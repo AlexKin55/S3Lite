@@ -197,9 +197,12 @@ message VolumeEcShardInformationMessage {
   // group shards by encode generation. Numbered 14 (not 10) to skip the
   // enterprise fork's reserved 10-13.
   int64 encode_ts_ns = 14;
+  // per-volume EC ratio (data_shards/parity_shards) from the .vif EcShardConfig.
+  // Numbered 20/21 to match the enterprise fork's layout, so a shard reported
+  // with a custom ratio is distinguishable from the fixed OSS 10+4 default.
+  uint32 data_shards = 20;
+  uint32 parity_shards = 21;
   // fields 15-19 reserved for future upstream open-source additions.
-  // fields 20+ are owned by the enterprise fork (e.g. data_shards/parity_shards)
-  // and must not be used here without coordination.
 }
 
 message StorageBackend {

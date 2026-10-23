@@ -64,9 +64,19 @@ func (vs *VolumeServer) VolumeEcShardsGenerate(ctx context.Context, req *volume_
 		return nil, fmt.Errorf("existing collection:%v unexpected input: %v", v.Collection, req.Collection)
 	}
 
-	// Create EC context - prefer existing .vif config if present (for regeneration scenarios)
+	// Create EC context - the request ratio (shell ec.encode -dataShards/-parityShards)
+	// has the highest priority; otherwise prefer existing .vif config if present
+	// (for regeneration scenarios); otherwise fall back to the build default (10+4).
 	ecCtx := erasure_coding.NewDefaultECContext(req.Collection, needle.VolumeId(req.VolumeId))
-	if volumeInfo, _, found, _ := volume_info.MaybeLoadVolumeInfo(baseFileName + ".vif"); found && volumeInfo.EcShardConfig != nil {
+	if req.DataShards > 0 && req.ParityShards > 0 {
+		if req.DataShards+req.ParityShards > erasure_coding.MaxShardCount {
+			return nil, fmt.Errorf("invalid EC config from request for volume %d: data=%d, parity=%d, total=%d (max=%d)",
+				req.VolumeId, req.DataShards, req.ParityShards, req.DataShards+req.ParityShards, erasure_coding.MaxShardCount)
+		}
+		ecCtx.DataShards = int(req.DataShards)
+		ecCtx.ParityShards = int(req.ParityShards)
+		glog.V(0).Infof("Using EC config from request for volume %d: %s", req.VolumeId, ecCtx.String())
+	} else if volumeInfo, _, found, _ := volume_info.MaybeLoadVolumeInfo(baseFileName + ".vif"); found && volumeInfo.EcShardConfig != nil {
 		ds := int(volumeInfo.EcShardConfig.DataShards)
 		ps := int(volumeInfo.EcShardConfig.ParityShards)
 

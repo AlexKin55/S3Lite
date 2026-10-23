@@ -61,7 +61,7 @@ func ChunkVolumeIds(volumeIds []needle.VolumeId, batchSize int) [][]needle.Volum
 	return batches
 }
 
-func ProcessEcEncodeBatch(env *Env, writer io.Writer, volumeIds []needle.VolumeId, rp *super_block.ReplicaPlacement, diskType types.DiskType, maxParallelization int, applyBalancing bool, collectionForMessage string) (err error) {
+func ProcessEcEncodeBatch(env *Env, writer io.Writer, volumeIds []needle.VolumeId, rp *super_block.ReplicaPlacement, diskType types.DiskType, maxParallelization int, applyBalancing bool, collectionForMessage string, dataShards int, parityShards int) (err error) {
 	topologyInfo, _, err := env.FetchTopology(0)
 	if err != nil {
 		return err
@@ -85,7 +85,7 @@ func ProcessEcEncodeBatch(env *Env, writer io.Writer, volumeIds []needle.VolumeI
 		return fmt.Errorf("failed to collect volume locations before EC encoding: %w", err)
 	}
 
-	if err := checkEcEncodeCapacity(topologyInfo, len(volumeIds), diskType, collectionForMessage); err != nil {
+	if err := checkEcEncodeCapacity(topologyInfo, len(volumeIds), diskType, collectionForMessage, dataShards, parityShards); err != nil {
 		return err
 	}
 
@@ -102,7 +102,7 @@ func ProcessEcEncodeBatch(env *Env, writer io.Writer, volumeIds []needle.VolumeI
 		}
 	}()
 
-	skippedNodes, err := doEcEncode(env, writer, volumeIdToCollection, volumeIds, maxParallelization, topologyInfo)
+	skippedNodes, err := doEcEncode(env, writer, volumeIdToCollection, volumeIds, maxParallelization, topologyInfo, dataShards, parityShards)
 	if err != nil {
 		return fmt.Errorf("ec encode for volumes %v: %w", volumeIds, err)
 	}
@@ -110,7 +110,11 @@ func ProcessEcEncodeBatch(env *Env, writer io.Writer, volumeIds []needle.VolumeI
 	// plans from a fresh topology snapshot: one taken before the mounts land
 	// shows no shards for these volumes, so the balance plans no moves and
 	// silently leaves every shard on the generation host.
-	if err := waitForEcShardsToRegister(env, volumeIds); err != nil {
+	totalShardsPerVolume := 0 // 0 = standard scheme (erasure_coding.TotalShardsCount)
+	if dataShards > 0 && parityShards > 0 {
+		totalShardsPerVolume = dataShards + parityShards
+	}
+	if err := waitForEcShardsToRegister(env, volumeIds, totalShardsPerVolume); err != nil {
 		return fmt.Errorf("wait for ec shards to register with the master: %w", err)
 	}
 	// EcBalance works at collection scope. In batch mode this intentionally
@@ -182,15 +186,19 @@ func rollbackFailedEcEncode(env *Env, writer io.Writer, volumeIds []needle.Volum
 	}
 }
 
-func checkEcEncodeCapacity(topologyInfo *master_pb.TopologyInfo, volumeCount int, diskType types.DiskType, collectionForMessage string) error {
+func checkEcEncodeCapacity(topologyInfo *master_pb.TopologyInfo, volumeCount int, diskType types.DiskType, collectionForMessage string, dataShards int, parityShards int) error {
 	// Pre-flight check: verify the target disk type has capacity for EC shards.
 	// This prevents encoding shards only to fail during rebalance. Reuse the
 	// caller's topology snapshot instead of issuing another VolumeList to the
 	// master per batch.
 	_, totalFreeEcSlots := CollectEcVolumeServersByDc(topologyInfo, "", diskType)
 
-	// Each volume needs TotalShardsCount (14) shards distributed.
-	requiredSlots := volumeCount * erasure_coding.TotalShardsCount
+	// Each volume needs total = data + parity shards distributed.
+	totalShardsPerVolume := erasure_coding.TotalShardsCount
+	if dataShards > 0 && parityShards > 0 {
+		totalShardsPerVolume = dataShards + parityShards
+	}
+	requiredSlots := volumeCount * totalShardsPerVolume
 	if totalFreeEcSlots < 1 {
 		if diskType != types.HardDriveType {
 			tryDiskTypeMessage := "Try passing -diskType=hdd, or omit -diskType to use the default (hdd)"
@@ -273,7 +281,7 @@ func collectSourceFreeVolumeCounts(topologyInfo *master_pb.TopologyInfo, volumeI
 	return freeVolumeCountMap
 }
 
-func doEcEncode(env *Env, writer io.Writer, volumeIdToCollection map[needle.VolumeId]string, volumeIds []needle.VolumeId, maxParallelization int, topologyInfo *master_pb.TopologyInfo) (skippedNodes map[pb.ServerAddress]struct{}, err error) {
+func doEcEncode(env *Env, writer io.Writer, volumeIdToCollection map[needle.VolumeId]string, volumeIds []needle.VolumeId, maxParallelization int, topologyInfo *master_pb.TopologyInfo, dataShards int, parityShards int) (skippedNodes map[pb.ServerAddress]struct{}, err error) {
 	if !env.isLocked() {
 		return nil, fmt.Errorf("lock is lost")
 	}
@@ -377,7 +385,7 @@ func doEcEncode(env *Env, writer io.Writer, volumeIdToCollection map[needle.Volu
 		target := bestReplicas[vid]
 		collection := volumeIdToCollection[vid]
 		ewg.Add(func() error {
-			if err := generateEcShards(env.GrpcDialOption, vid, collection, target.ServerAddress()); err != nil {
+			if err := generateEcShards(env.GrpcDialOption, vid, collection, target.ServerAddress(), dataShards, parityShards); err != nil {
 				return fmt.Errorf("generate ec shards for volume %d on %s: %v", vid, target.Url, err)
 			}
 			return nil
@@ -388,7 +396,14 @@ func doEcEncode(env *Env, writer io.Writer, volumeIdToCollection map[needle.Volu
 	}
 
 	// mount all ec shards for the converted volume
-	shardIds := erasure_coding.AllShardIds()
+	totalShards := erasure_coding.TotalShardsCount
+	if dataShards > 0 && parityShards > 0 {
+		totalShards = dataShards + parityShards
+	}
+	shardIds := make([]erasure_coding.ShardId, 0, totalShards)
+	for i := 0; i < totalShards; i++ {
+		shardIds = append(shardIds, erasure_coding.ShardId(i))
+	}
 
 	ewg.Reset()
 	for _, vid := range volumeIds {
@@ -670,9 +685,15 @@ func collectNewestGenerationShardsInfo(topoInfo *master_pb.TopologyInfo, vid nee
 // asynchronously (mount -> NewEcShardsChan -> delta heartbeat), so a topology
 // snapshot taken right after doEcEncode can predate the mounts. Failing after
 // the retries keeps the source volumes, and a re-run of ec.encode starts clean.
-func waitForEcShardsToRegister(env *Env, volumeIds []needle.VolumeId) error {
+func waitForEcShardsToRegister(env *Env, volumeIds []needle.VolumeId, totalShardsPerVolume int) error {
 	const maxAttempts = 10
 	const retryInterval = 2 * time.Second
+
+	// A custom ratio (e.g. 6+4 = 10 shards) is expected; 0 means the standard 10+4.
+	expectedShards := erasure_coding.TotalShardsCount
+	if totalShardsPerVolume > 0 {
+		expectedShards = totalShardsPerVolume
+	}
 
 	var lastMissing []string
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -689,8 +710,8 @@ func waitForEcShardsToRegister(env *Env, volumeIds []needle.VolumeId) error {
 			for _, bits := range CollectEcShardBitsByNode(topoInfo, vid) {
 				union |= bits
 			}
-			if union.Count() < erasure_coding.TotalShardsCount {
-				lastMissing = append(lastMissing, fmt.Sprintf("volume %d: %d/%d shards", vid, union.Count(), erasure_coding.TotalShardsCount))
+			if union.Count() < expectedShards {
+				lastMissing = append(lastMissing, fmt.Sprintf("volume %d: %d/%d shards", vid, union.Count(), expectedShards))
 			}
 		}
 		if len(lastMissing) == 0 {
@@ -915,14 +936,16 @@ func doDeleteVolumesWithLocations(env *Env, volumeIds []needle.VolumeId, volumeL
 	return nil
 }
 
-func generateEcShards(grpcDialOption grpc.DialOption, volumeId needle.VolumeId, collection string, sourceVolumeServer pb.ServerAddress) error {
+func generateEcShards(grpcDialOption grpc.DialOption, volumeId needle.VolumeId, collection string, sourceVolumeServer pb.ServerAddress, dataShards int, parityShards int) error {
 
 	fmt.Printf("generateEcShards %d (collection %q) on %s ...\n", volumeId, collection, sourceVolumeServer)
 
 	err := operation.WithVolumeServerClient(false, sourceVolumeServer, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
 		_, genErr := volumeServerClient.VolumeEcShardsGenerate(context.Background(), &volume_server_pb.VolumeEcShardsGenerateRequest{
-			VolumeId:   uint32(volumeId),
-			Collection: collection,
+			VolumeId:    uint32(volumeId),
+			Collection:  collection,
+			DataShards:  uint32(dataShards),
+			ParityShards: uint32(parityShards),
 		})
 		return genErr
 	})

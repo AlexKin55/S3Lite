@@ -378,6 +378,7 @@ func CollectEcShardIds(topoInfo *master_pb.TopologyInfo, collectionMatcher *wild
 
 func collectEcNodeShardsInfo(topoInfo *master_pb.TopologyInfo, vid needle.VolumeId) (map[pb.ServerAddress]*erasure_coding.ShardsInfo, int) {
 	res := make(map[pb.ServerAddress]*erasure_coding.ShardsInfo)
+	dataShards := erasure_coding.DataShardsCount
 	EachDataNode(topoInfo, func(dc DataCenterId, rack RackId, dn *master_pb.DataNodeInfo) {
 		// Union across ALL disk-type buckets and, within a node, across its
 		// physical disks. Shards sit wherever encode generation and balance
@@ -391,6 +392,9 @@ func collectEcNodeShardsInfo(topoInfo *master_pb.TopologyInfo, vid needle.Volume
 			}
 			for _, v := range diskInfo.EcShardInfos {
 				if v.Id == uint32(vid) {
+					if d := int(v.GetDataShards()); d > 0 {
+						dataShards = d
+					}
 					addr := pb.NewServerAddressFromDataNode(dn)
 					si := erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(v)
 					if existing, ok := res[addr]; ok {
@@ -403,8 +407,9 @@ func collectEcNodeShardsInfo(topoInfo *master_pb.TopologyInfo, vid needle.Volume
 		}
 	})
 
-	// OSS is always 10+4; the per-volume ratio override lives in the enterprise build.
-	return res, erasure_coding.DataShardsCount
+	// The data-shard count comes from the volume's .vif-reported ratio (a custom
+	// scheme such as 6+4); volumes without a reported ratio use the standard 10+4.
+	return res, dataShards
 }
 
 type DecodeDiskUsageState struct {

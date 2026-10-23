@@ -649,6 +649,11 @@ func (ev *EcVolume) ToVolumeEcShardInformationMessage(diskId uint32) (messages [
 				FileCount:   fileCount,
 				DeleteCount: deleteCount,
 				EncodeTsNs:  ev.EncodeTsNs,
+				// Per-volume EC ratio from the .vif EC context, so the master —
+				// and the ecbalancer / shell ops — can plan custom schemes
+				// (e.g. 6+4) instead of assuming the fixed 10+4.
+				DataShards:   uint32(ecDataShards(ev)),
+				ParityShards: uint32(ecParityShards(ev)),
 			}
 			ecInfoPerVolume[s.VolumeId] = m
 		}

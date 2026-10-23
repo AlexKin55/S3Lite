@@ -444,6 +444,8 @@ message VolumeTailReceiverResponse {
 message VolumeEcShardsGenerateRequest {
     uint32 volume_id = 1;
     string collection = 2;
+    uint32 data_shards = 3;
+    uint32 parity_shards = 4;
 }
 message VolumeEcShardsGenerateResponse {
 }

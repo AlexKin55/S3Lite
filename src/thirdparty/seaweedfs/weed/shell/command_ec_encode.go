@@ -70,6 +70,10 @@ func (c *commandEcEncode) Help() string {
 	  -diskType: target disk type for EC shards (hdd, ssd, or empty for default hdd)
 	  -batchSize: encode/rebalance/verify/delete this many volumes at a time (default 10; 0 = all in one batch)
 	  -volumeIds: comma-separated volume IDs to encode
+	  -dataShards: number of data shards (k). 0 = build default (10)
+	  -parityShards: number of parity shards (m). 0 = build default (4)
+	    Both must be set together, and k+m must be <= 32.
+	    Examples: -dataShards=6 -parityShards=4 (6+4), -dataShards=3 -parityShards=2 (3+2)
 
 	Each batch is committed independently. If a later batch fails, earlier batches
 	are already encoded and their original volumes deleted.
@@ -111,6 +115,8 @@ func (c *commandEcEncode) Do(args []string, commandEnv *CommandEnv, writer io.Wr
 	diskTypeStr := encodeCommand.String("diskType", "", "target disk type for EC shards (hdd, ssd, or empty for default hdd)")
 	applyBalancing := encodeCommand.Bool("rebalance", true, "re-balance EC shards after creation (default: true)")
 	verbose := encodeCommand.Bool("verbose", false, "show detailed reasons why volumes are not selected for encoding")
+	dataShards := encodeCommand.Int("dataShards", 0, "number of data shards (k). 0 = build default (10)")
+	parityShards := encodeCommand.Int("parityShards", 0, "number of parity shards (m). 0 = build default (4)")
 
 	if err = encodeCommand.Parse(args); err != nil {
 		return nil
@@ -118,6 +124,18 @@ func (c *commandEcEncode) Do(args []string, commandEnv *CommandEnv, writer io.Wr
 	if err = commandEnv.confirmIsLocked(args); err != nil {
 		return
 	}
+	if (*dataShards == 0) != (*parityShards == 0) {
+		return fmt.Errorf("-dataShards and -parityShards must be set together (both 0 for the default 10+4 scheme)")
+	}
+	if *dataShards > 0 && *parityShards > 0 {
+		if *dataShards < 1 || *parityShards < 1 {
+			return fmt.Errorf("-dataShards and -parityShards must both be >= 1")
+		}
+		if *dataShards+*parityShards > erasure_coding.MaxShardCount {
+			return fmt.Errorf("dataShards+parityShards (%d) exceeds MaxShardCount (%d)", *dataShards+*parityShards, erasure_coding.MaxShardCount)
+		}
+	}
+
 	rp, err := parseReplicaPlacementArg(commandEnv, *shardReplicaPlacement)
 	if err != nil {
 		return err
@@ -186,7 +204,7 @@ func (c *commandEcEncode) Do(args []string, commandEnv *CommandEnv, writer io.Wr
 		if len(batches) > 1 {
 			fmt.Printf("Starting EC encoding batch %d/%d with %d volumes: %v\n", i+1, len(batches), len(batchVolumeIds), batchVolumeIds)
 		}
-		if err := ec.ProcessEcEncodeBatch(commandEnv.ecEnv(), writer, batchVolumeIds, rp, diskType, *maxParallelization, *applyBalancing, *collection); err != nil {
+		if err := ec.ProcessEcEncodeBatch(commandEnv.ecEnv(), writer, batchVolumeIds, rp, diskType, *maxParallelization, *applyBalancing, *collection, *dataShards, *parityShards); err != nil {
 			return fmt.Errorf("ec encode batch %d/%d for volumes %v: %w", i+1, len(batches), batchVolumeIds, err)
 		}
 	}
