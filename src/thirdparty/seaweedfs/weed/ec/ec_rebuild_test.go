@@ -273,7 +273,7 @@ func TestPrepareDataToRecoverTargetShardCount(t *testing.T) {
 	}
 
 	// Shards 10-13 are missing, but 14-31 should NOT be reported
-	_, _, err := erb.prepareDataToRecover(node1, "c1", needle.VolumeId(1), locations)
+	_, _, err := erb.prepareDataToRecover(node1, "c1", needle.VolumeId(1), locations, erasure_coding.DataShardsCount, erasure_coding.TotalShardsCount)
 	if err != nil {
 		t.Fatalf("prepareDataToRecover failed: %v", err)
 	}

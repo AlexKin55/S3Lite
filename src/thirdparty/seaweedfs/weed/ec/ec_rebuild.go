@@ -77,6 +77,29 @@ func (erb *ecRebuilder) matchesVolumeId(vid needle.VolumeId) bool {
 	return slices.Contains(erb.volumeIds, vid)
 }
 
+// volumeRatio returns the per-volume EC scheme (data, parity) reported by the
+// volume's shards in the heartbeat (.vif-derived, set by our patch). 0,0 means
+// no shard carried the ratio yet — the caller falls back to the stock 10+4.
+func (erb *ecRebuilder) volumeRatio(collection string, volumeId needle.VolumeId) (int, int) {
+	erb.ecNodesMu.Lock()
+	defer erb.ecNodesMu.Unlock()
+	for _, node := range erb.ecNodes {
+		for _, diskInfo := range node.Info.DiskInfos {
+			if diskInfo == nil {
+				continue
+			}
+			for _, eci := range diskInfo.EcShardInfos {
+				if eci.Collection == collection && needle.VolumeId(eci.Id) == volumeId {
+					if d := int(eci.GetDataShards()); d > 0 {
+						return d, int(eci.GetParityShards())
+					}
+				}
+			}
+		}
+	}
+	return 0, 0
+}
+
 // countLocalShards returns the number of shards already present locally on the node for the given volume.
 // Unions across all of the node's disks, like prepareDataToRecover, so slot
 // accounting matches what the rebuild will actually treat as local.
@@ -94,7 +117,7 @@ func (erb *ecRebuilder) countLocalShards(node *EcNode, collection string, volume
 
 // selectAndReserveRebuilder atomically selects a rebuilder node with sufficient free slots
 // and reserves slots only for the non-local shards that need to be copied/generated.
-func (erb *ecRebuilder) selectAndReserveRebuilder(collection string, volumeId needle.VolumeId) (*EcNode, int, error) {
+func (erb *ecRebuilder) selectAndReserveRebuilder(collection string, volumeId needle.VolumeId, totalShards int) (*EcNode, int, error) {
 	erb.ecNodesMu.Lock()
 	defer erb.ecNodesMu.Unlock()
 
@@ -106,10 +129,10 @@ func (erb *ecRebuilder) selectAndReserveRebuilder(collection string, volumeId ne
 	var bestNode *EcNode
 	var bestSlotsNeeded int
 	var maxAvailableSlots int
-	var minSlotsNeeded int = erasure_coding.TotalShardsCount // Start with maximum possible
+	var minSlotsNeeded int = totalShards // Start with maximum possible
 	for _, node := range erb.ecNodes {
 		localShards := erb.countLocalShards(node, collection, volumeId)
-		slotsNeeded := erasure_coding.TotalShardsCount - localShards
+		slotsNeeded := totalShards - localShards
 		if slotsNeeded < 0 {
 			slotsNeeded = 0
 		}
@@ -165,12 +188,21 @@ func (erb *ecRebuilder) rebuildEcVolumes(collection string) {
 		if !erb.matchesVolumeId(vid) {
 			continue
 		}
+		// Per-volume scheme (k+m) from the heartbeat; fall back to the stock
+		// 10+4 when the volume predates the ratio fields.
+		dataShards, parityShards := erb.volumeRatio(collection, vid)
+		if dataShards <= 0 || parityShards <= 0 {
+			dataShards = erasure_coding.DataShardsCount
+			parityShards = erasure_coding.ParityShardsCount
+		}
+		totalShards := dataShards + parityShards
+
 		shardCount := locations.shardCount()
-		if shardCount == erasure_coding.TotalShardsCount {
+		if shardCount == totalShards {
 			continue
 		}
-		if shardCount < erasure_coding.DataShardsCount {
-			erb.write("ec volume %d is unrepairable with %d shards (need %d), skipping\n", vid, shardCount, erasure_coding.DataShardsCount)
+		if shardCount < dataShards {
+			erb.write("ec volume %d is unrepairable with %d shards (need %d), skipping\n", vid, shardCount, dataShards)
 			continue
 		}
 
@@ -180,13 +212,13 @@ func (erb *ecRebuilder) rebuildEcVolumes(collection string) {
 
 		erb.ewg.Add(func() error {
 			// Select rebuilder and reserve slots atomically per volume
-			rebuilder, slotsToReserve, err := erb.selectAndReserveRebuilder(collection, vid)
+			rebuilder, slotsToReserve, err := erb.selectAndReserveRebuilder(collection, vid, totalShards)
 			if err != nil {
 				return fmt.Errorf("failed to select rebuilder for volume %d: %v", vid, err)
 			}
 			defer erb.releaseRebuilder(rebuilder, slotsToReserve)
 
-			return erb.rebuildOneEcVolume(collection, vid, locations, rebuilder)
+			return erb.rebuildOneEcVolume(collection, vid, locations, rebuilder, dataShards, totalShards)
 		})
 	}
 }
@@ -246,7 +278,7 @@ func (erb *ecRebuilder) recoverMissingIndexes() {
 	erb.ecNodesMu.Unlock()
 }
 
-func (erb *ecRebuilder) rebuildOneEcVolume(collection string, volumeId needle.VolumeId, locations EcShardLocations, rebuilder *EcNode) error {
+func (erb *ecRebuilder) rebuildOneEcVolume(collection string, volumeId needle.VolumeId, locations EcShardLocations, rebuilder *EcNode, dataShards, totalShards int) error {
 	if !erb.isLocked() {
 		return fmt.Errorf("lock is lost")
 	}
@@ -255,7 +287,7 @@ func (erb *ecRebuilder) rebuildOneEcVolume(collection string, volumeId needle.Vo
 
 	// collect shard files to rebuilder local disk
 	var generatedShardIds []erasure_coding.ShardId
-	copiedShardIds, _, err := erb.prepareDataToRecover(rebuilder, collection, volumeId, locations)
+	copiedShardIds, _, err := erb.prepareDataToRecover(rebuilder, collection, volumeId, locations, dataShards, totalShards)
 	defer func() {
 		// Clean up the working copies this run actually made, even when the
 		// recoverability gate failed after some copies already succeeded:
@@ -312,7 +344,7 @@ func (erb *ecRebuilder) generateMissingShards(collection string, volumeId needle
 	return
 }
 
-func (erb *ecRebuilder) prepareDataToRecover(rebuilder *EcNode, collection string, volumeId needle.VolumeId, locations EcShardLocations) (copiedShardIds []erasure_coding.ShardId, localShardIds []erasure_coding.ShardId, err error) {
+func (erb *ecRebuilder) prepareDataToRecover(rebuilder *EcNode, collection string, volumeId needle.VolumeId, locations EcShardLocations, dataShards, totalShards int) (copiedShardIds []erasure_coding.ShardId, localShardIds []erasure_coding.ShardId, err error) {
 
 	needEcxFile := true
 	localShardsInfo := erasure_coding.NewShardsInfo()
@@ -329,8 +361,8 @@ func (erb *ecRebuilder) prepareDataToRecover(rebuilder *EcNode, collection strin
 		}
 	}
 
-	targetShardCount := erasure_coding.TotalShardsCount
-	for i := erasure_coding.TotalShardsCount; i < len(locations); i++ {
+	targetShardCount := totalShards
+	for i := totalShards; i < len(locations); i++ {
 		if len(locations[i]) > 0 {
 			targetShardCount = i + 1
 		}
@@ -394,7 +426,7 @@ func (erb *ecRebuilder) prepareDataToRecover(rebuilder *EcNode, collection strin
 		copiedShardIds = append(copiedShardIds, shardId)
 	}
 
-	if len(localShardIds)+recoverableRemoteShards >= erasure_coding.DataShardsCount {
+	if len(localShardIds)+recoverableRemoteShards >= dataShards {
 		return copiedShardIds, localShardIds, nil
 	}
 
