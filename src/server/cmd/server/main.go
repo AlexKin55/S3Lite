@@ -54,7 +54,9 @@ type VolumeTemplate struct {
 }
 
 func main() {
-	listen := flag.String("listen", ":8099", "control plane HTTP listen address")
+	listen := flag.String("listen", ":8099", "control plane listen address")
+	tlsCert := flag.String("tlsCert", "", "TLS certificate file (PEM). Empty = plain HTTP")
+	tlsKey := flag.String("tlsKey", "", "TLS private key file (PEM)")
 	masterHTTP := flag.String("master", "192.168.1.9:9333", "SeaweedFS master HTTP address")
 	pollSec := flag.Int("poll", 15, "redundancy poll interval (seconds)")
 	hbTTL := flag.Int("heartbeatTTL", 60, "agent heartbeat TTL (seconds)")
@@ -108,8 +110,19 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	log.Printf("control plane on %s, master=%s, poll=%ds, hbTTL=%ds", *listen, *masterHTTP, *pollSec, *hbTTL)
-	if err := http.ListenAndServe(*listen, mux); err != nil {
+	scheme := "http"
+	if *tlsCert != "" {
+		scheme = "https"
+	}
+	log.Printf("control plane on %s://%s, master=%s, poll=%ds, hbTTL=%ds",
+		scheme, *listen, *masterHTTP, *pollSec, *hbTTL)
+	var err error
+	if *tlsCert != "" {
+		err = http.ListenAndServeTLS(*listen, *tlsCert, *tlsKey, mux)
+	} else {
+		err = http.ListenAndServe(*listen, mux)
+	}
+	if err != nil {
 		log.Fatal(err)
 	}
 }

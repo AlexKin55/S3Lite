@@ -21,15 +21,16 @@ func main() {
 	serverAddr := flag.String("server", "", "control plane address (overrides config)")
 	port := flag.Int("port", 0, "volume server port (overrides config)")
 	weedBin := flag.String("weed", "", "path to the weed binary (overrides config)")
+	insecureTLS := flag.Bool("insecure", false, "skip TLS certificate verification for HTTPS control plane")
 	flag.Parse()
 
-	if err := run(*agentDir, *serverAddr, *port, *weedBin); err != nil {
+	if err := run(*agentDir, *serverAddr, *port, *weedBin, *insecureTLS); err != nil {
 		fmt.Fprintf(os.Stderr, "agent: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(agentDir, serverOverride string, portOverride int, weedOverride string) error {
+func run(agentDir, serverOverride string, portOverride int, weedOverride string, insecureTLS bool) error {
 	agentDir = abs(agentDir)
 
 	cfg, err := config.Load(agentDir)
@@ -49,7 +50,10 @@ func run(agentDir, serverOverride string, portOverride int, weedOverride string)
 		return fmt.Errorf("weed binary path is empty: pass -weed or set weed_bin in %s", config.Path(agentDir))
 	}
 
-	client := api.New(cfg.Server, cfg.APIKey)
+	if insecureTLS {
+		cfg.TLSInsecure = true
+	}
+	client := api.New(cfg.Server, cfg.APIKey, cfg.TLSInsecure)
 
 	// The local IP is also the address the volume server advertises in the cluster.
 	ip, err := supervisor.DetectIP()

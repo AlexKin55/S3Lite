@@ -1,0 +1,23 @@
+[Unit]
+Description=S3Lite storage node agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<RUNAS_USER>
+ExecStart=/usr/local/bin/s3lite-agent \
+    -dir=/var/lib/s3lite/agent \
+    -server=https://<CONTROL_PLANE_ADDR>:8099 \
+    -weed=/usr/local/bin/weed \
+    -insecure
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

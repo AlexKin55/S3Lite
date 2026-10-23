@@ -3,10 +3,12 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -17,11 +19,15 @@ type Client struct {
 	http    *http.Client
 }
 
-func New(server, apiKey string) *Client {
+func New(server, apiKey string, insecure bool) *Client {
+	transport := &http.Transport{}
+	if strings.HasPrefix(server, "https://") && insecure {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
+	}
 	return &Client{
 		baseURL: server,
 		apiKey:  apiKey,
-		http:    &http.Client{Timeout: 10 * time.Second},
+		http:    &http.Client{Timeout: 10 * time.Second, Transport: transport},
 	}
 }
 

@@ -46,6 +46,10 @@ type Config struct {
 
 	// HeartbeatIntervalSec is the heartbeat interval.
 	HeartbeatIntervalSec int `json:"heartbeat_interval_sec,omitempty"`
+
+	// TLSInsecure skips certificate verification for HTTPS control plane
+	// connections (development; production should use a trusted CA).
+	TLSInsecure bool `json:"tls_insecure,omitempty"`
 }
 
 // Default returns a config with defaults (node_id still empty).

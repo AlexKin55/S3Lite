@@ -1,0 +1,28 @@
+# Global metrics
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # S3Lite control plane
+  - job_name: s3lite-controlplane
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - 127.0.0.1:8099   # control plane (replace with its real address)
+
+  # SeaweedFS master
+  - job_name: seaweedfs-master
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - 127.0.0.1:9333
+
+  # SeaweedFS volume servers (one per PC node)
+  - job_name: seaweedfs-volumes
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - 127.0.0.1:8081
+          - 127.0.0.1:8082
+          # ... add every volume server / PC node here

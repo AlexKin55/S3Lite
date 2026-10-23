@@ -34,6 +34,61 @@ printf 'lock\nec.encode -volumeId=1 -dataShards=6 -parityShards=4\nunlock\n' \
   | ./bin/weed shell -master=127.0.0.1:9333
 ```
 
+## Production deployment
+
+### TLS (control plane)
+
+Generate a self-signed CA and certificates, then run the control plane over HTTPS:
+
+```bash
+./deploy/tls/generate.sh 192.168.1.9 localhost
+bin/server -listen=:8099 \
+  -tlsCert=deploy/tls/out/server.crt -tlsKey=deploy/tls/out/server.key \
+  -master=192.168.1.9:9333 -webhook=https://alerts.example.com/hook
+```
+
+Agents connect with `-server=https://<control-ip>:8099 -insecure`
+(remove `-insecure` once the CA is trusted on the nodes).
+
+### Installing the agent as a service
+
+- Linux (systemd): `sudo ./deploy/systemd/install_agent.sh <CONTROL_PLANE_ADDR> [PORT]`
+- Windows (NSSM): `powershell -File deploy/windows/s3lite-agent.ps1 -ControlPlane 192.168.1.9`
+
+### High availability
+
+- **Control plane**: run two+ instances behind a load balancer with a shared
+  PostgreSQL registry ([`deploy/postgres/schema.sql`](deploy/postgres/schema.sql));
+  the node registry and placement history move to PostgreSQL (in-memory is the
+  development default).
+- **SeaweedFS**: run the master as a Raft trio (`weed master -peers=...`) and
+  multiple filers/S3 gateways behind a proxy.
+
+### Monitoring
+
+- Control plane exposes `/metrics` (Prometheus text format): registered nodes
+  and EC volumes per state (ok/degraded/at_risk).
+- Scrape config: [`deploy/prometheus/prometheus.yml`](deploy/prometheus/prometheus.yml)
+  (control plane + weed master + volume servers).
+
+### CA storage and recovery
+
+- EC 6+4 with one shard per node means data survives 4 nodes offline.
+- If a node is lost permanently, use `ec.rebuild` (weed shell) to reconstruct
+  missing shards on live nodes; AT_RISK notifications name the exact PCs to
+  power back on.
+- Store the EC shard layout (`ec_placement` table) so recommendations survive
+  control-plane restarts.
+
+## Testing
+
+```bash
+./scripts/build_all.sh                    # build weed, agent, server (+mc)
+python3 src/tests/integration.py          # all cases A–E
+python3 src/tests/integration.py -c A,B  # selected cases
+python3 src/tests/integration_webhook.py # webhook delivery check (TODO-3)
+```
+
 ## Status
 
 - [x] Stage 1: test cluster (master + volume x10 + filer + s3), stock EC 10+4 verified
