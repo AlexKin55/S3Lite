@@ -1,7 +1,13 @@
-# Локальные данные стенда (имитация дисков ПК, логи, PID)
+# Local test-stand data (PC disk simulation, logs, PIDs)
 .cluster/
 
-# Собранные бинари и временные артефакты
+# Built binaries and temp artifacts
 bin/
 *.log
 *.pid
+
+# SeaweedFS component working data
+filerldb2/
+
+# Local documents/plans (kept out of the repository)
+plans/
