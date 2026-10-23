@@ -55,6 +55,10 @@ fi
 build "src/agent" "./cmd/agent" "agent"
 build "src/server" "./cmd/server" "server"
 
+# 4) S3 recovery-hint proxy (fronts the SeaweedFS S3 gateway)
+echo "==> s3proxy"
+build "src/s3proxy" "." "s3proxy"
+
 echo
 echo "==> Built binaries in ${BIN}:"
 ls -lh "${BIN}" | awk '{print $5, $9}'

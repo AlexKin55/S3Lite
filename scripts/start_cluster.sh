@@ -26,6 +26,7 @@ PID_DIR="${CLUSTER_DIR}/pids"
 MASTER_PORT=9333
 FILER_PORT=8888
 S3_PORT=8333
+S3_UPSTREAM_PORT=8332
 VOLUME_BASE_PORT=8081
 VOLUME_COUNT=10
 
@@ -91,9 +92,17 @@ start() {
 
   sleep 1
   run_bg s3 "${WEED}" s3 \
-    -port="${S3_PORT}" \
+    -port="${S3_UPSTREAM_PORT}" \
     -filer="127.0.0.1:${FILER_PORT}" \
     -config="${PROJECT_ROOT}/src/thirdparty/seaweedfs/docker/compose/s3.json"
+
+  sleep 1
+  # Thin S3 proxy in front of the gateway: turns 5xx downloads into an S3
+  # error that names the offline PCs to power on (via the control plane).
+  run_bg s3proxy "${PROJECT_ROOT}/bin/s3proxy" \
+    -listen=":${S3_PORT}" \
+    -upstream="http://127.0.0.1:${S3_UPSTREAM_PORT}" \
+    -control="http://127.0.0.1:8099"
 
   echo "==> Waiting for the master to be ready..."
   for _ in $(seq 1 15); do
@@ -110,8 +119,8 @@ start() {
 
 stop() {
   echo "==> Stopping the cluster..."
-  # Stop in reverse order: s3, filer, volumeN..volume1, master
-  local names=(s3 filer)
+  # Stop in reverse order: s3proxy, s3, filer, volumeN..volume1, master
+  local names=(s3proxy s3 filer)
   for i in $(seq "${VOLUME_COUNT}" -1 1); do
     names+=("volume${i}")
   done
@@ -158,7 +167,7 @@ status() {
   echo
   echo "  master: http://localhost:${MASTER_PORT}/ui/index.html"
   echo "  filer:  http://localhost:${FILER_PORT}/ui/index.html"
-  echo "  s3:     http://localhost:${S3_PORT}"
+  echo "  s3:     http://localhost:${S3_PORT} (via s3proxy, upstream :${S3_UPSTREAM_PORT})"
   if curl -sf "http://127.0.0.1:${MASTER_PORT}/cluster/status" 2>/dev/null | head -c 400 >/dev/null; then
     echo
     echo "  Master topology (live volume servers):"

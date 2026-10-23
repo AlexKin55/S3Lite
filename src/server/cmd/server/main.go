@@ -104,6 +104,8 @@ func main() {
 	mux.HandleFunc("/api/v1/cluster/status", srv.handleClusterStatus)
 	mux.HandleFunc("/api/v1/volumes/risk", srv.handleVolumesRisk)
 	mux.HandleFunc("/api/v1/admin/notify/test", srv.handleNotifyTest)
+	mux.HandleFunc("/api/v1/dashboard", srv.dashboardAPI)
+	mux.HandleFunc("/", srv.handleDashboard)
 	mux.HandleFunc("/metrics", srv.handleMetrics)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

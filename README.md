@@ -64,12 +64,27 @@ Agents connect with `-server=https://<control-ip>:8099 -insecure`
 - **SeaweedFS**: run the master as a Raft trio (`weed master -peers=...`) and
   multiple filers/S3 gateways behind a proxy.
 
-### Monitoring
+### Monitoring & operator UI
 
+- **Browser dashboard**: open the control plane root (`http://<cp>:8099/`) — a
+  self-contained page shows cluster stats, EC volumes with their
+  `Power on to restore` column, registered nodes and a notification test button
+  (auto-refresh every 5 s). Its JSON is at `/api/v1/dashboard`.
 - Control plane exposes `/metrics` (Prometheus text format): registered nodes
   and EC volumes per state (ok/degraded/at_risk).
 - Scrape config: [`deploy/prometheus/prometheus.yml`](deploy/prometheus/prometheus.yml)
   (control plane + weed master + volume servers).
+
+### S3 recovery-hint proxy
+
+`s3proxy` sits in front of the S3 gateway ([`scripts/start_cluster.sh`](scripts/start_cluster.sh)
+runs it on :8333 with the gateway on :8332). When a download fails with 5xx,
+it asks the control plane which PCs are offline and returns an S3 error like:
+
+```
+Storage nodes are offline. Please power on the following nodes to recover
+the data: 192.168.1.9:8085
+```
 
 ### CA storage and recovery
 
