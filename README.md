@@ -38,7 +38,7 @@ printf 'lock\nec.encode -volumeId=1 -dataShards=6 -parityShards=4\nunlock\n' \
 
 - [x] Stage 1: test cluster (master + volume x10 + filer + s3), stock EC 10+4 verified
 - [x] Stage 2: custom EC k+m patch, EC 6+4 verified (4 nodes offline → reads still work)
-- [ ] Stage 3: Go node agent
+- [x] Stage 3: Go node agent (registration, volume supervision, heartbeat, auto-restart on crash)
 - [ ] Stage 4: control plane
 - [ ] Stage 5: integration tests
 - [ ] Stage 6: production readiness
