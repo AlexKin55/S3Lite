@@ -31,6 +31,10 @@ type server struct {
 	lastReports atomic.Value // []redundancy.Report
 	lastUpdate  atomic.Value // time.Time
 	lastTopoEC  atomic.Int64 // number of EC volumes in the last snapshot
+	// Placement history: merged per-volume shard layout (see redundancy.Merge).
+	// Keeps nodes that dropped out of the master topology known to the advice
+	// engine so "which PCs to power back on" can name them.
+	placementHist atomic.Value // []*redundancy.Volume
 }
 
 // VolumeTemplate is the static part of the volume config sent to agents.
@@ -77,6 +81,7 @@ func main() {
 		},
 	}
 	srv.lastReports.Store([]*redundancy.Report{})
+	srv.placementHist.Store([]*redundancy.Volume{})
 	srv.lastUpdate.Store(time.Time{})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -123,7 +128,12 @@ func (s *server) evaluate(ctx context.Context) {
 		return
 	}
 	online := s.buildOnline(topo)
-	volumes := redundancy.Collect(topo)
+	fresh := redundancy.Collect(topo)
+	// Merge the fresh snapshot into the placement history: shard layouts of
+	// volumes whose nodes vanished from the topology survive, so offline nodes
+	// (and the shards they hold) stay visible to the classifier and set cover.
+	volumes := redundancy.Merge(s.placementHist.Load().([]*redundancy.Volume), fresh)
+	s.placementHist.Store(volumes)
 	reports := redundancy.Evaluate(volumes, func(addr string) bool { return online[addr] })
 
 	prev := s.lastReports.Load().([]*redundancy.Report)
@@ -153,7 +163,7 @@ func (s *server) evaluate(ctx context.Context) {
 		}
 		key := fmt.Sprintf("%s/%d/atrisk", r.Collection, r.VolumeID)
 		s.notifier.Notify(key, notify.Event{
-			Kind:    "volume_at_risk",
+			Kind: "volume_at_risk",
 			Summary: fmt.Sprintf("Volume %d (%s) AT_RISK: %d/%d shards available",
 				r.VolumeID, r.Collection, r.Available, r.Total),
 			Detail: fmt.Sprintf("Data is unrecoverable right now. Restore by turning on: %v",
@@ -240,13 +250,13 @@ func (s *server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"node_id": n.NodeID,
 		"volume": map[string]any{
-			"master":       s.volumeCfg.Master,
-			"data_center":  s.volumeCfg.DataCenter,
-			"rack":         n.Rack,
-			"max_volumes":  s.volumeCfg.MaxVolumes,
-			"disk_type":    s.volumeCfg.DiskType,
-			"weed_url":     "",
-			"volume_port":  n.VolumePort,
+			"master":      s.volumeCfg.Master,
+			"data_center": s.volumeCfg.DataCenter,
+			"rack":        n.Rack,
+			"max_volumes": s.volumeCfg.MaxVolumes,
+			"disk_type":   s.volumeCfg.DiskType,
+			"weed_url":    "",
+			"volume_port": n.VolumePort,
 		},
 	})
 }
@@ -345,10 +355,10 @@ func (s *server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"nodes":       len(s.reg.All()),
-		"ec_volumes":  map[string]int{"ok": okC, "degraded": degC, "at_risk": riskC, "total": len(reports)},
-		"capacity":    map[string]int64{"total_bytes": totalCap, "used_bytes": usedCap},
-		"updated_at":  s.lastUpdate.Load().(time.Time),
+		"nodes":      len(s.reg.All()),
+		"ec_volumes": map[string]int{"ok": okC, "degraded": degC, "at_risk": riskC, "total": len(reports)},
+		"capacity":   map[string]int64{"total_bytes": totalCap, "used_bytes": usedCap},
+		"updated_at": s.lastUpdate.Load().(time.Time),
 	})
 }
 

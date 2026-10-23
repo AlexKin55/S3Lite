@@ -8,8 +8,8 @@ import (
 
 // Volume aggregates the EC shard placement of one encoded volume.
 type Volume struct {
-	Collection string
-	VolumeID   uint32
+	Collection   string
+	VolumeID     uint32
 	DataShards   int // k, from the .vif-reported ratio (10 for stock 10+4)
 	ParityShards int // m
 	// ShardsByNode maps node address (ip:port) -> local shard indices.
@@ -18,6 +18,56 @@ type Volume struct {
 
 // Total returns k+m.
 func (v *Volume) Total() int { return v.DataShards + v.ParityShards }
+
+// clone returns a deep copy of the volume's placement (safe to mutate).
+func (v *Volume) clone() *Volume {
+	cp := &Volume{
+		Collection:   v.Collection,
+		VolumeID:     v.VolumeID,
+		DataShards:   v.DataShards,
+		ParityShards: v.ParityShards,
+		ShardsByNode: make(map[string][]int, len(v.ShardsByNode)),
+	}
+	for node, shards := range v.ShardsByNode {
+		cp.ShardsByNode[node] = append([]int(nil), shards...)
+	}
+	return cp
+}
+
+// Merge overlays a fresh topology snapshot over the recorded placement history.
+// Volumes that only exist in history (their nodes vanished from the master
+// topology) keep their shard layout, so offline nodes and the shards they
+// hosted stay known — this is what lets the set-cover recommendation name the
+// exact PCs to power back on. Fresh per-node shard sets overwrite the history;
+// for a node present in both, only the current set counts.
+func Merge(history, fresh []*Volume) []*Volume {
+	byKey := make(map[volKey]*Volume)
+	for _, v := range history {
+		if v == nil {
+			continue
+		}
+		byKey[volKey{v.Collection, v.VolumeID}] = v.clone()
+	}
+	for _, v := range fresh {
+		if v == nil {
+			continue
+		}
+		key := volKey{v.Collection, v.VolumeID}
+		old, ok := byKey[key]
+		if !ok {
+			byKey[key] = v.clone()
+			continue
+		}
+		for node, shards := range v.ShardsByNode {
+			old.ShardsByNode[node] = append([]int(nil), shards...)
+		}
+	}
+	out := make([]*Volume, 0, len(byKey))
+	for _, v := range byKey {
+		out = append(out, v)
+	}
+	return out
+}
 
 // Status classification.
 const (
@@ -28,15 +78,15 @@ const (
 
 // Report is the redundancy state of one EC volume.
 type Report struct {
-	Collection    string   `json:"collection"`
-	VolumeID      uint32   `json:"volume_id"`
-	State         string   `json:"state"`
-	DataShards    int      `json:"data_shards"`
-	ParityShards  int      `json:"parity_shards"`
-	Available     int      `json:"available_shards"`
-	Total         int      `json:"total_shards"`
-	NodesToStart  []string `json:"nodes_to_start,omitempty"`
-	OfflineNodes  []string `json:"offline_nodes,omitempty"`
+	Collection   string   `json:"collection"`
+	VolumeID     uint32   `json:"volume_id"`
+	State        string   `json:"state"`
+	DataShards   int      `json:"data_shards"`
+	ParityShards int      `json:"parity_shards"`
+	Available    int      `json:"available_shards"`
+	Total        int      `json:"total_shards"`
+	NodesToStart []string `json:"nodes_to_start,omitempty"`
+	OfflineNodes []string `json:"offline_nodes,omitempty"`
 }
 
 // Collect builds EC volume views from the master topology.
