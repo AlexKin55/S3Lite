@@ -7,15 +7,17 @@ import (
 
 // data structure used in master
 type EcVolumeInfo struct {
-	VolumeId    needle.VolumeId
-	Collection  string
-	DiskType    string
-	DiskId      uint32 // ID of the disk this EC volume is on
-	ExpireAtSec uint64 // ec volume destroy time, calculated from the ec volume was created
-	ShardsInfo  *ShardsInfo
-	FileCount   uint64 // live needle count for this EC volume (same on every node holding shards)
-	DeleteCount uint64 // tombstoned needle count for this EC volume
-	EncodeTsNs  int64  // encode-run identity (unix nanos); one value per (volume, disk)
+	VolumeId     needle.VolumeId
+	Collection   string
+	DiskType     string
+	DiskId       uint32 // ID of the disk this EC volume is on
+	ExpireAtSec  uint64 // ec volume destroy time, calculated from the ec volume was created
+	ShardsInfo   *ShardsInfo
+	FileCount    uint64 // live needle count for this EC volume (same on every node holding shards)
+	DeleteCount  uint64 // tombstoned needle count for this EC volume
+	EncodeTsNs   int64  // encode-run identity (unix nanos); one value per (volume, disk)
+	DataShards   uint32 // per-volume EC ratio from the heartbeat (.vif), 0 = stock 10+4
+	ParityShards uint32
 }
 
 // DataShardsOrDefault returns how many of this volume's shards hold data; shard
@@ -24,35 +26,42 @@ type EcVolumeInfo struct {
 // accessor, like EcShardsVolumeDataShards, so callers stay correct on builds
 // that derive the ratio per volume.
 func (ecInfo *EcVolumeInfo) DataShardsOrDefault() int {
+	if ecInfo.DataShards > 0 {
+		return int(ecInfo.DataShards)
+	}
 	return DataShardsCount
 }
 
 func (ecInfo *EcVolumeInfo) Minus(other *EcVolumeInfo) *EcVolumeInfo {
 	return &EcVolumeInfo{
-		VolumeId:    ecInfo.VolumeId,
-		Collection:  ecInfo.Collection,
-		ShardsInfo:  ecInfo.ShardsInfo.Minus(other.ShardsInfo),
-		DiskType:    ecInfo.DiskType,
-		DiskId:      ecInfo.DiskId,
-		ExpireAtSec: ecInfo.ExpireAtSec,
-		FileCount:   ecInfo.FileCount,
-		DeleteCount: ecInfo.DeleteCount,
-		EncodeTsNs:  ecInfo.EncodeTsNs,
+		VolumeId:     ecInfo.VolumeId,
+		Collection:   ecInfo.Collection,
+		ShardsInfo:   ecInfo.ShardsInfo.Minus(other.ShardsInfo),
+		DiskType:     ecInfo.DiskType,
+		DiskId:       ecInfo.DiskId,
+		ExpireAtSec:  ecInfo.ExpireAtSec,
+		FileCount:    ecInfo.FileCount,
+		DeleteCount:  ecInfo.DeleteCount,
+		EncodeTsNs:   ecInfo.EncodeTsNs,
+		DataShards:   ecInfo.DataShards,
+		ParityShards: ecInfo.ParityShards,
 	}
 }
 
 func (evi *EcVolumeInfo) ToVolumeEcShardInformationMessage() (ret *master_pb.VolumeEcShardInformationMessage) {
 	return &master_pb.VolumeEcShardInformationMessage{
-		Id:          uint32(evi.VolumeId),
-		EcIndexBits: evi.ShardsInfo.Bitmap(),
-		ShardSizes:  evi.ShardsInfo.SizesInt64(),
-		Collection:  evi.Collection,
-		DiskType:    evi.DiskType,
-		ExpireAtSec: evi.ExpireAtSec,
-		DiskId:      evi.DiskId,
-		FileCount:   evi.FileCount,
-		DeleteCount: evi.DeleteCount,
-		EncodeTsNs:  evi.EncodeTsNs,
+		Id:           uint32(evi.VolumeId),
+		EcIndexBits:  evi.ShardsInfo.Bitmap(),
+		ShardSizes:   evi.ShardsInfo.SizesInt64(),
+		Collection:   evi.Collection,
+		DiskType:     evi.DiskType,
+		ExpireAtSec:  evi.ExpireAtSec,
+		DiskId:       evi.DiskId,
+		FileCount:    evi.FileCount,
+		DeleteCount:  evi.DeleteCount,
+		EncodeTsNs:   evi.EncodeTsNs,
+		DataShards:   evi.DataShards,
+		ParityShards: evi.ParityShards,
 	}
 }
 

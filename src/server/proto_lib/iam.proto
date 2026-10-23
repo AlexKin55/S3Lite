@@ -1,0 +1,447 @@
+syntax = "proto3";
+
+package iam_pb;
+
+option go_package = "github.com/seaweedfs/seaweedfs/weed/pb/iam_pb";
+option java_package = "seaweedfs.client";
+option java_outer_classname = "IamProto";
+
+//////////////////////////////////////////////////
+
+service SeaweedIdentityAccessManagement {
+    // Configuration Management
+    rpc GetConfiguration (GetConfigurationRequest) returns (GetConfigurationResponse);
+    rpc PutConfiguration (PutConfigurationRequest) returns (PutConfigurationResponse);
+    
+    // User Management
+    rpc CreateUser (CreateUserRequest) returns (CreateUserResponse);
+    rpc GetUser (GetUserRequest) returns (GetUserResponse);
+    rpc UpdateUser (UpdateUserRequest) returns (UpdateUserResponse);
+    rpc DeleteUser (DeleteUserRequest) returns (DeleteUserResponse);
+    rpc ListUsers (ListUsersRequest) returns (ListUsersResponse);
+    
+    // Access Key Management
+    rpc CreateAccessKey (CreateAccessKeyRequest) returns (CreateAccessKeyResponse);
+    rpc DeleteAccessKey (DeleteAccessKeyRequest) returns (DeleteAccessKeyResponse);
+    rpc GetUserByAccessKey (GetUserByAccessKeyRequest) returns (GetUserByAccessKeyResponse);
+    
+    // Policy Management
+    rpc PutPolicy (PutPolicyRequest) returns (PutPolicyResponse);
+    rpc GetPolicy (GetPolicyRequest) returns (GetPolicyResponse);
+    rpc ListPolicies (ListPoliciesRequest) returns (ListPoliciesResponse);
+    rpc DeletePolicy (DeletePolicyRequest) returns (DeletePolicyResponse);
+
+    // Service Account Management
+    rpc CreateServiceAccount (CreateServiceAccountRequest) returns (CreateServiceAccountResponse);
+    rpc UpdateServiceAccount (UpdateServiceAccountRequest) returns (UpdateServiceAccountResponse);
+    rpc DeleteServiceAccount (DeleteServiceAccountRequest) returns (DeleteServiceAccountResponse);
+    rpc GetServiceAccount (GetServiceAccountRequest) returns (GetServiceAccountResponse);
+    rpc ListServiceAccounts (ListServiceAccountsRequest) returns (ListServiceAccountsResponse);
+    rpc GetServiceAccountByAccessKey (GetServiceAccountByAccessKeyRequest) returns (GetServiceAccountByAccessKeyResponse);
+
+    // OIDC Provider Management. Writes the records the S3 servers' STS trusts
+    // when they run with "oidcProviderStore": {"storeType": "filer"}.
+    rpc PutOIDCProvider (PutOIDCProviderRequest) returns (PutOIDCProviderResponse);
+    rpc GetOIDCProvider (GetOIDCProviderRequest) returns (GetOIDCProviderResponse);
+    rpc DeleteOIDCProvider (DeleteOIDCProviderRequest) returns (DeleteOIDCProviderResponse);
+    rpc ListOIDCProviders (ListOIDCProvidersRequest) returns (ListOIDCProvidersResponse);
+
+    // Role Management. Writes the roles the S3 servers' STS assumes when they
+    // run with "roleStore": {"storeType": "filer"}.
+    rpc PutRole (PutRoleRequest) returns (PutRoleResponse);
+    rpc GetRole (GetRoleRequest) returns (GetRoleResponse);
+    rpc DeleteRole (DeleteRoleRequest) returns (DeleteRoleResponse);
+    rpc ListRoles (ListRolesRequest) returns (ListRolesResponse);
+}
+
+//////////////////////////////////////////////////
+// Configuration Management Messages
+
+message GetConfigurationRequest {
+}
+
+message GetConfigurationResponse {
+    S3ApiConfiguration configuration = 1;
+}
+
+message PutConfigurationRequest {
+    S3ApiConfiguration configuration = 1;
+}
+
+message PutConfigurationResponse {
+}
+
+//////////////////////////////////////////////////
+// User Management Messages
+
+message CreateUserRequest {
+    Identity identity = 1;
+}
+
+message CreateUserResponse {
+}
+
+message GetUserRequest {
+    string username = 1;
+}
+
+message GetUserResponse {
+    Identity identity = 1;
+}
+
+message UpdateUserRequest {
+    string username = 1;
+    Identity identity = 2;
+}
+
+message UpdateUserResponse {
+}
+
+message DeleteUserRequest {
+    string username = 1;
+}
+
+message DeleteUserResponse {
+}
+
+message ListUsersRequest {
+}
+
+message ListUsersResponse {
+    repeated string usernames = 1;
+}
+
+//////////////////////////////////////////////////
+// Access Key Management Messages
+
+message CreateAccessKeyRequest {
+    string username = 1;
+    Credential credential = 2;
+}
+
+message CreateAccessKeyResponse {
+}
+
+message DeleteAccessKeyRequest {
+    string username = 1;
+    string access_key = 2;
+}
+
+message DeleteAccessKeyResponse {
+}
+
+message GetUserByAccessKeyRequest {
+    string access_key = 1;
+}
+
+message GetUserByAccessKeyResponse {
+    Identity identity = 1;
+}
+
+message ListAccessKeysRequest {
+    string username = 1;
+}
+
+message ListAccessKeysResponse {
+    repeated Credential access_keys = 1;
+}
+
+// User Policy Management Messages
+message PutUserPolicyRequest {
+    string username = 1;
+    string policy_name = 2;
+    string policy_document = 3;
+}
+
+message PutUserPolicyResponse {
+}
+
+message GetUserPolicyRequest {
+    string username = 1;
+    string policy_name = 2;
+}
+
+message GetUserPolicyResponse {
+    string username = 1;
+    string policy_name = 2;
+    string policy_document = 3;
+}
+
+message DeleteUserPolicyRequest {
+    string username = 1;
+    string policy_name = 2;
+}
+
+message DeleteUserPolicyResponse {
+}
+
+//////////////////////////////////////////////////
+
+message S3ApiConfiguration {
+    repeated Identity identities = 1;
+    repeated Account accounts = 2;
+    repeated ServiceAccount service_accounts = 3;
+    repeated Policy policies = 4;
+    repeated Group groups = 5;
+}
+
+message Group {
+    string name = 1;
+    repeated string members = 2;       // usernames
+    repeated string policy_names = 3;  // attached managed policy names
+    bool disabled = 4;
+}
+
+message Identity {
+    string name = 1;
+    repeated Credential credentials = 2;
+    repeated string actions = 3;
+    Account account = 4;
+    bool disabled = 5;  // User status: false = enabled (default), true = disabled
+    repeated string service_account_ids = 6;  // IDs of service accounts owned by this user
+    repeated string policy_names = 7;
+    bool is_static = 8;  // Loaded from static config file (read-only, not editable via API)
+    repeated UserTag tags = 9;
+}
+
+message UserTag {
+    string key = 1;
+    string value = 2;
+}
+
+message Credential {
+    string access_key = 1;
+    string secret_key = 2;
+    string status = 3;  // Access key status: "Active" or "Inactive"
+}
+
+message Account {
+    string id = 1;
+    string display_name = 2;
+    string email_address = 3;
+}
+
+// ServiceAccount represents a service account - special credentials for applications.
+// Service accounts are linked to a parent user and can have restricted permissions.
+message ServiceAccount {
+    string id = 1;                     // Unique identifier (e.g., "sa-xxxxx")
+    string parent_user = 2;            // Parent identity name
+    string description = 3;            // Optional description
+    Credential credential = 4;         // Access key/secret for this service account
+    repeated string actions = 5;       // Allowed actions (subset of parent)
+    int64 expiration = 6;              // Unix timestamp, 0 = no expiration
+    bool disabled = 7;                 // Status: false = enabled (default)
+    int64 created_at = 8;              // Creation timestamp
+    string created_by = 9;             // Who created this service account
+}
+
+message PutPolicyRequest {
+    string name = 1;
+    string content = 2;
+}
+
+message PutPolicyResponse {
+}
+
+message GetPolicyRequest {
+    string name = 1;
+}
+
+message GetPolicyResponse {
+    string name = 1;
+    string content = 2;
+}
+
+message ListPoliciesRequest {
+}
+
+message ListPoliciesResponse {
+    repeated Policy policies = 1;
+}
+
+message DeletePolicyRequest {
+    string name = 1;
+}
+
+message DeletePolicyResponse {
+}
+
+message Policy {
+    string name = 1;
+    string content = 2; // JSON content of the policy
+}
+
+//////////////////////////////////////////////////
+// Service Account Messages
+
+message CreateServiceAccountRequest {
+    ServiceAccount service_account = 1;
+}
+
+message CreateServiceAccountResponse {
+}
+
+message UpdateServiceAccountRequest {
+    string id = 1;
+    ServiceAccount service_account = 2;
+}
+
+message UpdateServiceAccountResponse {
+}
+
+message DeleteServiceAccountRequest {
+    string id = 1;
+}
+
+message DeleteServiceAccountResponse {
+}
+
+message GetServiceAccountRequest {
+    string id = 1;
+}
+
+message GetServiceAccountResponse {
+    ServiceAccount service_account = 1;
+}
+
+message ListServiceAccountsRequest {
+}
+
+message ListServiceAccountsResponse {
+    repeated ServiceAccount service_accounts = 1;
+}
+
+message GetServiceAccountByAccessKeyRequest {
+    string access_key = 1;
+}
+
+message GetServiceAccountByAccessKeyResponse {
+    ServiceAccount service_account = 1;
+}
+
+
+//////////////////////////////////////////////////
+// OIDC Provider Messages
+
+message OIDCProvider {
+    string issuer_url = 1;
+    repeated string client_ids = 2;
+    repeated string thumbprints = 3;
+    // account_id scopes the provider; empty means global. The ARN is derived
+    // from it and the issuer URL.
+    string account_id = 4;
+    string arn = 5; // output only
+}
+
+// PutOIDCProviderRequest creates the provider, or replaces the client IDs and
+// thumbprints of an existing one.
+message PutOIDCProviderRequest {
+    string issuer_url = 1;
+    repeated string client_ids = 2;
+    repeated string thumbprints = 3;
+    string account_id = 4;
+}
+
+message PutOIDCProviderResponse {
+    string arn = 1;
+}
+
+message GetOIDCProviderRequest {
+    string issuer_url = 1;
+    string account_id = 2;
+}
+
+message GetOIDCProviderResponse {
+    OIDCProvider provider = 1;
+}
+
+message DeleteOIDCProviderRequest {
+    string issuer_url = 1;
+    string account_id = 2;
+}
+
+message DeleteOIDCProviderResponse {
+}
+
+message ListOIDCProvidersRequest {
+}
+
+message ListOIDCProvidersResponse {
+    repeated OIDCProvider providers = 1;
+}
+
+//////////////////////////////////////////////////
+// Role Messages
+
+message Role {
+    string role_name = 1;
+    string role_arn = 2; // defaults to arn:aws:iam::role/<role_name>
+    string trust_policy = 3; // JSON trust policy document
+    repeated string attached_policies = 4; // managed policy names
+    string description = 5;
+    int64 max_session_duration = 6; // seconds; 0 uses the STS default
+}
+
+// PutRoleRequest creates the role or replaces it.
+message PutRoleRequest {
+    Role role = 1;
+}
+
+message PutRoleResponse {
+    string role_arn = 1;
+}
+
+message GetRoleRequest {
+    string role_name = 1;
+}
+
+message GetRoleResponse {
+    Role role = 1;
+}
+
+message DeleteRoleRequest {
+    string role_name = 1;
+}
+
+message DeleteRoleResponse {
+}
+
+message ListRolesRequest {
+}
+
+message ListRolesResponse {
+    repeated Role roles = 1;
+}
+
+//////////////////////////////////////////////////
+// S3 IAM Cache Management
+// Designed for unidirectional propagation from Filer to S3 Servers
+
+
+message PutIdentityRequest {
+    Identity identity = 1;
+}
+
+message PutIdentityResponse {
+}
+
+message RemoveIdentityRequest {
+    string username = 1;
+}
+
+message RemoveIdentityResponse {
+}
+
+message PutGroupRequest {
+    Group group = 1;
+}
+
+message PutGroupResponse {
+}
+
+message RemoveGroupRequest {
+    string group_name = 1;
+}
+
+message RemoveGroupResponse {
+}

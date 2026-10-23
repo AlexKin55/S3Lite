@@ -20,15 +20,17 @@ func (t *Topology) SyncDataNodeEcShards(shardInfos []*master_pb.VolumeEcShardInf
 	for _, shardInfo := range shardInfos {
 		// Create EcVolumeInfo directly with optimized format
 		ecVolumeInfo := &erasure_coding.EcVolumeInfo{
-			VolumeId:    needle.VolumeId(shardInfo.Id),
-			Collection:  shardInfo.Collection,
-			ShardsInfo:  erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(shardInfo),
-			DiskType:    shardInfo.DiskType,
-			DiskId:      shardInfo.DiskId,
-			ExpireAtSec: shardInfo.ExpireAtSec,
-			FileCount:   shardInfo.FileCount,
-			DeleteCount: shardInfo.DeleteCount,
-			EncodeTsNs:  shardInfo.EncodeTsNs,
+			VolumeId:     needle.VolumeId(shardInfo.Id),
+			Collection:   shardInfo.Collection,
+			ShardsInfo:   erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(shardInfo),
+			DiskType:     shardInfo.DiskType,
+			DiskId:       shardInfo.DiskId,
+			ExpireAtSec:  shardInfo.ExpireAtSec,
+			FileCount:    shardInfo.FileCount,
+			DeleteCount:  shardInfo.DeleteCount,
+			EncodeTsNs:   shardInfo.EncodeTsNs,
+			DataShards:   shardInfo.DataShards,
+			ParityShards: shardInfo.ParityShards,
 		}
 
 		shards = append(shards, ecVolumeInfo)
@@ -50,10 +52,12 @@ func (t *Topology) IncrementalSyncDataNodeEcShards(newEcShards, deletedEcShards 
 	for _, shardInfo := range newEcShards {
 		// Create EcVolumeInfo directly with optimized format
 		ecVolumeInfo := &erasure_coding.EcVolumeInfo{
-			VolumeId:    needle.VolumeId(shardInfo.Id),
-			Collection:  shardInfo.Collection,
-			ShardsInfo:  erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(shardInfo),
-			DiskType:    shardInfo.DiskType,
+			VolumeId:     needle.VolumeId(shardInfo.Id),
+			Collection:   shardInfo.Collection,
+			ShardsInfo:   erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(shardInfo),
+			DiskType:     shardInfo.DiskType,
+			DataShards:   shardInfo.DataShards,
+			ParityShards: shardInfo.ParityShards,
 			DiskId:      shardInfo.DiskId,
 			ExpireAtSec: shardInfo.ExpireAtSec,
 			FileCount:   shardInfo.FileCount,
