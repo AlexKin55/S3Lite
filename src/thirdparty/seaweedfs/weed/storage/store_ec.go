@@ -294,15 +294,18 @@ func (s *Store) MountEcShards(collection string, vid needle.VolumeId, shardId er
 
 			si := erasure_coding.NewShardsInfo()
 			si.Set(erasure_coding.NewShardInfo(shardId, erasure_coding.ShardSize(ecVolume.ShardSize())))
+			ds, ps := ecVolumeHeartbeatRatio(ecVolume)
 			s.NewEcShardsChan <- &master_pb.VolumeEcShardInformationMessage{
-				Id:          uint32(vid),
-				Collection:  collection,
-				EcIndexBits: uint32(si.Bitmap()),
-				ShardSizes:  si.SizesInt64(),
-				DiskType:    string(ecVolume.DiskType()),
-				ExpireAtSec: ecVolume.ExpireAtSec,
-				DiskId:      uint32(diskId),
-				EncodeTsNs:  ecVolume.EncodeTsNs,
+				Id:           uint32(vid),
+				Collection:   collection,
+				EcIndexBits:  uint32(si.Bitmap()),
+				ShardSizes:   si.SizesInt64(),
+				DiskType:     string(ecVolume.DiskType()),
+				ExpireAtSec:  ecVolume.ExpireAtSec,
+				DiskId:       uint32(diskId),
+				EncodeTsNs:   ecVolume.EncodeTsNs,
+				DataShards:   ds,
+				ParityShards: ps,
 			}
 			s.UpdateMaxVolumeIdSeen(vid)
 			return nil
@@ -335,6 +338,15 @@ func (s *Store) MountEcShards(collection string, vid needle.VolumeId, shardId er
 		b = append(b, fmt.Sprintf("%s: %v", f.dir, f.err)...)
 	}
 	return fmt.Errorf("MountEcShards %d.%d load failures: %s", vid, shardId, string(b))
+}
+
+// ecVolumeHeartbeatRatio returns the per-volume EC ratio from the EC context,
+// 0 meaning the volume predates (or lacks) the heartbeat ratio fields.
+func ecVolumeHeartbeatRatio(ev *erasure_coding.EcVolume) (uint32, uint32) {
+	if ev == nil || ev.ECContext == nil || ev.ECContext.DataShards <= 0 {
+		return 0, 0
+	}
+	return uint32(ev.ECContext.DataShards), uint32(ev.ECContext.ParityShards)
 }
 
 func (s *Store) UnmountEcShards(vid needle.VolumeId, shardId erasure_coding.ShardId, reqEncodeTsNs int64) error {

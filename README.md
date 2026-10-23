@@ -40,7 +40,7 @@ printf 'lock\nec.encode -volumeId=1 -dataShards=6 -parityShards=4\nunlock\n' \
 - [x] Stage 2: custom EC k+m patch, EC 6+4 verified (4 nodes offline → reads still work)
 - [x] Stage 3: Go node agent (registration, volume supervision, heartbeat, auto-restart on crash)
 - [x] Stage 4: control plane core (registry, health, redundancy OK/DEGRADED/AT_RISK, notifications, metrics)
-- [ ] Stage 5: integration tests
+- [x] Stage 5: integration tests (12/12 PASS: DEGRADED, AT_RISK, return, rebuild scenarios)
 - [ ] Stage 6: production readiness
 
 Details: [plans/action-plan.md](plans/action-plan.md), [plans/distributed-storage-plan.md](plans/distributed-storage-plan.md).

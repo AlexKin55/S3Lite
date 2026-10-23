@@ -168,16 +168,19 @@ func NewStore(
 
 			// Use non-blocking send during startup to avoid deadlock
 			// The channel reader only starts after connecting to master, but we're loading during startup
+			ds, ps := ecVolumeHeartbeatRatio(ecVolume)
 			select {
 			case s.NewEcShardsChan <- &master_pb.VolumeEcShardInformationMessage{
-				Id:          uint32(vid),
-				Collection:  collection,
-				EcIndexBits: si.Bitmap(),
-				ShardSizes:  si.SizesInt64(),
-				DiskType:    string(location.DiskType),
-				ExpireAtSec: ecVolume.ExpireAtSec,
-				DiskId:      diskId,
-				EncodeTsNs:  ecVolume.EncodeTsNs,
+				Id:           uint32(vid),
+				Collection:   collection,
+				EcIndexBits:  si.Bitmap(),
+				ShardSizes:   si.SizesInt64(),
+				DiskType:     string(location.DiskType),
+				ExpireAtSec:  ecVolume.ExpireAtSec,
+				DiskId:       diskId,
+				EncodeTsNs:   ecVolume.EncodeTsNs,
+				DataShards:   ds,
+				ParityShards: ps,
 			}:
 			default:
 				// Channel full during startup - this is OK, heartbeat will report EC shards later
