@@ -1,0 +1,216 @@
+package weed_server
+
+// https://yusufs.medium.com/creating-distributed-kv-database-by-implementing-raft-consensus-using-golang-d0884eef2e28
+// https://github.com/Jille/raft-grpc-example/blob/cd5bcab0218f008e044fbeee4facdd01b06018ad/application.go#L18
+
+import (
+	"encoding/json"
+	"fmt"
+	"math/rand/v2"
+	"os"
+	"path"
+	"path/filepath"
+	"time"
+
+	transport "github.com/Jille/raft-grpc-transport"
+	"github.com/armon/go-metrics"
+	"github.com/armon/go-metrics/prometheus"
+	"github.com/hashicorp/raft"
+	hashicorpRaft "github.com/hashicorp/raft"
+	boltdb "github.com/hashicorp/raft-boltdb/v2"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/topology"
+	"google.golang.org/grpc"
+)
+
+const (
+	ldbFile            = "logs.dat"
+	sdbFile            = "stable.dat"
+	updatePeersTimeout = 15 * time.Minute
+)
+
+func raftServerID(server pb.ServerAddress) string {
+	return server.ToHttpAddress()
+}
+
+func (s *RaftServer) AddPeersConfiguration() (cfg raft.Configuration) {
+	for _, peer := range s.peers {
+		cfg.Servers = append(cfg.Servers, raft.Server{
+			Suffrage: raft.Voter,
+			ID:       raft.ServerID(raftServerID(peer)),
+			Address:  raft.ServerAddress(peer.ToGrpcAddress()),
+		})
+	}
+	return cfg
+}
+
+func (s *RaftServer) monitorLeaderLoop(updatePeers bool) {
+	for {
+		prevLeader, _ := s.RaftHashicorp.LeaderWithID()
+		select {
+		case isLeader := <-s.RaftHashicorp.LeaderCh():
+			leader, _ := s.RaftHashicorp.LeaderWithID()
+			s.topo.SetLastLeaderChangeTime(time.Now())
+			if isLeader {
+
+				if updatePeers {
+					s.updatePeers()
+					updatePeers = false
+				}
+
+				s.topo.DoBarrier()
+
+				EnsureTopologyId(s.topo, func() bool {
+					return s.RaftHashicorp.State() == hashicorpRaft.Leader
+				}, func(topologyId string) error {
+					command := topology.NewMaxVolumeIdCommand(s.topo.GetMaxVolumeId(), topologyId)
+					b, err := json.Marshal(command)
+					if err != nil {
+						return err
+					}
+					return s.RaftHashicorp.Apply(b, 5*time.Second).Error()
+				})
+
+				stats.MasterLeaderChangeCounter.WithLabelValues(fmt.Sprintf("%+v", leader)).Inc()
+			} else {
+				s.topo.BarrierReset()
+			}
+			glog.V(0).Infof("is leader %+v change event: %+v => %+v", isLeader, prevLeader, leader)
+			prevLeader = leader
+		}
+	}
+}
+
+func (s *RaftServer) updatePeers() {
+	peerLeader := raftServerID(s.serverAddr)
+	desiredPeers := make(map[string]pb.ServerAddress, len(s.peers))
+	for _, peer := range s.peers {
+		desiredPeers[raftServerID(peer)] = peer
+	}
+
+	existsPeerName := make(map[string]bool)
+	for _, server := range s.RaftHashicorp.GetConfiguration().Configuration().Servers {
+		if string(server.ID) == peerLeader {
+			continue
+		}
+		existsPeerName[string(server.ID)] = true
+	}
+	for peerName, peer := range desiredPeers {
+		if peerName == peerLeader || existsPeerName[peerName] {
+			continue
+		}
+		glog.V(0).Infof("adding new peer: %s", peerName)
+		s.RaftHashicorp.AddVoter(
+			raft.ServerID(peerName), raft.ServerAddress(peer.ToGrpcAddress()), 0, 0)
+	}
+	for peer := range existsPeerName {
+		if _, found := desiredPeers[peer]; !found {
+			glog.V(0).Infof("removing old peer: %s", peer)
+			s.RaftHashicorp.RemoveServer(raft.ServerID(peer), 0, 0)
+		}
+	}
+	if _, found := desiredPeers[peerLeader]; !found {
+		glog.V(0).Infof("removing old leader peer: %s", peerLeader)
+		s.RaftHashicorp.RemoveServer(raft.ServerID(peerLeader), 0, 0)
+	}
+}
+
+func NewHashicorpRaftServer(option *RaftServerOption) (*RaftServer, error) {
+	s := &RaftServer{
+		peers:      option.Peers,
+		serverAddr: option.ServerAddr,
+		dataDir:    option.DataDir,
+		topo:       option.Topo,
+	}
+
+	c := raft.DefaultConfig()
+	c.LocalID = raft.ServerID(raftServerID(s.serverAddr))
+	c.HeartbeatTimeout = time.Duration(float64(option.HeartbeatInterval) * (rand.Float64()*0.25 + 1))
+	c.ElectionTimeout = option.ElectionTimeout
+	if c.LeaderLeaseTimeout > c.HeartbeatTimeout {
+		c.LeaderLeaseTimeout = c.HeartbeatTimeout
+	}
+	if glog.V(4) {
+		c.LogLevel = "Debug"
+	} else if glog.V(2) {
+		c.LogLevel = "Info"
+	} else if glog.V(1) {
+		c.LogLevel = "Warn"
+	} else if glog.V(0) {
+		c.LogLevel = "Error"
+	}
+
+	if err := raft.ValidateConfig(c); err != nil {
+		return nil, fmt.Errorf("raft.ValidateConfig: %w", err)
+	}
+
+	if err := os.MkdirAll(path.Join(s.dataDir, "snapshots"), os.ModePerm); err != nil {
+		return nil, err
+	}
+	option.Topo.SetMaxVolumeIdFile(filepath.Join(s.dataDir, "max_volume_id"))
+	baseDir := s.dataDir
+
+	ldb, err := boltdb.NewBoltStore(filepath.Join(baseDir, ldbFile))
+	if err != nil {
+		return nil, fmt.Errorf("boltdb.NewBoltStore(%q): %v", filepath.Join(baseDir, "logs.dat"), err)
+	}
+
+	sdb, err := boltdb.NewBoltStore(filepath.Join(baseDir, sdbFile))
+	if err != nil {
+		return nil, fmt.Errorf("boltdb.NewBoltStore(%q): %v", filepath.Join(baseDir, "stable.dat"), err)
+	}
+
+	fss, err := raft.NewFileSnapshotStore(baseDir, 3, os.Stderr)
+	if err != nil {
+		return nil, fmt.Errorf("raft.NewFileSnapshotStore(%q, ...): %v", baseDir, err)
+	}
+
+	s.TransportManager = transport.New(raft.ServerAddress(s.serverAddr), []grpc.DialOption{option.GrpcDialOption})
+
+	stateMachine := StateMachine{topo: option.Topo}
+	s.RaftHashicorp, err = raft.NewRaft(c, &stateMachine, ldb, sdb, fss, s.TransportManager.Transport())
+	if err != nil {
+		return nil, fmt.Errorf("raft.NewRaft: %w", err)
+	}
+
+	// The caller bootstraps, once it has confirmed no peer already has a
+	// leader: bootstrapping next to a live leader forms a second cluster
+	// instead of joining the first one.
+	updatePeers := len(s.RaftHashicorp.GetConfiguration().Configuration().Servers) > 0
+
+	go s.monitorLeaderLoop(updatePeers)
+
+	ticker := time.NewTicker(c.HeartbeatTimeout * 10)
+	if glog.V(4) {
+		go func() {
+			for {
+				select {
+				case <-ticker.C:
+					cfuture := s.RaftHashicorp.GetConfiguration()
+					if err = cfuture.Error(); err != nil {
+						glog.Fatalf("error getting config: %s", err)
+					}
+					configuration := cfuture.Configuration()
+					glog.V(4).Infof("Showing peers known by %s:\n%+v", s.RaftHashicorp.String(), configuration.Servers)
+				}
+			}
+		}()
+	}
+
+	// Configure a prometheus sink as the raft metrics sink
+	if sink, err := prometheus.NewPrometheusSinkFrom(prometheus.PrometheusOpts{
+		Registerer: stats.Gather,
+	}); err != nil {
+		return nil, fmt.Errorf("NewPrometheusSink: %w", err)
+	} else {
+		metricsConf := metrics.DefaultConfig(stats.Namespace)
+		metricsConf.EnableRuntimeMetrics = false
+		if _, err = metrics.NewGlobal(metricsConf, sink); err != nil {
+			return nil, fmt.Errorf("metrics.NewGlobal: %w", err)
+		}
+	}
+
+	return s, nil
+}

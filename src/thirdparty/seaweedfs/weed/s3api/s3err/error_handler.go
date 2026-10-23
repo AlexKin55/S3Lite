@@ -1,0 +1,177 @@
+package s3err
+
+import (
+	"bytes"
+	"encoding/xml"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/aws/aws-sdk-go/private/protocol/xml/xmlutil"
+	"github.com/gorilla/mux"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/util/request_id"
+)
+
+type mimeType string
+
+const (
+	mimeNone mimeType = ""
+	MimeXML  mimeType = "application/xml"
+
+	errorResponseBodyDrainTimeout = 30 * time.Second
+)
+
+func WriteAwsXMLResponse(w http.ResponseWriter, r *http.Request, statusCode int, result interface{}) {
+	var bytesBuffer bytes.Buffer
+	err := xmlutil.BuildXML(result, xml.NewEncoder(&bytesBuffer))
+	if err != nil {
+		WriteErrorResponse(w, r, ErrInternalError)
+		return
+	}
+	WriteResponse(w, r, statusCode, bytesBuffer.Bytes(), MimeXML)
+}
+
+func WriteXMLResponse(w http.ResponseWriter, r *http.Request, statusCode int, response interface{}) {
+	WriteResponse(w, r, statusCode, EncodeXMLResponse(response), MimeXML)
+}
+
+func WriteEmptyResponse(w http.ResponseWriter, r *http.Request, statusCode int) {
+	WriteResponse(w, r, statusCode, []byte{}, mimeNone)
+	PostLog(r, statusCode, ErrNone)
+}
+
+func WriteErrorResponse(w http.ResponseWriter, r *http.Request, errorCode ErrorCode) {
+	WriteErrorResponseWithMessage(w, r, errorCode, "")
+}
+
+// WriteErrorResponseWithMessage writes an S3 error response that uses the
+// standard error code mapping (status + Code). When message is non-empty,
+// it overrides the default Message field so the caller can surface why the
+// request was rejected (e.g. which POST policy condition failed) instead
+// of the generic APIError Description.
+func WriteErrorResponseWithMessage(w http.ResponseWriter, r *http.Request, errorCode ErrorCode, message string) {
+	r, reqID := request_id.Ensure(r)
+	vars := mux.Vars(r)
+	bucket := vars["bucket"]
+	object := vars["object"]
+	if strings.HasPrefix(object, "/") {
+		object = object[1:]
+	}
+
+	apiError := GetAPIError(errorCode)
+	errorResponse := getRESTErrorResponse(apiError, r.URL.Path, bucket, object, reqID)
+	if message != "" {
+		errorResponse.Message = message
+	}
+	drainRequestBody(w, r)
+	WriteXMLResponse(w, r, apiError.HTTPStatusCode, errorResponse)
+	PostLog(r, apiError.HTTPStatusCode, errorCode)
+}
+
+func drainRequestBody(w http.ResponseWriter, r *http.Request) {
+	if r == nil || r.Body == nil || r.Body == http.NoBody {
+		return
+	}
+	rc := http.NewResponseController(w)
+	if err := rc.SetReadDeadline(time.Now().Add(errorResponseBodyDrainTimeout)); err == nil {
+		defer rc.SetReadDeadline(time.Time{})
+	}
+	_, _ = io.Copy(io.Discard, r.Body)
+}
+
+func getRESTErrorResponse(err APIError, resource string, bucket, object, requestID string) RESTErrorResponse {
+	return RESTErrorResponse{
+		Code:       err.Code,
+		BucketName: bucket,
+		Key:        object,
+		Message:    err.Description,
+		Resource:   resource,
+		RequestID:  requestID,
+	}
+}
+
+// Encodes the response headers into XML format.
+func EncodeXMLResponse(response interface{}) []byte {
+	var bytesBuffer bytes.Buffer
+	bytesBuffer.WriteString(xml.Header)
+	e := xml.NewEncoder(&bytesBuffer)
+	e.Encode(response)
+	return bytesBuffer.Bytes()
+}
+
+func setCommonHeaders(w http.ResponseWriter, r *http.Request) {
+	_, reqID := request_id.Ensure(r)
+	w.Header().Set(request_id.AmzRequestIDHeader, reqID)
+	w.Header().Set("Accept-Ranges", "bytes")
+
+	// Handle CORS headers for requests with Origin header
+	if r.Header.Get("Origin") != "" {
+		// Use mux.Vars to detect bucket-specific requests more reliably
+		vars := mux.Vars(r)
+		bucket := vars["bucket"]
+		isBucketRequest := bucket != ""
+
+		if !isBucketRequest {
+			// Service-level request (like OPTIONS /) - apply static CORS if none set
+			if w.Header().Get("Access-Control-Allow-Origin") == "" {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				w.Header().Set("Access-Control-Allow-Methods", "*")
+				w.Header().Set("Access-Control-Allow-Headers", "*")
+				w.Header().Set("Access-Control-Expose-Headers", "*")
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			}
+		} else {
+			// Bucket-specific request - preserve existing CORS headers or set default
+			// This handles cases where CORS middleware set headers but auth failed
+			if w.Header().Get("Access-Control-Allow-Origin") == "" {
+				// No CORS headers were set by middleware, so this request doesn't match any CORS rule
+				// According to CORS spec, we should not set CORS headers for non-matching requests
+				// However, if the bucket has CORS config but request doesn't match,
+				// we still should not set headers here as it would be incorrect
+			}
+			// If CORS headers were already set by middleware, preserve them
+		}
+	}
+}
+
+// bodyAllowedForStatus is a copy of http.bodyAllowedForStatus non-exported function.
+func bodyAllowedForStatus(status int) bool {
+	switch {
+	case status >= 100 && status <= 199:
+		return false
+	case status == http.StatusNoContent:
+		return false
+	case status == http.StatusNotModified:
+		return false
+	}
+	return true
+}
+
+func WriteResponse(w http.ResponseWriter, r *http.Request, statusCode int, response []byte, mType mimeType) {
+	setCommonHeaders(w, r)
+	canHaveBody := bodyAllowedForStatus(statusCode)
+	if response != nil && canHaveBody {
+		w.Header().Set("Content-Length", strconv.Itoa(len(response)))
+	}
+	if mType != mimeNone {
+		w.Header().Set("Content-Type", string(mType))
+	}
+	w.WriteHeader(statusCode)
+	if response != nil && canHaveBody && r.Method != http.MethodHead {
+		glog.V(4).Infof("status %d %s: %s", statusCode, mType, string(response))
+		_, err := w.Write(response)
+		if err != nil {
+			glog.V(1).Infof("write err: %v", err)
+		}
+		w.(http.Flusher).Flush()
+	}
+}
+
+// If none of the http routes match respond with MethodNotAllowed
+func NotFoundHandler(w http.ResponseWriter, r *http.Request) {
+	glog.V(2).Infof("unsupported %s %s", r.Method, r.RequestURI)
+	WriteErrorResponse(w, r, ErrMethodNotAllowed)
+}

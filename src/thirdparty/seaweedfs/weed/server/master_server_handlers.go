@@ -1,0 +1,294 @@
+package weed_server
+
+import (
+	"fmt"
+	"math"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/topology"
+)
+
+func (ms *MasterServer) lookupVolumeId(vids []string, collection string) (volumeLocations map[string]operation.LookupResult) {
+	volumeLocations = make(map[string]operation.LookupResult)
+	for _, vid := range vids {
+		commaSep := strings.Index(vid, ",")
+		if commaSep > 0 {
+			vid = vid[0:commaSep]
+		}
+		if _, ok := volumeLocations[vid]; ok {
+			continue
+		}
+		volumeLocations[vid] = ms.findVolumeLocation(collection, vid)
+	}
+	return
+}
+
+// If "fileId" is provided, this returns the fileId location and a JWT to update or delete the file.
+// If "volumeId" is provided, this only returns the volumeId location
+func (ms *MasterServer) dirLookupHandler(w http.ResponseWriter, r *http.Request) {
+	vid := r.FormValue("volumeId")
+	if vid != "" {
+		// backward compatible
+		commaSep := strings.Index(vid, ",")
+		if commaSep > 0 {
+			vid = vid[0:commaSep]
+		}
+	}
+	fileId := r.FormValue("fileId")
+	if fileId != "" {
+		commaSep := strings.Index(fileId, ",")
+		if commaSep > 0 {
+			vid = fileId[0:commaSep]
+		}
+	}
+	collection := r.FormValue("collection") // optional, but can be faster if too many collections
+	location := ms.findVolumeLocation(collection, vid)
+	httpStatus := http.StatusOK
+	if location.Error != "" || location.Locations == nil {
+		if location.NotFound && ms.Topo.IsLeader() && ms.Topo.IsWarmingUp() {
+			httpStatus = http.StatusServiceUnavailable
+			remaining := ms.Topo.RemainingWarmupDuration()
+			if remaining < time.Second {
+				remaining = time.Second
+			}
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(math.Ceil(remaining.Seconds()))))
+			location.Error = "service warming up, please retry"
+		} else {
+			httpStatus = http.StatusNotFound
+		}
+	} else {
+		forRead := r.FormValue("read")
+		isRead := forRead == "yes"
+		ms.maybeAddJwtAuthorization(w, fileId, !isRead)
+	}
+	writeJsonQuiet(w, r, httpStatus, location)
+}
+
+// findVolumeLocation finds the volume location from master topo if it is leader,
+// or from master client if not leader
+func (ms *MasterServer) findVolumeLocation(collection, vid string) operation.LookupResult {
+	var locations []operation.Location
+	var err error
+	if ms.Topo.IsLeader() {
+		volumeId, newVolumeIdErr := needle.NewVolumeId(vid)
+		if newVolumeIdErr != nil {
+			err = fmt.Errorf("unknown volume id %s", vid)
+		} else {
+			machines := ms.Topo.Lookup(collection, volumeId)
+			for _, loc := range machines {
+				locations = append(locations, topologyLocation(loc, volumeId))
+			}
+		}
+	} else {
+		machines, getVidLocationsErr := ms.MasterClient.GetVidLocations(vid)
+		for _, loc := range machines {
+			locations = append(locations, operation.Location{
+				Url:               loc.Url,
+				PublicUrl:         loc.PublicUrl,
+				DataCenter:        loc.DataCenter,
+				GrpcPort:          loc.GrpcPort,
+				DataInRemote:      loc.DataInRemote,
+				ReadOnly:          loc.ReadOnly,
+				ReadOnlyCanDelete: loc.ReadOnlyCanDelete,
+			})
+		}
+		err = getVidLocationsErr
+	}
+	notFound := false
+	if len(locations) == 0 && err == nil {
+		err = fmt.Errorf("volume id %s not found", vid)
+		notFound = true
+	}
+	ret := operation.LookupResult{
+		VolumeOrFileId: vid,
+		Locations:      locations,
+		NotFound:       notFound,
+	}
+	if err != nil {
+		ret.Error = err.Error()
+	}
+	return ret
+}
+
+// topologyLocation describes one node holding vid. A node that answers for an
+// EC volume holds shards rather than a volume record, so an absent record means
+// the read is local, never that the node should be left out of the answer.
+func topologyLocation(dn *topology.DataNode, vid needle.VolumeId) operation.Location {
+	dataInRemote, readOnly, readOnlyCanDelete := false, false, false
+	if volInfo, lookupErr := dn.GetVolumesById(vid); lookupErr == nil {
+		dataInRemote = volInfo.IsRemote()
+		readOnly = volInfo.ReadOnly
+		readOnlyCanDelete = volInfo.ReadOnlyCanDelete
+	}
+	return operation.Location{
+		Url:               dn.Url(),
+		PublicUrl:         dn.PublicUrl,
+		DataCenter:        dn.GetDataCenterId(),
+		GrpcPort:          dn.GrpcPort,
+		DataInRemote:      dataInRemote,
+		ReadOnly:          readOnly,
+		ReadOnlyCanDelete: readOnlyCanDelete,
+	}
+}
+
+func (ms *MasterServer) dirAssignHandler(w http.ResponseWriter, r *http.Request) {
+	if ms.Topo.IsLeader() && ms.Topo.IsWarmingUp() {
+		remaining := ms.Topo.RemainingWarmupDuration()
+		if remaining < time.Second {
+			remaining = time.Second
+		}
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(math.Ceil(remaining.Seconds()))))
+		writeJsonQuiet(w, r, http.StatusServiceUnavailable, operation.AssignResult{
+			Error: "master is warming up, topology is still loading",
+		})
+		return
+	}
+	stats.AssignRequest()
+	requestedCount, e := strconv.ParseUint(r.FormValue("count"), 10, 64)
+	if e != nil || requestedCount == 0 {
+		requestedCount = 1
+	}
+
+	writableVolumeCount, e := strconv.ParseUint(r.FormValue("writableVolumeCount"), 10, 32)
+	if e != nil {
+		writableVolumeCount = 0
+	}
+
+	expectedDataSize, e := strconv.ParseUint(r.FormValue("dataSize"), 10, 64)
+	if e != nil {
+		expectedDataSize = 0
+	}
+
+	option, err := ms.getVolumeGrowOption(r)
+	if err != nil {
+		writeJsonQuiet(w, r, http.StatusNotAcceptable, operation.AssignResult{Error: err.Error()})
+		return
+	}
+
+	vl := ms.Topo.GetVolumeLayout(option.Collection, option.ReplicaPlacement, option.Ttl, option.DiskType)
+
+	var (
+		lastErr           error
+		maxTimeout        = time.Second * 10
+		startTime         = time.Now()
+		initiatedGrow     bool
+		repickedAfterGrow bool
+	)
+
+	if !ms.Topo.DataCenterExists(option.DataCenter) {
+		writeJsonQuiet(w, r, http.StatusBadRequest, operation.AssignResult{
+			Error: fmt.Sprintf("data center %v not found in topology", option.DataCenter),
+		})
+		return
+	}
+	if !ms.Topo.RackExists(option.DataCenter, option.Rack) {
+		writeJsonQuiet(w, r, http.StatusBadRequest, operation.AssignResult{
+			Error: fmt.Sprintf("rack %v not found in topology", option.Rack),
+		})
+		return
+	}
+	if !ms.Topo.DataNodeExists(option.DataCenter, option.Rack, option.DataNode) {
+		writeJsonQuiet(w, r, http.StatusBadRequest, operation.AssignResult{
+			Error: fmt.Sprintf("data node %v not found in topology", option.DataNode),
+		})
+		return
+	}
+
+	// As in gRPC Assign: the periodic growth scan keeps this layout topped up
+	// to the writableVolumeCount clients ask for. 0 (not sent) is ignored.
+	vl.SetLastGrowCount(uint32(writableVolumeCount))
+
+	for time.Since(startTime) < maxTimeout {
+		fid, count, dnList, shouldGrow, err := ms.Topo.PickForWrite(requestedCount, option, vl, expectedDataSize)
+		if shouldGrow && !initiatedGrow && !ms.option.VolumeGrowthDisabled && vl.AddGrowRequestIfAbsent() {
+			initiatedGrow = true
+			glog.V(0).Infof("dirAssign volume growth %v from %v", option.String(), r.RemoteAddr)
+			if err != nil && ms.Topo.AvailableSpaceFor(option) <= 0 {
+				err = fmt.Errorf("%s and no free volumes left for %s", err.Error(), option.String())
+			}
+			ms.volumeGrowthRequestChan <- &topology.VolumeGrowRequest{
+				Option: option,
+				Count:  uint32(writableVolumeCount),
+				Reason: "http assign",
+			}
+		}
+		if err != nil {
+			stats.MasterPickForWriteErrorCounter.Inc()
+			lastErr = err
+			if shouldGrow {
+				if ms.Topo.AvailableSpaceFor(option) <= 0 {
+					break // out of space: surface the real error (406 below)
+				}
+				// See Assign: only the initiator waits, and only while the
+				// growth it triggered is still pending.
+				if initiatedGrow != vl.HasGrowRequest() {
+					// See Assign: re-pick once after the growth concludes before
+					// shedding — the failed pick may predate the conclusion.
+					if initiatedGrow && !repickedAfterGrow {
+						repickedAfterGrow = true
+						continue
+					}
+					w.Header().Set("Retry-After", "1")
+					writeJsonQuiet(w, r, http.StatusServiceUnavailable, operation.AssignResult{
+						Error: fmt.Sprintf("no writable volumes for %s, volume growth in progress", option.String()),
+					})
+					return
+				}
+			}
+			select {
+			case <-r.Context().Done():
+				return // client gone
+			case <-time.After(200 * time.Millisecond):
+			}
+			continue
+		} else {
+			ms.maybeAddJwtAuthorization(w, fid, true)
+			dn := dnList.Head()
+			if dn == nil {
+				continue
+			}
+			writeJsonQuiet(w, r, http.StatusOK, operation.AssignResult{Fid: fid, Url: dn.Url(), PublicUrl: dn.PublicUrl, Count: count})
+			return
+		}
+	}
+
+	// See Assign: initiator that timed out with growth still pending stays retryable.
+	if initiatedGrow && vl.HasGrowRequest() && ms.Topo.AvailableSpaceFor(option) > 0 {
+		w.Header().Set("Retry-After", "1")
+		writeJsonQuiet(w, r, http.StatusServiceUnavailable, operation.AssignResult{
+			Error: fmt.Sprintf("no writable volumes for %s, volume growth in progress", option.String()),
+		})
+		return
+	}
+	if lastErr != nil {
+		writeJsonQuiet(w, r, http.StatusNotAcceptable, operation.AssignResult{Error: lastErr.Error()})
+	} else {
+		writeJsonQuiet(w, r, http.StatusRequestTimeout, operation.AssignResult{Error: "request timeout"})
+	}
+}
+
+func (ms *MasterServer) maybeAddJwtAuthorization(w http.ResponseWriter, fileId string, isWrite bool) {
+	if fileId == "" {
+		return
+	}
+	var encodedJwt security.EncodedJwt
+	if isWrite {
+		encodedJwt = security.GenJwtForVolumeServer(ms.guard.SigningKey(), ms.guard.ExpiresAfterSec(), fileId)
+	} else {
+		encodedJwt = security.GenJwtForVolumeServer(ms.guard.ReadSigningKey(), ms.guard.ReadExpiresAfterSec(), fileId)
+	}
+	if encodedJwt == "" {
+		return
+	}
+
+	w.Header().Set("Authorization", security.BearerPrefix+string(encodedJwt))
+}

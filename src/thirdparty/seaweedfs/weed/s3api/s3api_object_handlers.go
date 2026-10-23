@@ -1,0 +1,3749 @@
+package s3api
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"mime"
+	"net/http"
+	"net/url"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
+	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+)
+
+// zeroBuf is a reusable buffer of zero bytes for padding operations
+// Package-level to avoid per-call allocations in writeZeroBytes
+var zeroBuf = make([]byte, 32*1024)
+
+// countingWriter wraps an io.Writer to count bytes written
+type countingWriter struct {
+	w        io.Writer
+	written  int64
+	writeErr error
+}
+
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.written += int64(n)
+	if err != nil {
+		cw.writeErr = err
+	}
+	return n, err
+}
+
+// commitOnFirstWrite defers the status line until the first body write, so the
+// first read from the volume servers must succeed before the 200 is committed
+// and a missing needle still gets a clean 5xx instead of a broken 200 body.
+type commitOnFirstWrite struct {
+	w         io.Writer
+	commit    func()
+	committed bool
+}
+
+func (c *commitOnFirstWrite) Write(p []byte) (int, error) {
+	c.Commit()
+	return c.w.Write(p)
+}
+
+// Commit commits the response if the first body write has not already done so;
+// a zero-length body never writes, so a successful stream must end with this.
+func (c *commitOnFirstWrite) Commit() {
+	if !c.committed {
+		c.committed = true
+		c.commit()
+	}
+}
+
+// adjustRangeForPart adjusts a client's Range header to absolute offsets within a part.
+// Parameters:
+//   - partStartOffset: the absolute start offset of the part in the object
+//   - partEndOffset: the absolute end offset of the part in the object
+//   - clientRangeHeader: the Range header value from the client (e.g., "bytes=0-99")
+//
+// Returns:
+//   - adjustedStart: the adjusted absolute start offset
+//   - adjustedEnd: the adjusted absolute end offset
+//   - error: nil on success, error if the range is invalid
+func adjustRangeForPart(partStartOffset, partEndOffset int64, clientRangeHeader string) (adjustedStart, adjustedEnd int64, err error) {
+	// Validate inputs
+	if partStartOffset > partEndOffset {
+		return 0, 0, fmt.Errorf("invalid part boundaries: start %d > end %d", partStartOffset, partEndOffset)
+	}
+
+	// If no range header, return the full part
+	if clientRangeHeader == "" || !strings.HasPrefix(clientRangeHeader, "bytes=") {
+		return partStartOffset, partEndOffset, nil
+	}
+
+	// Parse client's range request (relative to the part)
+	rangeSpec := clientRangeHeader[6:] // Remove "bytes=" prefix
+	parts := strings.Split(rangeSpec, "-")
+
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid range format")
+	}
+
+	partSize := partEndOffset - partStartOffset + 1
+	var clientStart, clientEnd int64
+
+	// Parse start offset
+	if parts[0] != "" {
+		clientStart, err = strconv.ParseInt(parts[0], 10, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid range start: %w", err)
+		}
+	}
+
+	// Parse end offset
+	if parts[1] != "" {
+		clientEnd, err = strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid range end: %w", err)
+		}
+	} else {
+		// No end specified, read to end of part
+		clientEnd = partSize - 1
+	}
+
+	// Handle suffix-range (e.g., "bytes=-100" means last 100 bytes)
+	// When parts[0] is empty, the parsed clientEnd value represents the suffix length,
+	// not the actual end position. We compute the actual start/end from the suffix length.
+	if parts[0] == "" {
+		suffixLength := clientEnd // clientEnd temporarily holds the suffix length
+		if suffixLength > partSize {
+			suffixLength = partSize
+		}
+		clientStart = partSize - suffixLength
+		clientEnd = partSize - 1 // Now clientEnd holds the actual end position
+	}
+
+	// Validate range is within part boundaries
+	if clientStart < 0 || clientStart >= partSize {
+		return 0, 0, fmt.Errorf("range start %d out of bounds for part size %d", clientStart, partSize)
+	}
+	if clientEnd >= partSize {
+		clientEnd = partSize - 1
+	}
+	if clientStart > clientEnd {
+		return 0, 0, fmt.Errorf("range start %d > end %d", clientStart, clientEnd)
+	}
+
+	// Adjust to absolute offsets in the object
+	adjustedStart = partStartOffset + clientStart
+	adjustedEnd = partStartOffset + clientEnd
+
+	return adjustedStart, adjustedEnd, nil
+}
+
+// parseAndValidateRange parses the Range header and validates it against the object size.
+// It also handles SeaweedFS-specific directory object checks.
+// Returns:
+//   - offset: the absolute start offset in the object
+//   - size: the number of bytes to read
+//   - isRangeRequest: true if the client requested a range
+//   - err: nil on success, StreamError on failure (wraps S3 error response)
+func (s3a *S3ApiServer) parseAndValidateRange(w http.ResponseWriter, r *http.Request, entry *filer_pb.Entry, totalSize int64, bucket, object string) (offset, size int64, isRangeRequest bool, err *StreamError) {
+	rangeHeader := r.Header.Get("Range")
+	if rangeHeader == "" || !strings.HasPrefix(rangeHeader, "bytes=") {
+		return 0, totalSize, false, nil
+	}
+
+	rangeSpec := rangeHeader[6:]
+	parts := strings.Split(rangeSpec, "-")
+	if len(parts) != 2 {
+		return 0, totalSize, false, nil
+	}
+
+	// Empty directory: 404. A file promoted to a directory keeps its data and
+	// stays retrievable, and a stored directory-key marker is an object, not a
+	// missing key — an unsatisfiable range answers 416.
+	if entry.IsDirectory && totalSize == 0 && !entry.IsDirectoryKeyObject() {
+		s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+		return 0, 0, false, newStreamErrorWithResponse(fmt.Errorf("directory object %s/%s cannot be retrieved", bucket, object))
+	}
+
+	var startOffset, endOffset int64
+	if parts[0] == "" && parts[1] != "" {
+		// Suffix range: bytes=-N (last N bytes)
+		if suffixLen, err := strconv.ParseInt(parts[1], 10, 64); err == nil {
+			// RFC 7233: suffix range on empty object or zero-length suffix is unsatisfiable
+			if totalSize == 0 || suffixLen <= 0 {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+				s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRange)
+				return 0, 0, false, newStreamErrorWithResponse(fmt.Errorf("invalid suffix range for empty object"))
+			}
+			if suffixLen > totalSize {
+				suffixLen = totalSize
+			}
+			startOffset = totalSize - suffixLen
+			endOffset = totalSize - 1
+		} else {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+			s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRange)
+			return 0, 0, false, newStreamErrorWithResponse(fmt.Errorf("invalid suffix range"))
+		}
+	} else {
+		// Regular range or open-ended range
+		startOffset = 0
+		endOffset = totalSize - 1
+
+		if parts[0] != "" {
+			parsed, parseErr := strconv.ParseInt(parts[0], 10, 64)
+			if parseErr != nil {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+				s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRange)
+				return 0, 0, false, newStreamErrorWithResponse(fmt.Errorf("invalid range start: %w", parseErr))
+			}
+			startOffset = parsed
+		}
+		if parts[1] != "" {
+			parsed, parseErr := strconv.ParseInt(parts[1], 10, 64)
+			if parseErr != nil {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+				s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRange)
+				return 0, 0, false, newStreamErrorWithResponse(fmt.Errorf("invalid range end: %w", parseErr))
+			}
+			endOffset = parsed
+		}
+
+		// Special case: range requests on empty files should return 416
+		if totalSize == 0 {
+			w.Header().Set("Content-Range", "bytes */0")
+			s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRange)
+			return 0, 0, false, newStreamErrorWithResponse(fmt.Errorf("range request on empty file %s/%s", bucket, object))
+		}
+
+		// Validate range
+		if startOffset < 0 || startOffset >= totalSize {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+			s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRange)
+			return 0, 0, false, newStreamErrorWithResponse(fmt.Errorf("invalid range start: %d >= %d, range: %s", startOffset, totalSize, rangeHeader))
+		}
+
+		if endOffset >= totalSize {
+			endOffset = totalSize - 1
+		}
+
+		if endOffset < startOffset {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+			s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRange)
+			return 0, 0, false, newStreamErrorWithResponse(fmt.Errorf("invalid range: end before start"))
+		}
+	}
+
+	return startOffset, endOffset - startOffset + 1, true, nil
+}
+
+// StreamError is returned when streaming functions encounter errors.
+// It tracks whether an HTTP response has already been written to prevent
+// double WriteHeader calls that would create malformed S3 error responses.
+type StreamError struct {
+	// Err is the underlying error
+	Err error
+	// ResponseWritten indicates if HTTP headers/status have been written to ResponseWriter
+	ResponseWritten bool
+}
+
+func (e *StreamError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *StreamError) Unwrap() error {
+	return e.Err
+}
+
+// newStreamErrorWithResponse creates a StreamError for cases where response was already written
+func newStreamErrorWithResponse(err error) *StreamError {
+	return &StreamError{Err: err, ResponseWritten: true}
+}
+
+func isCanceledStreamingError(err error) bool {
+	return errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled
+}
+
+func shouldWriteStreamingErrorResponse(err error) bool {
+	return err != nil && !isCanceledStreamingError(err)
+}
+
+func mimeDetect(r *http.Request, dataReader io.Reader) io.ReadCloser {
+	mimeBuffer := make([]byte, 512)
+	size, _ := dataReader.Read(mimeBuffer)
+	if size > 0 {
+		r.Header.Set("Content-Type", http.DetectContentType(mimeBuffer[:size]))
+		return io.NopCloser(io.MultiReader(bytes.NewReader(mimeBuffer[:size]), dataReader))
+	}
+	return io.NopCloser(dataReader)
+}
+
+func entryUrlEncode(dir string, entry string, encodingTypeUrl bool) (dirName string, entryName string, prefix string) {
+	if !encodingTypeUrl {
+		return dir, entry, entry
+	}
+	return urlPathEscape(dir), url.QueryEscape(entry), urlPathEscape(entry)
+}
+
+func urlPathEscape(object string) string {
+	var escapedParts []string
+	for _, part := range strings.Split(object, "/") {
+		escapedParts = append(escapedParts, strings.ReplaceAll(url.PathEscape(part), "+", "%2B"))
+	}
+	return strings.Join(escapedParts, "/")
+}
+
+func removeDuplicateSlashes(object string) string {
+	result := strings.Builder{}
+	result.Grow(len(object))
+
+	isLastSlash := false
+	for _, r := range object {
+		switch r {
+		case '/':
+			if !isLastSlash {
+				result.WriteRune(r)
+			}
+			isLastSlash = true
+		default:
+			result.WriteRune(r)
+			isLastSlash = false
+		}
+	}
+	return result.String()
+}
+
+// hasChildren checks if a path has any child objects (is a directory with contents).
+// On unexpected errors, it logs and conservatively returns true to avoid hiding entries.
+//
+// This helper function is used to distinguish implicit directories from regular files or empty directories.
+// An implicit directory is one that exists only because it has children, not because it was explicitly created.
+//
+// Implementation:
+//   - Lists the directory with Limit=1 to check for at least one child
+//   - Returns true if any child exists, false otherwise
+//   - Efficient: only fetches one entry to minimize overhead
+//
+// Used by HeadObjectHandler to implement AWS S3-compatible implicit directory behavior:
+//   - If a 0-byte object or directory has children → it's an implicit directory → HEAD returns 404
+//   - If a 0-byte object or directory has no children → it's empty → HEAD returns 200
+//
+// Examples:
+//
+//	hasChildren("bucket", "dataset") where "dataset/file.txt" exists → true
+//	hasChildren("bucket", "empty-dir") where no children exist → false
+//
+// Performance: ~1-5ms per call (one gRPC LIST request with Limit=1)
+func (s3a *S3ApiServer) hasChildren(ctx context.Context, bucket, prefix string) bool {
+	// Clean up prefix: remove leading slashes
+	cleanPrefix := strings.TrimPrefix(prefix, "/")
+
+	// The directory to list is bucketDir + cleanPrefix
+	bucketDir := s3a.bucketDir(bucket)
+	fullPath := bucketDir + "/" + cleanPrefix
+
+	// List one child object. filer_pb.List cancels the underlying ListEntries
+	// stream when it returns, so gRPC's per-stream client goroutine is not leaked.
+	// The caller's request context is propagated so the probe is cancelled if the
+	// client disconnects.
+	found := false
+	err := filer_pb.List(ctx, s3a, fullPath, "", func(*filer_pb.Entry, bool) error {
+		found = true
+		return nil
+	}, "", true, 1)
+
+	if err == nil {
+		return found
+	}
+	if errors.Is(err, filer_pb.ErrNotFound) {
+		return false
+	}
+	glog.V(1).Infof("hasChildren: list entries failed for %s/%s: %v", bucket, cleanPrefix, err)
+	return true
+}
+
+// isBareDirectory reports whether entry is a directory carrying no object data of its own.
+// Such a path is not an S3 object: GET/HEAD answer 404 like AWS does for a prefix, and
+// Hadoop-style clients then discover the directory through their LIST fallback.
+func isBareDirectory(entry *filer_pb.Entry) bool {
+	return entry != nil && entry.IsDirectory && filer.FileSize(entry) == 0 && !entry.IsPrefixObject()
+}
+
+// isNullVersionObject distinguishes logical S3 keys that share a regular filer path.
+// A slash key requires an explicit directory marker; a prefix object belongs to the bare key.
+// Actual version files are selected separately and must not be filtered by this predicate.
+func isNullVersionObject(entry *filer_pb.Entry, object string) bool {
+	if entry == nil {
+		return false
+	}
+	if strings.HasSuffix(object, "/") {
+		return entry.IsDirectoryKeyObject() && !entry.IsPrefixObject()
+	}
+	return !isBareDirectory(entry)
+}
+
+// checkDirectoryObject checks if the object is a directory object (ends with "/") and if it exists
+// Returns: (entry, isDirectoryObject, error)
+// - entry: the directory entry if found and is a directory
+// - isDirectoryObject: true if the request was for a directory object (ends with "/")
+// - error: any error encountered while checking
+func (s3a *S3ApiServer) checkDirectoryObject(bucket, object string) (*filer_pb.Entry, bool, error) {
+	if !strings.HasSuffix(object, "/") {
+		return nil, false, nil // Not a directory object
+	}
+
+	bucketDir := s3a.bucketDir(bucket)
+	cleanObject := strings.TrimSuffix(object, "/")
+
+	if cleanObject == "" {
+		return nil, true, nil // Root level directory object, but we don't handle it
+	}
+
+	// Check if directory exists
+	dirEntry, err := s3a.getEntry(bucketDir, cleanObject)
+	if err != nil {
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			return nil, true, nil // Directory object requested but doesn't exist
+		}
+		return nil, true, err // Other errors should be propagated
+	}
+
+	if !dirEntry.IsDirectory {
+		return nil, true, nil // Exists but not a directory
+	}
+
+	return dirEntry, true, nil
+}
+
+// resolveObjectEntry resolves the object entry for conditional checks: the version the
+// request names when the bucket is versioned, otherwise the latest version. Callers
+// with no version to target pass an empty versionId.
+func (s3a *S3ApiServer) resolveObjectEntry(bucket, object, versionId string) (*filer_pb.Entry, error) {
+	// Check if versioning is configured
+	versioningConfigured, err := s3a.isVersioningConfigured(bucket)
+	if err != nil && !errors.Is(err, filer_pb.ErrNotFound) {
+		glog.Errorf("resolveObjectEntry: error checking versioning config for %s: %v", bucket, err)
+		return nil, err
+	}
+
+	if versioningConfigured {
+		if versionId != "" {
+			return s3a.getSpecificObjectVersion(bucket, object, versionId)
+		}
+		// For versioned buckets, we must use getLatestObjectVersion to correctly
+		// find the latest versioned object (in .versions/) or null version.
+		// Standard getEntry would fail to find objects moved to .versions/.
+		// Use 1 retry (fast path) for conditional checks to avoid backoff latency.
+		return s3a.doGetLatestObjectVersion(bucket, object, 1)
+	}
+
+	// For non-versioned buckets, verify directly
+	bucketDir := s3a.bucketDir(bucket)
+	return s3a.getEntry(bucketDir, object)
+}
+
+// serveDirectoryContent serves the content of a directory object directly
+func (s3a *S3ApiServer) serveDirectoryContent(w http.ResponseWriter, r *http.Request, entry *filer_pb.Entry, bucket, object string) {
+	// Defensive nil checks - entry and attributes should never be nil, but guard against it
+	if entry == nil || entry.Attributes == nil {
+		glog.Errorf("serveDirectoryContent: entry or attributes is nil")
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		return
+	}
+
+	// A directory promoted over an uploaded object still holds that object's
+	// chunks while entry.Content stays empty; GET streams them like a regular
+	// object so it delivers the bytes HEAD reports for this entry.
+	if r.Method != http.MethodHead && len(entry.Content) == 0 && len(entry.Chunks) > 0 {
+		sseType := s3a.detectPrimarySSEType(entry)
+		if err := s3a.streamFromVolumeServersWithSSE(w, r, entry, sseType, bucket, object, ""); err != nil {
+			var streamErr *StreamError
+			if errors.As(err, &streamErr) && streamErr.ResponseWritten {
+				return
+			}
+			if isCanceledStreamingError(err) {
+				glog.V(3).Infof("serveDirectoryContent: client disconnected while streaming %s/%s: %v", bucket, object, err)
+				return
+			}
+			glog.Errorf("serveDirectoryContent: failed to stream %s/%s: %v", bucket, object, err)
+			if errors.Is(err, util_http.ErrTooManyRequests) {
+				s3err.WriteErrorResponse(w, r, s3err.ErrRequestBytesExceed)
+			} else if shouldWriteStreamingErrorResponse(err) {
+				s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+			}
+		}
+		return
+	}
+
+	// Set content type - use stored MIME type or default. A directory without a stored
+	// mime and without data of its own answers application/x-directory, the marker type
+	// Hadoop-style clients (e.g. flink-s3-fs-presto) require to classify the path as a
+	// directory; defaulting to octet-stream makes them treat it as a 0-byte file.
+	// Marker content may be stored encrypted; decrypt before serving. HEAD
+	// returns no body, so it only checks access and skips decryption — and
+	// any KMS call — entirely.
+	content := entry.Content
+	sseType := s3a.detectPrimarySSEType(entry)
+	if sseType != "" && sseType != "None" {
+		var errCode s3err.ErrorCode
+		if r.Method == http.MethodHead {
+			errCode = s3a.checkDirectorySSEAccess(r, entry, sseType)
+		} else {
+			content, errCode = s3a.decryptDirectoryContent(r, entry, sseType)
+		}
+		if errCode != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, errCode)
+			return
+		}
+	}
+
+	contentType := entry.Attributes.Mime
+	if contentType == "" {
+		if entry.IsDirectoryKeyObject() {
+			contentType = "application/octet-stream"
+		} else {
+			contentType = s3_constants.DirectoryMimeType
+		}
+	}
+	w.Header().Set("Content-Type", contentType)
+
+	contentLength := int64(len(content))
+	if r.Method == http.MethodHead && len(entry.Chunks) > 0 {
+		contentLength = int64(entry.Attributes.FileSize)
+	}
+	statusCode := http.StatusOK
+	if r.Header.Get("Range") != "" && requestedPartNumber(r) == 0 {
+		// A ranged request answers like the object path does: 206 with its
+		// Content-Range and the range's length, served on GET, reported on HEAD.
+		totalSize := contentLength
+		offset, size, isRangeRequest, rangeErr := s3a.parseAndValidateRange(w, r, entry, totalSize, bucket, object)
+		if rangeErr != nil {
+			return
+		}
+		if isRangeRequest {
+			contentLength = size
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+size-1, totalSize))
+			statusCode = http.StatusPartialContent
+			if r.Method != http.MethodHead {
+				content = content[offset : offset+size]
+			}
+		}
+	}
+	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
+
+	// Set last modified
+	w.Header().Set("Last-Modified", time.Unix(entry.Attributes.Mtime, 0).UTC().Format(http.TimeFormat))
+
+	// Set ETag
+	w.Header().Set("ETag", "\""+filer.ETag(entry)+"\"")
+
+	s3a.addSSEResponseHeadersFromEntry(w, r, entry, sseType)
+
+	// For HEAD requests, don't write body
+	if r.Method == http.MethodHead {
+		w.WriteHeader(statusCode)
+		return
+	}
+
+	// Write content
+	w.WriteHeader(statusCode)
+	if len(content) > 0 {
+		if _, err := w.Write(content); err != nil {
+			glog.Errorf("serveDirectoryContent: failed to write response: %v", err)
+		}
+	}
+}
+
+// decryptDirectoryContent returns the plaintext of a directory marker's inline
+// entry.Content, which PutObjectHandler stores through the shared SSE path.
+func (s3a *S3ApiServer) decryptDirectoryContent(r *http.Request, entry *filer_pb.Entry, sseType string) ([]byte, s3err.ErrorCode) {
+	var reader io.Reader
+	var err error
+	switch sseType {
+	case s3_constants.SSETypeC:
+		customerKey, parseErr := ParseSSECHeaders(r)
+		if parseErr != nil {
+			return nil, MapSSECErrorToS3Error(parseErr)
+		}
+		if customerKey == nil {
+			return nil, s3err.ErrSSECustomerKeyMissing
+		}
+		if storedKeyMD5 := string(entry.Extended[s3_constants.AmzServerSideEncryptionCustomerKeyMD5]); storedKeyMD5 != "" && customerKey.KeyMD5 != storedKeyMD5 {
+			return nil, s3err.ErrAccessDenied
+		}
+		iv, ivErr := GetSSECIVFromMetadata(entry.Extended)
+		if ivErr != nil {
+			return nil, s3err.ErrInternalError
+		}
+		reader, err = CreateSSECDecryptedReader(bytes.NewReader(entry.Content), customerKey, iv)
+	case s3_constants.SSETypeKMS:
+		sseKMSKey, deserErr := DeserializeSSEKMSMetadata(entry.Extended[s3_constants.SeaweedFSSSEKMSKey])
+		if deserErr != nil {
+			return nil, s3err.ErrInternalError
+		}
+		reader, err = CreateSSEKMSDecryptedReader(bytes.NewReader(entry.Content), sseKMSKey)
+	case s3_constants.SSETypeS3:
+		keyManager := GetSSES3KeyManager()
+		sseS3Key, deserErr := DeserializeSSES3Metadata(entry.Extended[s3_constants.SeaweedFSSSES3Key], keyManager)
+		if deserErr != nil {
+			return nil, s3err.ErrInternalError
+		}
+		iv, ivErr := GetSSES3IV(entry, sseS3Key, keyManager)
+		if ivErr != nil {
+			return nil, s3err.ErrInternalError
+		}
+		reader, err = CreateSSES3DecryptedReader(bytes.NewReader(entry.Content), sseS3Key, iv)
+	default:
+		return entry.Content, s3err.ErrNone
+	}
+	if err != nil {
+		glog.Errorf("decryptDirectoryContent: %v", err)
+		return nil, s3err.ErrInternalError
+	}
+	content, readErr := io.ReadAll(reader)
+	if readErr != nil {
+		glog.Errorf("decryptDirectoryContent: %v", readErr)
+		return nil, s3err.ErrInternalError
+	}
+	return content, s3err.ErrNone
+}
+
+// checkDirectorySSEAccess runs the request-level checks a HEAD of an encrypted
+// marker needs: SSE-C requires the customer key to parse and to match the key
+// the marker was written with; SSE-KMS and SSE-S3 need nothing from the caller.
+func (s3a *S3ApiServer) checkDirectorySSEAccess(r *http.Request, entry *filer_pb.Entry, sseType string) s3err.ErrorCode {
+	if sseType != s3_constants.SSETypeC {
+		return s3err.ErrNone
+	}
+	customerKey, parseErr := ParseSSECHeaders(r)
+	if parseErr != nil {
+		return MapSSECErrorToS3Error(parseErr)
+	}
+	if customerKey == nil {
+		return s3err.ErrSSECustomerKeyMissing
+	}
+	if storedKeyMD5 := string(entry.Extended[s3_constants.AmzServerSideEncryptionCustomerKeyMD5]); storedKeyMD5 != "" && customerKey.KeyMD5 != storedKeyMD5 {
+		return s3err.ErrAccessDenied
+	}
+	return s3err.ErrNone
+}
+
+// handleDirectoryObjectRequest is a helper function that handles directory object requests
+// for both GET and HEAD operations, eliminating code duplication
+func (s3a *S3ApiServer) handleDirectoryObjectRequest(w http.ResponseWriter, r *http.Request, bucket, object, handlerName string) bool {
+	if isAnonymousObjectRead(r) && strings.HasSuffix(object, "/") {
+		// Versioned directory keys must authorize and serve the selected version,
+		// rather than an unrelated directory marker at the regular filer path.
+		versioned, err := s3a.isVersioningConfigured(bucket)
+		if err != nil {
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+			return true
+		}
+		if versioned {
+			return false
+		}
+	}
+	// Check if this is a directory object and handle it directly
+	if dirEntry, isDirectoryObject, err := s3a.checkDirectoryObject(bucket, object); err != nil {
+		glog.Errorf("%s: error checking directory object %s/%s: %v", handlerName, bucket, object, err)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		return true // Request was handled (with error)
+	} else if dirEntry != nil {
+		if errCode := s3a.recheckPolicyWithObjectEntry(r, bucket, object, string(s3_constants.ACTION_READ), dirEntry.Extended, handlerName); errCode != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, errCode)
+			return true // Request was handled (denied)
+		}
+		glog.V(2).Infof("%s: directory object %s/%s found, serving content", handlerName, bucket, object)
+		s3a.serveDirectoryContent(w, r, dirEntry, bucket, object)
+		return true // Request was handled successfully
+	} else if isDirectoryObject {
+		// Directory object but doesn't exist
+		glog.V(2).Infof("%s: directory object %s/%s not found", handlerName, bucket, object)
+		s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+		return true // Request was handled (with not found)
+	}
+
+	return false // Not a directory object, continue with normal processing
+}
+
+func newListEntry(s3a *S3ApiServer, entry *filer_pb.Entry, key string, dir string, name string, bucketPrefix string, fetchOwner bool, isDirectory bool, encodingTypeUrl bool) (listEntry ListEntry) {
+	storageClass := "STANDARD"
+	if v, ok := entry.Extended[s3_constants.AmzStorageClass]; ok {
+		storageClass = string(v)
+	}
+	keyFormat := "%s/%s"
+	if isDirectory {
+		keyFormat += "/"
+	}
+	if key == "" {
+		key = fmt.Sprintf(keyFormat, dir, name)[len(bucketPrefix):]
+	}
+	if encodingTypeUrl {
+		key = urlPathEscape(key)
+	}
+	// Determine ETag: prioritize ExtETagKey for versioned objects (supports multipart ETags),
+	// then fall back to filer.ETag() which uses Md5 attribute or calculates from chunks
+	etag := s3a.getObjectETag(entry)
+	size := int64(filer.FileSize(entry))
+	if isDirectory && size == 0 {
+		// A trailing-slash key keeps its body inline in the directory entry, with no FileSize.
+		size = int64(len(entry.Content))
+	}
+	listEntry = ListEntry{
+		Key:          key,
+		LastModified: time.Unix(entry.Attributes.Mtime, 0).UTC(),
+		ETag:         etag,
+		Size:         size,
+		StorageClass: StorageClass(storageClass),
+	}
+	if fetchOwner {
+		// Extract owner from S3 metadata (Extended attributes) instead of file system attributes
+		var ownerID, displayName string
+		if entry.Extended != nil {
+			if ownerBytes, exists := entry.Extended[s3_constants.ExtAmzOwnerKey]; exists {
+				ownerID = string(ownerBytes)
+			}
+		}
+
+		// Fallback to anonymous if no S3 owner found
+		if ownerID == "" {
+			ownerID = s3_constants.AccountAnonymousId
+			displayName = "anonymous"
+		} else {
+			// Get the proper display name from IAM system
+			displayName = s3a.iam.GetAccountNameById(ownerID)
+			// Fallback to ownerID if no display name found
+			if displayName == "" {
+				displayName = ownerID
+			}
+		}
+
+		listEntry.Owner = &CanonicalUser{
+			ID:          ownerID,
+			DisplayName: displayName,
+		}
+	}
+	return listEntry
+}
+
+func (s3a *S3ApiServer) toFilerPath(bucket, object string) string {
+	// Returns the raw file path - no URL escaping needed
+	// The path is used directly, not embedded in a URL
+	object = s3_constants.NormalizeObjectKey(object)
+	return fmt.Sprintf("%s/%s", s3a.bucketDir(bucket), object)
+}
+
+// hasConditionalHeaders checks if the request has any conditional headers
+// This is a lightweight check to avoid unnecessary function calls
+func (s3a *S3ApiServer) hasConditionalHeaders(r *http.Request) bool {
+	return r.Header.Get(s3_constants.IfMatch) != "" ||
+		r.Header.Get(s3_constants.IfNoneMatch) != "" ||
+		r.Header.Get(s3_constants.IfModifiedSince) != "" ||
+		r.Header.Get(s3_constants.IfUnmodifiedSince) != ""
+}
+
+// processConditionalHeaders checks conditional headers and writes an error response if a condition fails.
+// It returns the result of the check and a boolean indicating if the request has been handled.
+func (s3a *S3ApiServer) processConditionalHeaders(w http.ResponseWriter, r *http.Request, bucket, object, handlerName string) (ConditionalHeaderResult, bool) {
+	if !s3a.hasConditionalHeaders(r) {
+		return ConditionalHeaderResult{ErrorCode: s3err.ErrNone}, false
+	}
+
+	result := s3a.checkConditionalHeadersForReads(r, bucket, object)
+	if isAnonymousObjectRead(r) && result.Entry != nil {
+		// 304/412 are responses too: authorize before exposing the ETag or the
+		// outcome of a condition on an entry the caller cannot read.
+		if code := s3a.recheckPolicyWithObjectEntry(r, bucket, object, string(s3_constants.ACTION_READ), result.Entry.Extended, handlerName); code != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, code)
+			return result, true
+		}
+	}
+	if result.ErrorCode != s3err.ErrNone {
+		glog.V(3).Infof("%s: Conditional header check failed for %s/%s with error %v", handlerName, bucket, object, result.ErrorCode)
+
+		// For 304 Not Modified responses, include the ETag header
+		if result.ErrorCode == s3err.ErrNotModified && result.ETag != "" {
+			w.Header().Set("ETag", result.ETag)
+		}
+
+		if result.ErrorCode == s3err.ErrNoSuchKey || result.ErrorCode == s3err.ErrNoSuchBucket {
+			s3a.writeAnonymousAwareNotFound(w, r, bucket, result.ErrorCode)
+		} else {
+			s3err.WriteErrorResponse(w, r, result.ErrorCode)
+		}
+		return result, true // request handled
+	}
+	return result, false // request not handled
+}
+
+func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request) {
+
+	bucket, object := s3_constants.GetBucketAndObject(r)
+	glog.V(3).Infof("GetObjectHandler %s %s", bucket, object)
+	if _, err := s3a.validateTableBucketObjectPathOrVerify(bucket, object); err != nil {
+		s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
+		return
+	}
+
+	// Check for SOSAPI virtual objects (system.xml, capacity.xml)
+	// These are dynamically generated and don't exist on disk
+	if s3a.handleSOSAPIGetObject(w, r, bucket, object) {
+		return // SOSAPI request was handled
+	}
+
+	// TTFB Profiling: Track all stages until first byte
+	tStart := time.Now()
+	var (
+		conditionalHeadersTime time.Duration
+		versioningCheckTime    time.Duration
+		entryFetchTime         time.Duration
+		streamTime             time.Duration
+	)
+	defer func() {
+		totalTime := time.Since(tStart)
+		glog.V(4).Infof("GET TTFB PROFILE %s/%s: total=%v | conditional=%v, versioning=%v, entryFetch=%v, stream=%v",
+			bucket, object, totalTime, conditionalHeadersTime, versioningCheckTime, entryFetchTime, streamTime)
+	}()
+
+	// A non-null versionId only has meaning once versioning has been
+	// configured; reject it before directory or conditional handling can
+	// answer the request as a plain object.
+	versionId := r.URL.Query().Get("versionId")
+	if errCode := s3a.checkVersionIdConfigured(bucket, versionId); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
+	// Handle directory objects with shared logic
+	if s3a.handleDirectoryObjectRequest(w, r, bucket, object, "GetObjectHandler") {
+		return // Directory object request was handled
+	}
+
+	// Check conditional headers and handle early return if conditions fail
+	tConditional := time.Now()
+	result, handled := s3a.processConditionalHeaders(w, r, bucket, object, "GetObjectHandler")
+	conditionalHeadersTime = time.Since(tConditional)
+	if handled {
+		return
+	}
+
+	var (
+		entry                *filer_pb.Entry // Declare entry at function scope for SSE processing
+		targetVersionId      string
+		versioningConfigured bool
+		err                  error
+	)
+
+	// Check if versioning is configured for the bucket (Enabled or Suspended)
+	tVersioning := time.Now()
+	// Note: We need to check this even if versionId is empty, because versioned buckets
+	// handle even "get latest version" requests differently (through .versions directory)
+	versioningConfigured, err = s3a.isVersioningConfigured(bucket)
+	if err != nil {
+		if err == filer_pb.ErrNotFound {
+			s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchBucket)
+			return
+		}
+		glog.Errorf("Error checking versioning status for bucket %s: %v", bucket, err)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		return
+	}
+	glog.V(3).Infof("GetObject: bucket %s, object %s, versioningConfigured=%v, versionId=%s", bucket, object, versioningConfigured, versionId)
+
+	if versioningConfigured {
+		// Handle versioned GET - check if specific version requested
+
+		if versionId != "" {
+			// Request for specific version - must look in .versions directory
+			glog.V(3).Infof("GetObject: requesting specific version %s for %s/%s", versionId, bucket, object)
+			entry, err = s3a.getSpecificObjectVersion(bucket, object, versionId)
+			if err != nil {
+				glog.Errorf("Failed to get specific version %s: %v", versionId, err)
+				if errors.Is(err, filer_pb.ErrNotFound) {
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchVersion)
+				} else {
+					s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+				}
+				return
+			}
+			targetVersionId = versionId
+		} else {
+			// Request for latest version - OPTIMIZATION:
+			// Check if .versions/ directory exists quickly (no retries) to decide path
+			// - If .versions/ exists: real versions available, use getLatestObjectVersion
+			// - If .versions/ doesn't exist (ErrNotFound): only null version at regular path, use it directly
+			// - If transient error: fall back to getLatestObjectVersion which has retry logic
+			bucketDir := s3a.bucketDir(bucket)
+			normalizedObject := s3_constants.NormalizeObjectKey(object)
+			versionsDir := normalizedObject + s3_constants.VersionsFolder
+
+			// Quick check (no retries) for .versions/ directory
+			versionsEntry, versionsErr := s3a.getEntry(bucketDir, versionsDir)
+
+			if versionsErr == nil && versionsEntry != nil {
+				// .versions/ exists, meaning real versions are stored there
+				// Use getLatestObjectVersion which will properly find the newest version
+				entry, err = s3a.getLatestObjectVersion(bucket, object)
+				if err != nil {
+					glog.Errorf("GetObject: Failed to get latest version for %s/%s: %v", bucket, object, err)
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+					return
+				}
+			} else if errors.Is(versionsErr, filer_pb.ErrNotFound) {
+				// .versions/ doesn't exist (confirmed not found), check regular path for null version
+				regularEntry, regularErr := s3a.getEntry(bucketDir, normalizedObject)
+				// A physical parent or bare-key object is not a trailing-slash null marker.
+				if regularErr == nil && isNullVersionObject(regularEntry, normalizedObject) {
+					// Found object at regular path - this is the null version
+					entry = regularEntry
+					targetVersionId = "null"
+				} else {
+					// No object at regular path either - object doesn't exist
+					glog.V(3).Infof("GetObject: object not found at regular path or .versions for %s/%s", bucket, object)
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+					return
+				}
+			} else {
+				// Transient error checking .versions/, fall back to getLatestObjectVersion with retries
+				glog.V(2).Infof("GetObject: transient error checking .versions for %s/%s: %v, falling back to getLatestObjectVersion", bucket, object, versionsErr)
+				entry, err = s3a.getLatestObjectVersion(bucket, object)
+				if err != nil {
+					glog.Errorf("GetObject: Failed to get latest version for %s/%s: %v", bucket, object, err)
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+					return
+				}
+			}
+			// Extract version ID if not already set
+			if targetVersionId == "" {
+				if entry.Extended != nil {
+					if versionIdBytes, exists := entry.Extended[s3_constants.ExtVersionIdKey]; exists {
+						targetVersionId = string(versionIdBytes)
+					}
+				}
+				// If no version ID found in entry, this is a pre-versioning object
+				if targetVersionId == "" {
+					targetVersionId = "null"
+				}
+			}
+		}
+
+		// Check if this is a delete marker
+		if entry.Extended != nil {
+			if deleteMarker, exists := entry.Extended[s3_constants.ExtDeleteMarkerKey]; exists && string(deleteMarker) == "true" {
+				s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+				return
+			}
+		}
+
+		// For versioned objects, log the target version
+		if targetVersionId == "null" {
+			glog.V(2).Infof("GetObject: pre-versioning object %s/%s", bucket, object)
+		} else {
+			glog.V(2).Infof("GetObject: version %s for %s/%s", targetVersionId, bucket, object)
+		}
+
+	}
+
+	versioningCheckTime = time.Since(tVersioning)
+
+	// Fetch the correct entry for SSE processing (respects versionId)
+	// This consolidates entry lookups to avoid multiple filer calls
+	tEntryFetch := time.Now()
+	var objectEntryForSSE *filer_pb.Entry
+
+	// Optimization: Reuse already-fetched entry to avoid redundant metadata fetches
+	if versioningConfigured {
+		// For versioned objects, reuse the already-fetched entry
+		objectEntryForSSE = entry
+	} else {
+		// For non-versioned objects, try to reuse entry from conditional header check
+		if result.Entry != nil {
+			// Reuse entry fetched during conditional header check (optimization)
+			objectEntryForSSE = result.Entry
+			glog.V(3).Infof("GetObjectHandler: Reusing entry from conditional header check for %s/%s", bucket, object)
+		} else {
+			// Fetch entry for SSE processing
+			// This is needed for all SSE types (SSE-C, SSE-KMS, SSE-S3) to:
+			// 1. Detect encryption from object metadata (SSE-KMS/SSE-S3 don't send headers on GET)
+			// 2. Add proper response headers
+			// 3. Handle Range requests on encrypted objects
+			var fetchErr error
+			objectEntryForSSE, fetchErr = s3a.fetchObjectEntry(bucket, object)
+			if fetchErr != nil {
+				glog.Warningf("GetObjectHandler: failed to get entry for %s/%s: %v", bucket, object, fetchErr)
+				s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+				return
+			}
+			if objectEntryForSSE == nil {
+				s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+				return
+			}
+		}
+	}
+	entryFetchTime = time.Since(tEntryFetch)
+
+	// Safety check: entry must be valid before tag-based policy evaluation
+	if objectEntryForSSE == nil {
+		glog.Errorf("GetObjectHandler: objectEntryForSSE is nil for %s/%s (should not happen)", bucket, object)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		return
+	}
+
+	// A bare directory path is not an object: 404 like AWS instead of an empty 200,
+	// so Hadoop-style clients fall back to LIST discovery. HEAD and ranged GET already 404.
+	if !strings.HasSuffix(object, "/") && isBareDirectory(objectEntryForSSE) {
+		s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+		return
+	}
+
+	// Re-check bucket policy with object entry for tag-based conditions (e.g., s3:ExistingObjectTag)
+	if errCode := s3a.recheckPolicyWithObjectEntry(r, bucket, object, string(s3_constants.ACTION_READ), objectEntryForSSE.Extended, "GetObjectHandler"); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
+	// Return version and lock metadata only after authorizing this entry.
+	if versioningConfigured {
+		w.Header().Set("x-amz-version-id", targetVersionId)
+		s3a.addObjectLockHeadersToResponse(w, objectEntryForSSE)
+	}
+
+	// Handle remote storage objects: initiate background caching without blocking
+	// This implements stream-through caching: serve first byte immediately while
+	// caching happens in the background, improving TTFB for large files
+	if objectEntryForSSE.IsInRemoteOnly() {
+		// Start background cache without waiting (non-blocking)
+		// Only after authorization passes to avoid cache side effects for denied requests
+		versionId := r.URL.Query().Get("versionId")
+		cacheVersionId := resolvedSourceVersionId(versionId, objectEntryForSSE)
+		s3a.startBackgroundRemoteCache(bucket, object, cacheVersionId, objectEntryForSSE)
+		// Continue with streaming immediately - will serve from remote or cached chunks
+	}
+
+	// If PartNumber is specified, turn the request into a ranged read of that part
+	if partNumber := requestedPartNumber(r); partNumber > 0 {
+		startOffset, endOffset, errCode := s3a.partByteRange(w, r, objectEntryForSSE, partNumber)
+		if errCode != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, errCode)
+			return
+		}
+		r.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", startOffset, endOffset))
+		glog.V(3).Infof("GetObject: part %d served as bytes=%d-%d", partNumber, startOffset, endOffset)
+	}
+
+	// NEW OPTIMIZATION: Stream directly from volume servers, bypassing filer proxy
+	// This eliminates the 19ms filer proxy overhead
+	// SSE decryption is handled inline during streaming
+
+	// Detect SSE encryption type
+	primarySSEType := s3a.detectPrimarySSEType(objectEntryForSSE)
+
+	// Stream directly from volume servers with SSE support
+	tStream := time.Now()
+	err = s3a.streamFromVolumeServersWithSSE(w, r, objectEntryForSSE, primarySSEType, bucket, object, versionId)
+	streamTime = time.Since(tStream)
+	if err != nil {
+		switch {
+		case isCanceledStreamingError(err):
+			glog.V(3).Infof("GetObjectHandler: client disconnected while streaming %s/%s: %v", bucket, object, err)
+			return
+		case errors.Is(err, context.DeadlineExceeded):
+			glog.Warningf("GetObjectHandler: deadline exceeded while streaming %s/%s: %v", bucket, object, err)
+		default:
+			glog.Errorf("GetObjectHandler: failed to stream %s/%s from volume servers: %v", bucket, object, err)
+		}
+		// Check if the streaming function already wrote an HTTP response
+		var streamErr *StreamError
+		if errors.As(err, &streamErr) && streamErr.ResponseWritten {
+			// Response already written (headers + status code), don't write again
+			// to avoid "superfluous response.WriteHeader call" and malformed S3 error bodies
+			return
+		}
+		// Response not yet written - safe to write S3 error response
+		// Check if error is due to volume server rate limiting (HTTP 429)
+		if errors.Is(err, util_http.ErrTooManyRequests) {
+			s3err.WriteErrorResponse(w, r, s3err.ErrRequestBytesExceed)
+		} else if shouldWriteStreamingErrorResponse(err) {
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		}
+		return
+	}
+}
+
+// streamFromVolumeServers streams object data directly from volume servers, bypassing filer proxy
+// This eliminates the ~19ms filer proxy overhead by reading chunks directly
+func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.Request, entry *filer_pb.Entry, sseType string, bucket, object, versionId string) error {
+	// Profiling: Track overall and stage timings
+	t0 := time.Now()
+	var (
+		rangeParseTime   time.Duration
+		headerSetTime    time.Duration
+		chunkResolveTime time.Duration
+		streamPrepTime   time.Duration
+		streamExecTime   time.Duration
+	)
+	defer func() {
+		totalTime := time.Since(t0)
+		glog.V(2).Infof("  └─ streamFromVolumeServers: total=%v, rangeParse=%v, headerSet=%v, chunkResolve=%v, streamPrep=%v, streamExec=%v",
+			totalTime, rangeParseTime, headerSetTime, chunkResolveTime, streamPrepTime, streamExecTime)
+	}()
+
+	if entry == nil {
+		// Early validation error: write S3-compliant XML error response
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		return newStreamErrorWithResponse(fmt.Errorf("entry is nil"))
+	}
+
+	// Get file size
+	totalSize := int64(filer.FileSize(entry))
+
+	// Parse Range header if present
+	tRangeParse := time.Now()
+	offset, size, isRangeRequest, rangeErr := s3a.parseAndValidateRange(w, r, entry, totalSize, bucket, object)
+	if rangeErr != nil {
+		return rangeErr
+	}
+	rangeParseTime = time.Since(tRangeParse)
+
+	// For small files stored inline in entry.Content - validate BEFORE setting headers
+	if len(entry.Content) > 0 && totalSize == int64(len(entry.Content)) {
+		if isRangeRequest {
+			// Safely convert int64 to int for slice indexing - validate BEFORE WriteHeader
+			// Use MaxInt32 for portability across 32-bit and 64-bit platforms
+			if offset < 0 || offset > int64(math.MaxInt32) || size < 0 || size > int64(math.MaxInt32) {
+				// Early validation error: write S3-compliant error response
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+				s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRange)
+				return newStreamErrorWithResponse(fmt.Errorf("range too large for platform: offset=%d, size=%d", offset, size))
+			}
+			start := int(offset)
+			end := start + int(size)
+			// Bounds check (should already be validated, but double-check) - BEFORE WriteHeader
+			if start < 0 || start > len(entry.Content) || end > len(entry.Content) || end < start {
+				// Early validation error: write S3-compliant error response
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+				s3err.WriteErrorResponse(w, r, s3err.ErrInvalidRange)
+				return newStreamErrorWithResponse(fmt.Errorf("invalid range for inline content: start=%d, end=%d, len=%d", start, end, len(entry.Content)))
+			}
+			// Validation passed - now set headers and write
+			s3a.setResponseHeaders(w, r, entry, totalSize)
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+size-1, totalSize))
+			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+			w.WriteHeader(http.StatusPartialContent)
+			written, err := w.Write(entry.Content[start:end])
+			if written > 0 {
+				BucketTrafficSent(int64(written), r)
+			}
+			return err
+		}
+		// Non-range request for inline content
+		s3a.setResponseHeaders(w, r, entry, totalSize)
+		w.WriteHeader(http.StatusOK)
+		written, err := w.Write(entry.Content)
+		if written > 0 {
+			BucketTrafficSent(int64(written), r)
+		}
+		return err
+	}
+
+	// Get chunks and validate BEFORE setting headers
+	chunks := entry.GetChunks()
+	glog.V(4).Infof("streamFromVolumeServers: entry has %d chunks, totalSize=%d, isRange=%v, offset=%d, size=%d",
+		len(chunks), totalSize, isRangeRequest, offset, size)
+
+	if len(chunks) == 0 {
+		// Check if this is a remote-only entry
+		if entry.IsInRemoteOnly() {
+			glog.V(1).Infof("streamFromVolumeServers: entry is remote-only, attempting stream-through cache")
+			cacheVersionId := resolvedSourceVersionId(versionId, entry)
+			cachedEntry, cacheErr := s3a.cacheRemoteObjectForStreamingWithShortTimeout(r, entry, bucket, object, cacheVersionId)
+			// A superseded cache fill can return metadata without chunks; authorize it before any origin fallback.
+			if cacheErr == nil && cachedEntry != nil && isAnonymousObjectRead(r) {
+				if code := s3a.recheckPolicyWithObjectEntry(r, bucket, object, string(s3_constants.ACTION_READ), cachedEntry.Extended, "streamFromVolumeServers"); code != s3err.ErrNone {
+					// A denied replacement must not expose metadata headers GET already prepared.
+					for _, name := range []string{"x-amz-version-id", s3_constants.AmzObjectLockMode, s3_constants.AmzObjectLockRetainUntilDate, s3_constants.AmzObjectLockLegalHold, s3_constants.AmzMpPartsCount} {
+						w.Header().Del(name)
+					}
+					s3err.WriteErrorResponse(w, r, code)
+					return newStreamErrorWithResponse(fmt.Errorf("cached entry authorization failed: %v", code))
+				}
+			}
+			if cacheErr == nil && cachedEntry != nil && len(cachedEntry.GetChunks()) > 0 {
+				// Cache completed, use cached chunks
+				chunks = cachedEntry.GetChunks()
+				entry = cachedEntry
+				glog.V(1).Infof("streamFromVolumeServers: successfully cached remote object, got %d chunks", len(chunks))
+			} else if isFilerNotFound(cacheErr) {
+				// Authoritative: the entry vanished or its remote object is gone
+				return respondObjectGone(w, r, bucket, object, cacheErr)
+			} else {
+				// Client disconnected during the cache wait: report cancellation, not an
+				// error response, so we don't write to a closed connection.
+				if ctxErr := r.Context().Err(); ctxErr != nil {
+					return ctxErr
+				}
+				// Cache not ready or failing locally (e.g. no assignable volume): serve
+				// straight from the origin while the detached cache keeps filling for
+				// later reads. An entry resolved to a specific version -- even on a
+				// latest-version read -- has no origin key, so it keeps the error
+				// paths below.
+				if cacheVersionId == "" || cacheVersionId == "null" {
+					served, streamErr := s3a.serveObjectFromRemoteMount(w, r, entry, bucket, object, offset, size, isRangeRequest, totalSize, t0)
+					if served {
+						if streamErr != nil {
+							return newStreamErrorWithResponse(streamErr)
+						}
+						return nil
+					}
+					if errors.Is(streamErr, remote_storage.ErrRemoteObjectNotFound) {
+						return respondObjectGone(w, r, bucket, object, streamErr)
+					}
+				}
+				// Origin unreadable. A permanent cache error is final; a transient one
+				// gets 503 so the client retries the still-filling cache.
+				if cacheErr != nil && !errors.Is(cacheErr, context.DeadlineExceeded) && !errors.Is(cacheErr, context.Canceled) && status.Code(cacheErr) != codes.DeadlineExceeded && status.Code(cacheErr) != codes.Canceled {
+					glog.Errorf("streamFromVolumeServers: permanent cache error for %s/%s: %v", bucket, object, cacheErr)
+					s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+					return newStreamErrorWithResponse(cacheErr)
+				}
+				glog.V(1).Infof("streamFromVolumeServers: remote object %s/%s not cached yet, returning 503 for retry", bucket, object)
+				w.Header().Set("Retry-After", "2")
+				s3err.WriteErrorResponse(w, r, s3err.ErrServiceUnavailable)
+				return newStreamErrorWithResponse(fmt.Errorf("remote object not cached yet, will be available on retry"))
+			}
+		} else if totalSize > 0 && len(entry.Content) == 0 {
+			// Not a remote entry but has size without content - this is a data integrity issue
+			glog.Errorf("streamFromVolumeServers: Data integrity error - entry reports size %d but has no content or chunks", totalSize)
+			// Write S3-compliant XML error response
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+			return newStreamErrorWithResponse(fmt.Errorf("data integrity error: size %d reported but no content available", totalSize))
+		} else {
+			// Empty object - set headers and write status
+			s3a.setResponseHeaders(w, r, entry, totalSize)
+			w.WriteHeader(http.StatusOK)
+			return nil
+		}
+	}
+
+	// Log chunk details (verbose only - high frequency)
+	if glog.V(4) {
+		for i, chunk := range chunks {
+			glog.Infof("  GET Chunk[%d]: fid=%s, offset=%d, size=%d", i, chunk.GetFileIdString(), chunk.Offset, chunk.Size)
+		}
+	}
+
+	// CRITICAL: Resolve chunks and prepare reader BEFORE WriteHeader so failures
+	// can still return a proper S3 error response.
+	ctx := r.Context()
+	lookupFileIdFn := s3a.createLookupFileIdFunction()
+
+	// Resolve chunk manifests into visible intervals for the requested range.
+	// NonOverlappingVisibleIntervals internally calls ResolveChunkManifest.
+	tChunkResolve := time.Now()
+	visibleIntervals, err := filer.NonOverlappingVisibleIntervals(ctx, lookupFileIdFn, chunks, offset, offset+size)
+	chunkResolveTime = time.Since(tChunkResolve)
+	if err != nil {
+		if isCanceledStreamingError(err) {
+			glog.V(3).Infof("streamFromVolumeServers: request canceled while resolving chunks: %v", err)
+			return err
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			glog.Warningf("streamFromVolumeServers: request deadline exceeded while resolving chunks: %v", err)
+		} else {
+			glog.Errorf("streamFromVolumeServers: failed to resolve chunks: %v", err)
+		}
+		if s3a.shouldFallBackToRemote(entry, totalSize, versionId) {
+			glog.V(1).Infof("streamFromVolumeServers: resolving chunks for %s/%s failed, falling back to remote mount", bucket, object)
+			if served, streamErr := s3a.serveObjectFromRemoteMount(w, r, entry, bucket, object, offset, size, isRangeRequest, totalSize, t0); served {
+				if streamErr != nil {
+					return newStreamErrorWithResponse(streamErr)
+				}
+				return nil
+			}
+		}
+		// Write S3-compliant XML error response
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		return newStreamErrorWithResponse(fmt.Errorf("failed to resolve chunks: %v", err))
+	}
+
+	// Build a ChunkReadAt backed by the server-wide ReaderCache. This mirrors
+	// the WebDAV read path (server/webdav_server.go) and outperforms the
+	// io.Pipe-based streamChunksPrefetched path: ReaderCache prefetches whole
+	// chunks into memory buffers that the consumer can memcpy out of, so
+	// prefetchCount translates into actual in-flight bytes rather than just
+	// parallel TCP handshakes.
+	//
+	// We do NOT call reader.Close() here — ChunkReadAt.Close() would destroy
+	// the ReaderCache's downloaders map, which is shared across concurrent
+	// requests. Eviction is handled by the ReaderCache's own downloader
+	// limit. JWT for volume-server requests is generated internally by
+	// util_http.RetriedFetchChunkData from jwtSigningReadKey, matching the
+	// WebDAV and mount read paths.
+	tStreamPrep := time.Now()
+	chunkViews := filer.ViewFromVisibleIntervals(visibleIntervals, offset, size)
+	reader := filer.NewChunkReaderAtFromClient(ctx, s3a.readerCache, chunkViews, totalSize, filer.DefaultPrefetchCount)
+	defer reader.ReleaseStream()
+	streamPrepTime = time.Since(tStreamPrep)
+
+	// A cached chunk whose volume server is down, or whose needle was evicted and
+	// now 404s under retry-backoff, would stall and then 500 after the headers are
+	// already sent -- serve the authoritative remote instead.
+	if s3a.shouldFallBackToRemote(entry, totalSize, versionId) {
+		if probeErr := probeReadable(ctx, reader, offset, localReadProbeTimeout); probeErr != nil {
+			if isCanceledStreamingError(probeErr) {
+				glog.V(3).Infof("streamFromVolumeServers: request canceled while probing %s/%s: %v", bucket, object, probeErr)
+				return probeErr
+			}
+			glog.V(1).Infof("streamFromVolumeServers: local read of %s/%s failed (%v), falling back to remote mount", bucket, object, probeErr)
+			if served, streamErr := s3a.serveObjectFromRemoteMount(w, r, entry, bucket, object, offset, size, isRangeRequest, totalSize, t0); served {
+				if streamErr != nil {
+					return newStreamErrorWithResponse(streamErr)
+				}
+				return nil
+			}
+			glog.Errorf("streamFromVolumeServers: local read of %s/%s failed and remote mount unavailable: %v", bucket, object, probeErr)
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+			return newStreamErrorWithResponse(probeErr)
+		}
+	}
+
+	// Headers and status are committed on the first body write, once the first
+	// read from the volume servers has succeeded. The client sees the same wire
+	// timing either way -- the status line sits in the server's write buffer
+	// until body bytes arrive -- but a first read that fails now surfaces as a
+	// clean 5xx instead of a 200 with a broken body.
+	body := &commitOnFirstWrite{w: w, commit: func() {
+		tHeaderSet := time.Now()
+		s3a.setResponseHeaders(w, r, entry, totalSize)
+		if isRangeRequest {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+size-1, totalSize))
+		}
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		headerSetTime = time.Since(tHeaderSet)
+		if isRangeRequest {
+			w.WriteHeader(http.StatusPartialContent)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+		TimeToFirstByte(r.Method, t0, r)
+	}}
+
+	// Stream directly to response with counting wrapper.
+	// ChunkReadAt's ReadAt is backed by in-memory prefetched chunk buffers, so
+	// io.CopyBuffer drains them as fast memcpys.
+	tStreamExec := time.Now()
+	glog.V(4).Infof("streamFromVolumeServers: starting chunk reader, offset=%d, size=%d", offset, size)
+	written, err := s3a.streamRangeToClient(body, r, reader, entry, bucket, object, offset, size, totalSize, versionId)
+	streamExecTime = time.Since(tStreamExec)
+	// Track traffic even on partial writes for accurate egress accounting
+	if written > 0 {
+		BucketTrafficSent(written, r)
+	}
+	if err != nil {
+		if !body.committed {
+			if isCanceledStreamingError(err) {
+				glog.V(3).Infof("streamFromVolumeServers: request canceled before first byte of %s/%s: %v", bucket, object, err)
+				return err
+			}
+			glog.Errorf("streamFromVolumeServers: first read of %s/%s failed: %v", bucket, object, err)
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+			return newStreamErrorWithResponse(err)
+		}
+		switch {
+		case isCanceledStreamingError(err):
+			// Client disconnected mid-stream (e.g. Nginx upstream timeout, browser cancel) - expected
+			glog.V(3).Infof("streamFromVolumeServers: client disconnected after writing %d bytes: %v", written, err)
+		case errors.Is(err, context.DeadlineExceeded):
+			// Server-side deadline exceeded - unexpected, warrants operator attention
+			glog.Warningf("streamFromVolumeServers: server-side deadline exceeded after writing %d bytes: %v", written, err)
+		default:
+			glog.Errorf("streamFromVolumeServers: streamFn failed after writing %d bytes: %v", written, err)
+		}
+		// Streaming error after WriteHeader was called - response already partially written
+		return newStreamErrorWithResponse(err)
+	}
+	body.Commit()
+	glog.V(4).Infof("streamFromVolumeServers: streamFn completed successfully, wrote %d bytes", written)
+	return nil
+}
+
+// short, so a down volume server or an evicted needle under retry-backoff falls
+// back promptly instead of stalling the request
+const localReadProbeTimeout = 2 * time.Second
+
+// shouldFallBackToRemote reports whether a failed local read may be served from
+// the mounted remote instead: openRemoteStream only reads the unversioned key,
+// and the sizes must match for the bytes to be identical under the
+// already-computed Content-Length.
+func (s3a *S3ApiServer) shouldFallBackToRemote(entry *filer_pb.Entry, totalSize int64, versionId string) bool {
+	if v := resolvedSourceVersionId(versionId, entry); v != "" && v != "null" {
+		return false
+	}
+	remote := entry.GetRemoteEntry()
+	return totalSize > 0 && remote != nil && remote.GetRemoteSize() == totalSize
+}
+
+// the context-honoring read of filer.ChunkReadAt, so probeReadable can bound it
+type ctxReaderAt interface {
+	ReadAtWithTime(ctx context.Context, p []byte, offset int64) (int, int64, error)
+}
+
+// probeReadable decides whether the local copy is usable by reading one byte at
+// offset. Only a returned byte counts -- a zero-byte read, EOF or not, would
+// otherwise wave through a stream that then truncates.
+func probeReadable(ctx context.Context, reader ctxReaderAt, offset int64, timeout time.Duration) error {
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var b [1]byte
+	n, _, err := reader.ReadAtWithTime(probeCtx, b[:], offset)
+	if n == len(b) {
+		return nil
+	}
+	if err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	return err
+}
+
+func respondObjectGone(w http.ResponseWriter, r *http.Request, bucket, object string, err error) error {
+	glog.V(1).Infof("streamFromVolumeServers: %s/%s not found: %v", bucket, object, err)
+	s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+	return newStreamErrorWithResponse(err)
+}
+
+// serveObjectFromRemoteMount serves [offset, offset+size) straight from the
+// mounted remote. served=false means nothing was written and the caller still
+// owns the error path, with err saying why the origin could not be opened; once
+// served is true the response is committed.
+func (s3a *S3ApiServer) serveObjectFromRemoteMount(w http.ResponseWriter, r *http.Request, entry *filer_pb.Entry, bucket, object string, offset, size int64, isRangeRequest bool, totalSize int64, t0 time.Time) (served bool, err error) {
+	remoteReader, remoteErr := s3a.openRemoteStream(r.Context(), bucket, object, offset, size, nil)
+	if remoteErr != nil {
+		glog.Warningf("streamFromVolumeServers: origin stream %s/%s: %v", bucket, object, remoteErr)
+		return false, remoteErr
+	}
+	defer remoteReader.Close()
+
+	s3a.setResponseHeaders(w, r, entry, totalSize)
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	if isRangeRequest {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+size-1, totalSize))
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+
+	TimeToFirstByte(r.Method, t0, r)
+	cw := &countingWriter{w: w}
+	_, copyErr := io.CopyN(cw, remoteReader, size)
+	if copyErr == io.EOF {
+		// the origin returned fewer bytes than the entry's RemoteSize
+		copyErr = io.ErrUnexpectedEOF
+	}
+	if cw.written > 0 {
+		BucketTrafficSent(cw.written, r)
+	}
+	if copyErr != nil {
+		glog.V(2).Infof("streamFromVolumeServers: origin stream %s/%s ended after %d bytes: %v", bucket, object, cw.written, copyErr)
+		return true, copyErr
+	}
+	return true, nil
+}
+
+// streamRangeToClient copies the local copy into the already-committed response.
+// The probe only proved the byte at offset readable, so a later chunk can still
+// be gone: finish such a body from the remote -- if it is still the generation
+// that was cached -- instead of truncating it under the Content-Length already
+// sent.
+func (s3a *S3ApiServer) streamRangeToClient(w io.Writer, r *http.Request, reader io.ReaderAt, entry *filer_pb.Entry, bucket, object string, offset, size, totalSize int64, versionId string) (int64, error) {
+	// small-object GETs shouldn't allocate a 256 KiB scratch buffer per request
+	const maxCopyBuf = 256 * 1024
+	copyBufSize := int64(maxCopyBuf)
+	if size > 0 && size < copyBufSize {
+		copyBufSize = size
+	}
+	cw := &countingWriter{w: w}
+	_, err := io.CopyBuffer(cw, io.NewSectionReader(reader, offset, size), make([]byte, copyBufSize))
+	if err == nil && cw.written < size {
+		// a short local read surfaces as a clean EOF
+		err = io.ErrUnexpectedEOF
+	}
+	if err == nil || cw.writeErr != nil || isCanceledStreamingError(err) || !s3a.shouldFallBackToRemote(entry, totalSize, versionId) {
+		return cw.written, err
+	}
+
+	remaining := size - cw.written
+	glog.V(1).Infof("streamFromVolumeServers: local read of %s/%s failed after %d bytes (%v), finishing from the remote mount", bucket, object, cw.written, err)
+	// the bytes already sent are the cached generation, so splice on the remote
+	// only while it still is that generation
+	remoteReader, remoteErr := s3a.openRemoteStream(r.Context(), bucket, object, offset+cw.written, remaining, entry.GetRemoteEntry())
+	if remoteErr != nil {
+		glog.Warningf("streamFromVolumeServers: origin stream %s/%s: %v", bucket, object, remoteErr)
+		return cw.written, err
+	}
+	defer remoteReader.Close()
+	if _, copyErr := io.CopyN(cw, remoteReader, remaining); copyErr != nil {
+		if copyErr == io.EOF {
+			copyErr = io.ErrUnexpectedEOF
+		}
+		glog.V(2).Infof("streamFromVolumeServers: origin stream %s/%s ended after %d bytes: %v", bucket, object, cw.written, copyErr)
+		return cw.written, copyErr
+	}
+	return cw.written, nil
+}
+
+// createLookupFileIdFunction creates a reusable lookup function for resolving volume URLs
+// Uses FilerClient's vidMap cache to eliminate per-chunk gRPC overhead
+func (s3a *S3ApiServer) createLookupFileIdFunction() func(context.Context, string) ([]string, error) {
+	// Return the FilerClient's lookup function which uses the battle-tested vidMap cache
+	return s3a.filerClient.GetLookupFileIdFunction()
+}
+
+// streamFromVolumeServersWithSSE handles streaming with inline SSE decryption
+func (s3a *S3ApiServer) streamFromVolumeServersWithSSE(w http.ResponseWriter, r *http.Request, entry *filer_pb.Entry, sseType string, bucket, object, versionId string) error {
+	if entry.RemoteEntry != nil && entry.RemoteEntry.RemoteSize > 0 {
+		// inline content is served locally without chunks
+		hit := !entry.IsInRemoteOnly() || len(entry.Content) > 0
+		stats.RecordRemoteCacheRead(stats.RemoteCacheSourceS3, bucket, hit)
+	}
+
+	// If not encrypted, use fast path without decryption
+	if sseType == "" || sseType == "None" {
+		return s3a.streamFromVolumeServers(w, r, entry, sseType, bucket, object, versionId)
+	}
+
+	// Profiling: Track SSE decryption stages
+	t0 := time.Now()
+	var (
+		rangeParseTime   time.Duration
+		keyValidateTime  time.Duration
+		headerSetTime    time.Duration
+		streamFetchTime  time.Duration
+		decryptSetupTime time.Duration
+		copyTime         time.Duration
+	)
+	defer func() {
+		totalTime := time.Since(t0)
+		glog.V(2).Infof("  └─ streamFromVolumeServersWithSSE (%s): total=%v, rangeParse=%v, keyValidate=%v, headerSet=%v, streamFetch=%v, decryptSetup=%v, copy=%v",
+			sseType, totalTime, rangeParseTime, keyValidateTime, headerSetTime, streamFetchTime, decryptSetupTime, copyTime)
+	}()
+
+	glog.V(2).Infof("streamFromVolumeServersWithSSE: Handling %s encrypted object with inline decryption", sseType)
+
+	// Parse Range header BEFORE key validation
+	totalSize := int64(filer.FileSize(entry))
+	tRangeParse := time.Now()
+	offset, size, isRangeRequest, rangeErr := s3a.parseAndValidateRange(w, r, entry, totalSize, bucket, object)
+	if rangeErr != nil {
+		return rangeErr
+	}
+	if isRangeRequest {
+		glog.V(2).Infof("streamFromVolumeServersWithSSE: Range request bytes %d-%d/%d (size=%d)", offset, offset+size-1, totalSize, size)
+	}
+	rangeParseTime = time.Since(tRangeParse)
+
+	// Validate SSE keys BEFORE streaming
+	tKeyValidate := time.Now()
+	var decryptionKey interface{}
+	switch sseType {
+	case s3_constants.SSETypeC:
+		customerKey, err := ParseSSECHeaders(r)
+		if err != nil {
+			s3err.WriteErrorResponse(w, r, MapSSECErrorToS3Error(err))
+			return newStreamErrorWithResponse(err)
+		}
+		if customerKey == nil {
+			s3err.WriteErrorResponse(w, r, s3err.ErrSSECustomerKeyMissing)
+			return newStreamErrorWithResponse(fmt.Errorf("SSE-C key required"))
+		}
+		// Validate key MD5
+		if entry.Extended != nil {
+			storedKeyMD5 := string(entry.Extended[s3_constants.AmzServerSideEncryptionCustomerKeyMD5])
+			if storedKeyMD5 != "" && customerKey.KeyMD5 != storedKeyMD5 {
+				s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
+				return newStreamErrorWithResponse(fmt.Errorf("SSE-C key mismatch"))
+			}
+		}
+		decryptionKey = customerKey
+	case s3_constants.SSETypeKMS:
+		// Extract KMS key from metadata (stored as raw bytes, matching filer behavior)
+		if entry.Extended == nil {
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+			return newStreamErrorWithResponse(fmt.Errorf("no SSE-KMS metadata"))
+		}
+		kmsMetadataBytes := entry.Extended[s3_constants.SeaweedFSSSEKMSKey]
+		sseKMSKey, err := DeserializeSSEKMSMetadata(kmsMetadataBytes)
+		if err != nil {
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+			return newStreamErrorWithResponse(err)
+		}
+		decryptionKey = sseKMSKey
+	case s3_constants.SSETypeS3:
+		// Extract S3 key from metadata (stored as raw bytes, matching filer behavior)
+		if entry.Extended == nil {
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+			return newStreamErrorWithResponse(fmt.Errorf("no SSE-S3 metadata"))
+		}
+		keyData := entry.Extended[s3_constants.SeaweedFSSSES3Key]
+		keyManager := GetSSES3KeyManager()
+		sseS3Key, err := DeserializeSSES3Metadata(keyData, keyManager)
+		if err != nil {
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+			return newStreamErrorWithResponse(err)
+		}
+		decryptionKey = sseS3Key
+	}
+	keyValidateTime = time.Since(tKeyValidate)
+
+	// Headers and status are committed on the first body write, once the first
+	// fetch and decryption step has succeeded -- the same deferral as
+	// streamFromVolumeServers, so a missing needle or broken decrypt setup
+	// surfaces as a clean 5xx instead of a 200 with a broken body.
+	body := &commitOnFirstWrite{w: w, commit: func() {
+		tHeaderSet := time.Now()
+		s3a.setResponseHeaders(w, r, entry, totalSize)
+		s3a.addSSEResponseHeadersFromEntry(w, r, entry, sseType)
+		if isRangeRequest {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+size-1, totalSize))
+			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		}
+		headerSetTime = time.Since(tHeaderSet)
+		if isRangeRequest {
+			w.WriteHeader(http.StatusPartialContent)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+		TimeToFirstByte(r.Method, t0, r)
+	}}
+
+	// Full Range Optimization: Use ViewFromChunks to only fetch/decrypt needed chunks
+	tDecryptSetup := time.Now()
+
+	// Use range-aware chunk resolution (like filer does)
+	if isRangeRequest {
+		glog.V(2).Infof("Using range-aware SSE decryption for offset=%d size=%d", offset, size)
+		streamFetchTime = 0 // No full stream fetch in range-aware path
+		written, err := s3a.streamDecryptedRangeFromChunks(r.Context(), body, entry, offset, size, sseType, decryptionKey)
+		decryptSetupTime = time.Since(tDecryptSetup)
+		copyTime = decryptSetupTime // Streaming is included in decrypt setup for range-aware path
+		// Track traffic even on partial writes for accurate egress accounting
+		if written > 0 {
+			BucketTrafficSent(written, r)
+		}
+		if err != nil {
+			if !body.committed {
+				// nothing written yet -- the caller writes the S3 error response
+				return err
+			}
+			return newStreamErrorWithResponse(err)
+		}
+		body.Commit()
+		return nil
+	}
+	if _, err := s3a.flattenManifestChunks(r.Context(), entry); err != nil {
+		return fmt.Errorf("resolve encrypted chunk manifests: %w", err)
+	}
+
+	// Full object path: Optimize multipart vs single-part
+	var decryptedReader io.Reader
+	var err error
+
+	switch sseType {
+	case s3_constants.SSETypeC:
+		customerKey := decryptionKey.(*SSECustomerKey)
+
+		// Check if this is a multipart object (multiple chunks with SSE-C metadata)
+		isMultipartSSEC := false
+		ssecChunks := 0
+		for _, chunk := range entry.GetChunks() {
+			if chunk.GetSseType() == filer_pb.SSEType_SSE_C && len(chunk.GetSseMetadata()) > 0 {
+				ssecChunks++
+			}
+		}
+		isMultipartSSEC = ssecChunks > 1
+		glog.V(3).Infof("SSE-C decryption: KeyMD5=%s, entry has %d chunks, isMultipart=%v, ssecChunks=%d",
+			customerKey.KeyMD5, len(entry.GetChunks()), isMultipartSSEC, ssecChunks)
+
+		if isMultipartSSEC {
+			// For multipart, skip getEncryptedStreamFromVolumes and fetch chunks directly
+			// This saves one filer lookup/pipe creation
+			decryptedReader, err = s3a.createMultipartSSECDecryptedReaderDirect(r.Context(), nil, customerKey, entry)
+			glog.V(2).Infof("Using multipart SSE-C decryption for object with %d chunks (no prefetch)", len(entry.GetChunks()))
+		} else {
+			// For single-part, get encrypted stream and decrypt
+			tStreamFetch := time.Now()
+			encryptedReader, streamErr := s3a.getEncryptedStreamFromVolumes(r.Context(), entry, 0, int64(filer.FileSize(entry)))
+			streamFetchTime = time.Since(tStreamFetch)
+			if streamErr != nil {
+				return streamErr
+			}
+			defer encryptedReader.Close()
+
+			iv := entry.Extended[s3_constants.SeaweedFSSSEIV]
+			if len(iv) == 0 {
+				return fmt.Errorf("SSE-C IV not found in entry metadata")
+			}
+			glog.V(2).Infof("SSE-C decryption: IV length=%d, KeyMD5=%s", len(iv), customerKey.KeyMD5)
+			decryptedReader, err = CreateSSECDecryptedReader(encryptedReader, customerKey, iv)
+		}
+
+	case s3_constants.SSETypeKMS:
+		sseKMSKey := decryptionKey.(*SSEKMSKey)
+
+		// Check if this is a multipart object (multiple chunks with SSE-KMS metadata)
+		isMultipartSSEKMS := false
+		ssekmsChunks := 0
+		for _, chunk := range entry.GetChunks() {
+			if chunk.GetSseType() == filer_pb.SSEType_SSE_KMS && len(chunk.GetSseMetadata()) > 0 {
+				ssekmsChunks++
+			}
+		}
+		isMultipartSSEKMS = ssekmsChunks > 1
+		glog.V(3).Infof("SSE-KMS decryption: isMultipart=%v, ssekmsChunks=%d", isMultipartSSEKMS, ssekmsChunks)
+
+		if isMultipartSSEKMS {
+			// For multipart, skip getEncryptedStreamFromVolumes and fetch chunks directly
+			decryptedReader, err = s3a.createMultipartSSEKMSDecryptedReaderDirect(r.Context(), nil, entry)
+			glog.V(2).Infof("Using multipart SSE-KMS decryption for object with %d chunks (no prefetch)", len(entry.GetChunks()))
+		} else {
+			// For single-part, get encrypted stream and decrypt
+			tStreamFetch := time.Now()
+			encryptedReader, streamErr := s3a.getEncryptedStreamFromVolumes(r.Context(), entry, 0, int64(filer.FileSize(entry)))
+			streamFetchTime = time.Since(tStreamFetch)
+			if streamErr != nil {
+				return streamErr
+			}
+			defer encryptedReader.Close()
+
+			glog.V(2).Infof("SSE-KMS decryption: KeyID=%s, IV length=%d", sseKMSKey.KeyID, len(sseKMSKey.IV))
+			decryptedReader, err = CreateSSEKMSDecryptedReader(encryptedReader, sseKMSKey)
+		}
+
+	case s3_constants.SSETypeS3:
+		sseS3Key := decryptionKey.(*SSES3Key)
+
+		// Check if this is a multipart object (multiple chunks with SSE-S3 metadata)
+		isMultipartSSES3 := false
+		sses3Chunks := 0
+		for _, chunk := range entry.GetChunks() {
+			if chunk.GetSseType() == filer_pb.SSEType_SSE_S3 && len(chunk.GetSseMetadata()) > 0 {
+				sses3Chunks++
+			}
+		}
+		isMultipartSSES3 = sses3Chunks > 1
+		glog.V(3).Infof("SSE-S3 decryption: isMultipart=%v, sses3Chunks=%d", isMultipartSSES3, sses3Chunks)
+
+		if isMultipartSSES3 {
+			// For multipart, skip getEncryptedStreamFromVolumes and fetch chunks directly
+			decryptedReader, err = s3a.createMultipartSSES3DecryptedReaderDirect(r.Context(), nil, entry)
+			glog.V(2).Infof("Using multipart SSE-S3 decryption for object with %d chunks (no prefetch)", len(entry.GetChunks()))
+		} else {
+			// For single-part, get encrypted stream and decrypt
+			tStreamFetch := time.Now()
+			encryptedReader, streamErr := s3a.getEncryptedStreamFromVolumes(r.Context(), entry, 0, int64(filer.FileSize(entry)))
+			streamFetchTime = time.Since(tStreamFetch)
+			if streamErr != nil {
+				return streamErr
+			}
+			defer encryptedReader.Close()
+
+			keyManager := GetSSES3KeyManager()
+			iv, ivErr := GetSSES3IV(entry, sseS3Key, keyManager)
+			if ivErr != nil {
+				return fmt.Errorf("failed to get SSE-S3 IV: %w", ivErr)
+			}
+			glog.V(2).Infof("SSE-S3 decryption: KeyID=%s, IV length=%d", sseS3Key.KeyID, len(iv))
+			decryptedReader, err = CreateSSES3DecryptedReader(encryptedReader, sseS3Key, iv)
+		}
+	}
+	decryptSetupTime = time.Since(tDecryptSetup)
+
+	if err != nil {
+		glog.Errorf("SSE decryption error (%s): %v", sseType, err)
+		return fmt.Errorf("failed to create decrypted reader: %w", err)
+	}
+
+	// Close the decrypted reader to avoid leaking HTTP bodies
+	if closer, ok := decryptedReader.(io.Closer); ok {
+		defer func() {
+			if closeErr := closer.Close(); closeErr != nil {
+				glog.V(3).Infof("Error closing decrypted reader: %v", closeErr)
+			}
+		}()
+	}
+
+	// Stream full decrypted object to client
+	tCopy := time.Now()
+	buf := make([]byte, 128*1024)
+	copied, copyErr := io.CopyBuffer(body, decryptedReader, buf)
+	copyTime = time.Since(tCopy)
+	// Track traffic even on partial writes for accurate egress accounting
+	if copied > 0 {
+		BucketTrafficSent(copied, r)
+	}
+	if copyErr != nil {
+		glog.Errorf("Failed to copy full object: copied %d bytes: %v", copied, copyErr)
+		if !body.committed {
+			// nothing written yet -- the caller writes the S3 error response
+			return copyErr
+		}
+		return newStreamErrorWithResponse(copyErr)
+	}
+	body.Commit()
+	glog.V(3).Infof("Full object request: copied %d bytes", copied)
+	return nil
+}
+
+// streamDecryptedRangeFromChunks streams a range of decrypted data by only fetching needed chunks
+// This implements the filer's ViewFromChunks approach for optimal range performance
+// Returns the number of bytes written and any error
+func (s3a *S3ApiServer) streamDecryptedRangeFromChunks(ctx context.Context, w io.Writer, entry *filer_pb.Entry, offset int64, size int64, sseType string, decryptionKey interface{}) (int64, error) {
+	lookupFileIdFn := s3a.createLookupFileIdFunction()
+	resolvedChunks, _, err := filer.ResolveChunkManifest(ctx, lookupFileIdFn, entry.GetChunks(), offset, offset+size, s3a.filerClient)
+	if err != nil {
+		return 0, err
+	}
+	chunkViews, err := filer.ViewFromChunks(ctx, nil, resolvedChunks, offset, size)
+	if err != nil {
+		return 0, err
+	}
+
+	totalWritten := int64(0)
+	targetOffset := offset
+
+	// Stream each chunk view
+	for x := chunkViews.Front(); x != nil; x = x.Next {
+		chunkView := x.Value
+
+		// Handle gaps between chunks (write zeros)
+		if targetOffset < chunkView.ViewOffset {
+			gap := chunkView.ViewOffset - targetOffset
+			glog.V(4).Infof("Writing %d zero bytes for gap [%d,%d)", gap, targetOffset, chunkView.ViewOffset)
+			if err := writeZeroBytes(w, gap); err != nil {
+				return totalWritten, fmt.Errorf("failed to write zero padding: %w", err)
+			}
+			totalWritten += gap
+			targetOffset = chunkView.ViewOffset
+		}
+
+		// Find the corresponding FileChunk for this chunkView
+		var fileChunk *filer_pb.FileChunk
+		for _, chunk := range resolvedChunks {
+			if chunk.GetFileIdString() == chunkView.FileId {
+				fileChunk = chunk
+				break
+			}
+		}
+		if fileChunk == nil {
+			return totalWritten, fmt.Errorf("chunk %s not found in entry", chunkView.FileId)
+		}
+
+		// Fetch and decrypt this chunk view
+		var decryptedChunkReader io.Reader
+		var err error
+
+		switch sseType {
+		case s3_constants.SSETypeC:
+			decryptedChunkReader, err = s3a.decryptSSECChunkView(ctx, fileChunk, chunkView, decryptionKey.(*SSECustomerKey))
+		case s3_constants.SSETypeKMS:
+			decryptedChunkReader, err = s3a.decryptSSEKMSChunkView(ctx, fileChunk, chunkView)
+		case s3_constants.SSETypeS3:
+			decryptedChunkReader, err = s3a.decryptSSES3ChunkView(ctx, fileChunk, chunkView, entry)
+		default:
+			// Non-encrypted chunk
+			decryptedChunkReader, err = s3a.fetchChunkViewData(ctx, chunkView)
+		}
+
+		if err != nil {
+			return totalWritten, fmt.Errorf("failed to decrypt chunk view %s: %w", chunkView.FileId, err)
+		}
+
+		// Copy the decrypted chunk data
+		written, copyErr := io.Copy(w, decryptedChunkReader)
+		if closer, ok := decryptedChunkReader.(io.Closer); ok {
+			closeErr := closer.Close()
+			if closeErr != nil {
+				glog.Warningf("streamDecryptedRangeFromChunks: failed to close decrypted chunk reader: %v", closeErr)
+			}
+		}
+		if copyErr != nil {
+			glog.Errorf("streamDecryptedRangeFromChunks: copy error after writing %d bytes (expected %d): %v", written, chunkView.ViewSize, copyErr)
+			return totalWritten, fmt.Errorf("failed to copy decrypted chunk data: %w", copyErr)
+		}
+
+		if written != int64(chunkView.ViewSize) {
+			glog.Errorf("streamDecryptedRangeFromChunks: size mismatch - wrote %d bytes but expected %d", written, chunkView.ViewSize)
+			return totalWritten, fmt.Errorf("size mismatch: wrote %d bytes but expected %d for chunk %s", written, chunkView.ViewSize, chunkView.FileId)
+		}
+
+		totalWritten += written
+		targetOffset += written
+		glog.V(2).Infof("streamDecryptedRangeFromChunks: Wrote %d bytes from chunk %s [%d,%d), totalWritten=%d, targetSize=%d", written, chunkView.FileId, chunkView.ViewOffset, chunkView.ViewOffset+int64(chunkView.ViewSize), totalWritten, size)
+	}
+
+	// Handle trailing zeros if needed
+	remaining := size - totalWritten
+	if remaining > 0 {
+		glog.V(4).Infof("Writing %d trailing zero bytes", remaining)
+		if err := writeZeroBytes(w, remaining); err != nil {
+			return totalWritten, fmt.Errorf("failed to write trailing zeros: %w", err)
+		}
+		totalWritten += remaining
+	}
+
+	glog.V(3).Infof("Completed range-aware SSE decryption: wrote %d bytes for range [%d,%d)", totalWritten, offset, offset+size)
+	return totalWritten, nil
+}
+
+// writeZeroBytes writes n zero bytes to writer using the package-level zero buffer
+func writeZeroBytes(w io.Writer, n int64) error {
+	for n > 0 {
+		toWrite := min(n, int64(len(zeroBuf)))
+		written, err := w.Write(zeroBuf[:toWrite])
+		if err != nil {
+			return err
+		}
+		n -= int64(written)
+	}
+	return nil
+}
+
+// decryptSSECChunkView decrypts a specific chunk view with SSE-C
+//
+// IV Handling for SSE-C:
+// ----------------------
+// SSE-C multipart encryption differs from SSE-KMS/SSE-S3:
+//
+// 1. Encryption: CreateSSECEncryptedReader generates a RANDOM IV per part
+//   - Each part starts with a fresh random IV (NOT derived from a base IV)
+//   - CTR counter starts from 0 for each part: counter₀, counter₁, counter₂, ...
+//   - PartOffset is stored in metadata to describe where this chunk sits in that encrypted stream
+//
+// 2. Decryption: Use the stored per-part IV and advance the CTR by PartOffset
+//   - CreateSSECDecryptedReaderWithOffset internally uses calculateIVWithOffset to advance
+//     the CTR counter to reach PartOffset within the per-part encrypted stream
+//   - calculateIVWithOffset is applied to the per-part IV, NOT to derive a global base IV
+//   - Do NOT compute a single base IV for all parts (unlike SSE-KMS/SSE-S3)
+//
+// This contrasts with SSE-KMS/SSE-S3 which use: base IV + calculateIVWithOffset(ChunkOffset)
+func (s3a *S3ApiServer) decryptSSECChunkView(ctx context.Context, fileChunk *filer_pb.FileChunk, chunkView *filer.ChunkView, customerKey *SSECustomerKey) (io.Reader, error) {
+	// For multipart SSE-C, each chunk has its own IV in chunk.SseMetadata
+	if fileChunk.GetSseType() == filer_pb.SSEType_SSE_C && len(fileChunk.GetSseMetadata()) > 0 {
+		ssecMetadata, err := DeserializeSSECMetadata(fileChunk.GetSseMetadata())
+		if err != nil {
+			return nil, fmt.Errorf("failed to deserialize SSE-C metadata: %w", err)
+		}
+		chunkIV, err := base64.StdEncoding.DecodeString(ssecMetadata.IV)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode IV: %w", err)
+		}
+
+		// Fetch FULL encrypted chunk
+		// Note: Fetching full chunk is necessary for proper CTR decryption stream
+		fullChunkReader, err := s3a.fetchFullChunk(ctx, chunkView)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch full chunk: %w", err)
+		}
+
+		partOffset := ssecMetadata.PartOffset
+		if partOffset < 0 {
+			fullChunkReader.Close()
+			return nil, fmt.Errorf("invalid SSE-C part offset %d for chunk %s", partOffset, chunkView.FileId)
+		}
+
+		// Use stored IV and advance CTR stream by PartOffset within the encrypted stream
+		decryptedReader, decryptErr := CreateSSECDecryptedReaderWithOffset(fullChunkReader, customerKey, chunkIV, uint64(partOffset))
+		if decryptErr != nil {
+			fullChunkReader.Close()
+			return nil, fmt.Errorf("failed to create decrypted reader: %w", decryptErr)
+		}
+
+		// Skip to the position we need in the decrypted stream
+		if chunkView.OffsetInChunk > 0 {
+			_, err = io.CopyN(io.Discard, decryptedReader, chunkView.OffsetInChunk)
+			if err != nil {
+				if closer, ok := decryptedReader.(io.Closer); ok {
+					closer.Close()
+				}
+				return nil, fmt.Errorf("failed to skip to offset %d: %w", chunkView.OffsetInChunk, err)
+			}
+		}
+
+		// Return a reader that only reads ViewSize bytes with proper cleanup
+		limitedReader := io.LimitReader(decryptedReader, int64(chunkView.ViewSize))
+		return &rc{Reader: limitedReader, Closer: fullChunkReader}, nil
+	}
+
+	// Single-part SSE-C: use object-level IV (should not hit this in range path, but handle it)
+	encryptedReader, err := s3a.fetchChunkViewData(ctx, chunkView)
+	if err != nil {
+		return nil, err
+	}
+	// For single-part, the IV is stored at object level, already handled in non-range path
+	return encryptedReader, nil
+}
+
+// decryptSSEKMSChunkView decrypts a specific chunk view with SSE-KMS
+//
+// IV Handling for SSE-KMS:
+// ------------------------
+// SSE-KMS (and SSE-S3) use a fundamentally different IV scheme than SSE-C:
+//
+// 1. Encryption: Uses a BASE IV + offset calculation
+//   - Base IV is generated once for the entire object
+//   - For each chunk at position N: adjustedIV = calculateIVWithOffset(baseIV, N)
+//   - This shifts the CTR counter to counterₙ where n = N/16
+//   - ChunkOffset is stored in metadata and IS applied during encryption
+//
+// 2. Decryption: Apply the same offset calculation
+//   - Use calculateIVWithOffset(baseIV, ChunkOffset) to reconstruct the encryption IV
+//   - Also handle ivSkip for non-block-aligned offsets (intra-block positioning)
+//   - This ensures decryption uses the same CTR counter sequence as encryption
+//
+// This contrasts with SSE-C which uses random IVs without offset calculation.
+func (s3a *S3ApiServer) decryptSSEKMSChunkView(ctx context.Context, fileChunk *filer_pb.FileChunk, chunkView *filer.ChunkView) (io.Reader, error) {
+	if fileChunk.GetSseType() == filer_pb.SSEType_SSE_KMS && len(fileChunk.GetSseMetadata()) > 0 {
+		sseKMSKey, err := DeserializeSSEKMSMetadata(fileChunk.GetSseMetadata())
+		if err != nil {
+			return nil, fmt.Errorf("failed to deserialize SSE-KMS metadata: %w", err)
+		}
+
+		// Fetch FULL encrypted chunk
+		fullChunkReader, err := s3a.fetchFullChunk(ctx, chunkView)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch full chunk: %w", err)
+		}
+
+		// CreateSSEKMSDecryptedReader applies ChunkOffset to the stored base IV.
+		// Passing a pre-adjusted IV here would apply the offset twice and corrupt
+		// range reads that cross multipart chunk boundaries.
+		decryptedReader, decryptErr := CreateSSEKMSDecryptedReader(fullChunkReader, sseKMSKey)
+		if decryptErr != nil {
+			fullChunkReader.Close()
+			return nil, fmt.Errorf("failed to create KMS decrypted reader: %w", decryptErr)
+		}
+
+		// Skip to position and limit to ViewSize
+		if chunkView.OffsetInChunk > 0 {
+			_, err = io.CopyN(io.Discard, decryptedReader, chunkView.OffsetInChunk)
+			if err != nil {
+				if closer, ok := decryptedReader.(io.Closer); ok {
+					closer.Close()
+				}
+				return nil, fmt.Errorf("failed to skip to offset: %w", err)
+			}
+		}
+
+		limitedReader := io.LimitReader(decryptedReader, int64(chunkView.ViewSize))
+		return &rc{Reader: limitedReader, Closer: fullChunkReader}, nil
+	}
+
+	// Non-KMS encrypted chunk
+	return s3a.fetchChunkViewData(ctx, chunkView)
+}
+
+// decryptSSES3ChunkView decrypts a specific chunk view with SSE-S3
+//
+// IV Handling for SSE-S3:
+// -----------------------
+// SSE-S3 uses the same BASE IV + offset scheme as SSE-KMS, but with a subtle difference:
+//
+// 1. Encryption: Uses BASE IV + offset, but stores the ADJUSTED IV
+//   - Base IV is generated once for the entire object
+//   - For each chunk at position N: adjustedIV, skip = calculateIVWithOffset(baseIV, N)
+//   - The ADJUSTED IV (not base IV) is stored in chunk metadata
+//   - ChunkOffset calculation is performed during encryption
+//
+// 2. Decryption: Use the stored adjusted IV directly
+//   - The stored IV is already block-aligned and ready to use
+//   - No need to call calculateIVWithOffset again (unlike SSE-KMS)
+//   - Decrypt full chunk from start, then skip to OffsetInChunk in plaintext
+//
+// This differs from:
+//   - SSE-C: Uses random IV per chunk, no offset calculation
+//   - SSE-KMS: Stores base IV, requires calculateIVWithOffset during decryption
+func (s3a *S3ApiServer) decryptSSES3ChunkView(ctx context.Context, fileChunk *filer_pb.FileChunk, chunkView *filer.ChunkView, entry *filer_pb.Entry) (io.Reader, error) {
+	// For multipart SSE-S3, each chunk has its own IV in chunk.SseMetadata
+	if fileChunk.GetSseType() == filer_pb.SSEType_SSE_S3 && len(fileChunk.GetSseMetadata()) > 0 {
+		keyManager := GetSSES3KeyManager()
+
+		// Deserialize per-chunk SSE-S3 metadata to get chunk-specific IV
+		chunkSSES3Metadata, err := DeserializeSSES3Metadata(fileChunk.GetSseMetadata(), keyManager)
+		if err != nil {
+			return nil, fmt.Errorf("failed to deserialize chunk SSE-S3 metadata: %w", err)
+		}
+
+		// Fetch FULL encrypted chunk (necessary for proper CTR decryption stream)
+		fullChunkReader, err := s3a.fetchFullChunk(ctx, chunkView)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch full chunk: %w", err)
+		}
+
+		// IMPORTANT: Use the stored IV directly - it's already block-aligned
+		// During encryption, CreateSSES3EncryptedReaderWithBaseIV called:
+		//   adjustedIV, skip := calculateIVWithOffset(baseIV, partOffset)
+		// and stored the adjustedIV in metadata. We use it as-is for decryption.
+		// No need to call calculateIVWithOffset again (unlike SSE-KMS which stores base IV).
+		iv := chunkSSES3Metadata.IV
+
+		glog.V(4).Infof("Decrypting multipart SSE-S3 chunk %s with chunk-specific IV length=%d",
+			chunkView.FileId, len(iv))
+
+		// Decrypt the full chunk starting from offset 0
+		decryptedReader, decryptErr := CreateSSES3DecryptedReader(fullChunkReader, chunkSSES3Metadata, iv)
+		if decryptErr != nil {
+			fullChunkReader.Close()
+			return nil, fmt.Errorf("failed to create SSE-S3 decrypted reader: %w", decryptErr)
+		}
+
+		// Skip to position within the decrypted chunk (plaintext offset, not ciphertext offset)
+		if chunkView.OffsetInChunk > 0 {
+			_, err = io.CopyN(io.Discard, decryptedReader, chunkView.OffsetInChunk)
+			if err != nil {
+				if closer, ok := decryptedReader.(io.Closer); ok {
+					closer.Close()
+				}
+				return nil, fmt.Errorf("failed to skip to offset %d: %w", chunkView.OffsetInChunk, err)
+			}
+		}
+
+		limitedReader := io.LimitReader(decryptedReader, int64(chunkView.ViewSize))
+		return &rc{Reader: limitedReader, Closer: fullChunkReader}, nil
+	}
+
+	// Single-part SSE-S3: use object-level IV and key (fallback path)
+	keyData := entry.Extended[s3_constants.SeaweedFSSSES3Key]
+	keyManager := GetSSES3KeyManager()
+	sseS3Key, err := DeserializeSSES3Metadata(keyData, keyManager)
+	if err != nil {
+		return nil, fmt.Errorf("failed to deserialize SSE-S3 metadata: %w", err)
+	}
+
+	// Fetch FULL encrypted chunk
+	fullChunkReader, err := s3a.fetchFullChunk(ctx, chunkView)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch full chunk: %w", err)
+	}
+
+	// Get base IV for single-part object
+	iv, err := GetSSES3IV(entry, sseS3Key, keyManager)
+	if err != nil {
+		fullChunkReader.Close()
+		return nil, fmt.Errorf("failed to get SSE-S3 IV: %w", err)
+	}
+
+	glog.V(4).Infof("Decrypting single-part SSE-S3 chunk %s with entry-level IV length=%d",
+		chunkView.FileId, len(iv))
+
+	decryptedReader, decryptErr := CreateSSES3DecryptedReader(fullChunkReader, sseS3Key, iv)
+	if decryptErr != nil {
+		fullChunkReader.Close()
+		return nil, fmt.Errorf("failed to create S3 decrypted reader: %w", decryptErr)
+	}
+
+	// Skip to position and limit to ViewSize
+	if chunkView.OffsetInChunk > 0 {
+		_, err = io.CopyN(io.Discard, decryptedReader, chunkView.OffsetInChunk)
+		if err != nil {
+			if closer, ok := decryptedReader.(io.Closer); ok {
+				closer.Close()
+			}
+			return nil, fmt.Errorf("failed to skip to offset: %w", err)
+		}
+	}
+
+	limitedReader := io.LimitReader(decryptedReader, int64(chunkView.ViewSize))
+	return &rc{Reader: limitedReader, Closer: fullChunkReader}, nil
+}
+
+// fetchFullChunk fetches the complete chunk from the volume server
+func (s3a *S3ApiServer) fetchFullChunk(ctx context.Context, chunkView *filer.ChunkView) (io.ReadCloser, error) {
+	return s3a.fetchChunkData(ctx, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, 0, int64(chunkView.ChunkSize), true)
+}
+
+// fetchChunkViewData fetches data for a chunk view (with range)
+func (s3a *S3ApiServer) fetchChunkViewData(ctx context.Context, chunkView *filer.ChunkView) (io.ReadCloser, error) {
+	return s3a.fetchChunkData(ctx, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, chunkView.OffsetInChunk, int64(chunkView.ViewSize), chunkView.IsFullChunk())
+}
+
+// fetchChunkData reads [offset, offset+size) of a chunk in plaintext space:
+// the volume cipher is decrypted and compression undone by
+// RetriedFetchChunkData. Unencrypted chunks take the streaming range read.
+func (s3a *S3ApiServer) fetchChunkData(ctx context.Context, fileId string, cipherKey []byte, isCompressed bool, offset int64, size int64, isFullChunk bool) (io.ReadCloser, error) {
+	if len(cipherKey) > 0 || isCompressed {
+		lookupFileIdFn := s3a.createLookupFileIdFunction()
+		urlStrings, err := lookupFileIdFn(ctx, fileId)
+		if err != nil || len(urlStrings) == 0 {
+			return nil, fmt.Errorf("failed to lookup chunk %s: %w", fileId, err)
+		}
+		buffer := make([]byte, size)
+		n, err := util_http.RetriedFetchChunkData(ctx, buffer, urlStrings, cipherKey, isCompressed, isFullChunk, offset, fileId, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch chunk %s: %w", fileId, err)
+		}
+		return io.NopCloser(bytes.NewReader(buffer[:n])), nil
+	}
+	return s3a.readChunkRange(ctx, fileId, offset, size, isFullChunk)
+}
+
+func (s3a *S3ApiServer) readChunkRange(ctx context.Context, fileId string, offset int64, size int64, isFullChunk bool) (io.ReadCloser, error) {
+	// Lookup the volume server URLs for this chunk
+	lookupFileIdFn := s3a.createLookupFileIdFunction()
+	urlStrings, err := lookupFileIdFn(ctx, fileId)
+	if err != nil || len(urlStrings) == 0 {
+		return nil, fmt.Errorf("failed to lookup chunk %s: %w", fileId, err)
+	}
+
+	// Use the first URL (already contains complete URL with fileId). The lookup returns http:// URLs; when
+	// [https.client] is configured the volume servers only speak TLS, so take the global client's scheme.
+	chunkUrl, err := util_http.NormalizeUrl(urlStrings[0])
+	if err != nil {
+		return nil, fmt.Errorf("failed to normalize chunk URL %s: %w", fileId, err)
+	}
+
+	// Generate JWT for volume server authentication (uses config loaded once at startup)
+	jwt := filer.JwtForVolumeServer(fileId)
+
+	// Create request with Range header for the chunk view
+	req, err := http.NewRequestWithContext(ctx, "GET", chunkUrl, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set Range header to fetch only the needed portion of the chunk
+	if !isFullChunk {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+size-1))
+	}
+
+	// Set JWT for authentication
+	if jwt != "" {
+		req.Header.Set("Authorization", security.BearerPrefix+jwt)
+	}
+
+	// Use the global HTTP client: it carries the [https.client] TLS configuration (CA and client
+	// certificate) that HTTPS volume servers require; a bare http.Client cannot reach them.
+	resp, err := util_http.GetGlobalHttpClient().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch chunk: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		err = util_http.StatusError(chunkUrl, resp)
+		resp.Body.Close()
+		return nil, err
+	}
+
+	return resp.Body, nil
+}
+
+// getEncryptedStreamFromVolumes gets a raw encrypted data stream from volume
+// servers for [offset, offset+size) of the entry.
+func (s3a *S3ApiServer) getEncryptedStreamFromVolumes(ctx context.Context, entry *filer_pb.Entry, offset, size int64) (io.ReadCloser, error) {
+	if size <= 0 {
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+
+	// Handle inline content
+	if len(entry.Content) > 0 {
+		content := entry.Content
+		if offset >= int64(len(content)) {
+			content = nil
+		} else {
+			content = content[offset:min(offset+size, int64(len(content)))]
+		}
+		return io.NopCloser(bytes.NewReader(content)), nil
+	}
+
+	// Handle empty files
+	chunks := entry.GetChunks()
+	if len(chunks) == 0 {
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+
+	// Reuse shared lookup function to keep volume lookup logic in one place
+	lookupFileIdFn := s3a.createLookupFileIdFunction()
+
+	// Resolve chunks
+	resolvedChunks, _, err := filer.ResolveChunkManifest(ctx, lookupFileIdFn, chunks, offset, offset+size, s3a.filerClient)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create streaming reader - use filerClient directly for cache invalidation support
+	streamFn, err := filer.PrepareStreamContentWithPrefetch(
+		ctx,
+		s3a.filerClient,
+		filer.JwtForVolumeServer, // Use filer's JWT function (loads config once, generates JWT locally)
+		resolvedChunks,
+		offset,
+		size,
+		0,
+		4, // prefetch 4 chunks ahead for overlapped fetching
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a pipe to get io.ReadCloser
+	pipeReader, pipeWriter := io.Pipe()
+	go func() {
+		defer pipeWriter.Close()
+		if err := streamFn(pipeWriter); err != nil {
+			glog.Errorf("getEncryptedStreamFromVolumes: streaming error: %v", err)
+			pipeWriter.CloseWithError(err)
+		}
+	}()
+
+	return pipeReader, nil
+}
+
+// addSSEResponseHeadersFromEntry adds appropriate SSE response headers based on entry metadata
+func (s3a *S3ApiServer) addSSEResponseHeadersFromEntry(w http.ResponseWriter, r *http.Request, entry *filer_pb.Entry, sseType string) {
+	if entry == nil || entry.Extended == nil {
+		return
+	}
+
+	switch sseType {
+	case s3_constants.SSETypeC:
+		// SSE-C: Echo back algorithm and key MD5
+		if algo, exists := entry.Extended[s3_constants.AmzServerSideEncryptionCustomerAlgorithm]; exists {
+			w.Header().Set(s3_constants.AmzServerSideEncryptionCustomerAlgorithm, string(algo))
+		}
+		if keyMD5, exists := entry.Extended[s3_constants.AmzServerSideEncryptionCustomerKeyMD5]; exists {
+			w.Header().Set(s3_constants.AmzServerSideEncryptionCustomerKeyMD5, string(keyMD5))
+		}
+
+	case s3_constants.SSETypeKMS:
+		// SSE-KMS: Return algorithm and key ID
+		w.Header().Set(s3_constants.AmzServerSideEncryption, "aws:kms")
+		if kmsMetadataBytes, exists := entry.Extended[s3_constants.SeaweedFSSSEKMSKey]; exists {
+			sseKMSKey, err := DeserializeSSEKMSMetadata(kmsMetadataBytes)
+			if err == nil {
+				AddSSEKMSResponseHeaders(w, sseKMSKey)
+			}
+		}
+
+	case s3_constants.SSETypeS3:
+		// SSE-S3: Return algorithm
+		w.Header().Set(s3_constants.AmzServerSideEncryption, s3_constants.SSEAlgorithmAES256)
+	}
+}
+
+// setResponseHeaders sets all standard HTTP response headers from entry metadata
+func (s3a *S3ApiServer) setResponseHeaders(w http.ResponseWriter, r *http.Request, entry *filer_pb.Entry, totalSize int64) {
+	// Safety check: entry must be valid
+	if entry == nil {
+		glog.Errorf("setResponseHeaders: entry is nil")
+		return
+	}
+
+	// Set content length and accept ranges
+	w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
+	w.Header().Set("Accept-Ranges", "bytes")
+
+	// Set ETag (but don't overwrite if already set, e.g., for part-specific GET requests)
+	if w.Header().Get("ETag") == "" {
+		etag := s3a.getObjectETag(entry)
+		if etag != "" {
+			w.Header().Set("ETag", etag)
+		}
+	}
+
+	// Set Last-Modified in RFC1123 format
+	if entry.Attributes != nil {
+		modTime := time.Unix(entry.Attributes.Mtime, 0).UTC()
+		w.Header().Set("Last-Modified", modTime.Format(http.TimeFormat))
+	}
+
+	// Set Content-Type
+	mimeType := ""
+	if entry.Attributes != nil && entry.Attributes.Mime != "" {
+		mimeType = entry.Attributes.Mime
+	}
+	if mimeType == "" {
+		// Try to detect from entry name
+		if entry.Name != "" {
+			ext := filepath.Ext(entry.Name)
+			if ext != "" {
+				mimeType = mime.TypeByExtension(ext)
+			}
+		}
+	}
+	if mimeType != "" {
+		w.Header().Set("Content-Type", mimeType)
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+
+	// Set custom headers from entry.Extended (user metadata)
+	// Use direct map assignment to preserve original header casing (matches proxy behavior)
+	if entry.Extended != nil {
+		for k, v := range entry.Extended {
+			// Skip internal SeaweedFS headers
+			if !strings.HasPrefix(k, "xattr-") && !s3_constants.IsSeaweedFSInternalHeader(k) {
+				// Support backward compatibility: migrate old non-canonical format to canonical format
+				// OLD: "x-amz-meta-foo" → NEW: "X-Amz-Meta-foo" (preserving suffix case)
+				headerKey := k
+				if len(k) >= 11 && strings.EqualFold(k[:11], "x-amz-meta-") {
+					// Normalize to AWS S3 format: "X-Amz-Meta-" prefix with lowercase suffix
+					// AWS S3 returns user metadata with the suffix in lowercase
+					suffix := k[len("x-amz-meta-"):]
+					headerKey = s3_constants.AmzUserMetaPrefix + strings.ToLower(suffix)
+					if glog.V(4) && k != headerKey {
+						glog.Infof("Normalizing user metadata header %q to %q in response", k, headerKey)
+					}
+				}
+				w.Header()[headerKey] = []string{string(v)}
+			}
+		}
+	}
+
+	// Set tag count header (matches filer logic)
+	if entry.Extended != nil {
+		tagCount := 0
+		for k := range entry.Extended {
+			if strings.HasPrefix(k, s3_constants.AmzObjectTagging+"-") {
+				tagCount++
+			}
+		}
+		if tagCount > 0 {
+			w.Header().Set(s3_constants.AmzTagCount, strconv.Itoa(tagCount))
+		}
+	}
+
+	// Set checksum header if stored in metadata, but only when:
+	// 1. The request contains "x-amz-checksum-mode: ENABLED" (per AWS S3 spec)
+	// 2. The response covers the full object (no Range header, no partNumber)
+	//    The stored checksum covers the full object; returning it for partial
+	//    responses causes SDK checksum validation failures.
+	if r != nil && strings.EqualFold(lookupHeaderOrQuery(r, parseRequestQuery(r), s3_constants.AmzChecksumMode), "ENABLED") && r.Header.Get("Range") == "" && requestedPartNumber(r) == 0 {
+		if entry.Extended != nil {
+			if algoName, ok := entry.Extended[s3_constants.ExtChecksumAlgorithm]; ok {
+				if checksumVal, ok := entry.Extended[s3_constants.ExtChecksumValue]; ok {
+					w.Header().Set(string(algoName), string(checksumVal))
+					if checksumType, ok := entry.Extended[s3_constants.ExtChecksumType]; ok && len(checksumType) > 0 {
+						w.Header().Set(s3_constants.AmzChecksumType, string(checksumType))
+					}
+				}
+			}
+		}
+	}
+
+	// Apply S3 passthrough headers from query parameters
+	// AWS S3 supports overriding response headers via query parameters like:
+	// ?response-cache-control=no-cache&response-content-type=application/json
+	// This allows presigned URLs to control how browsers handle the downloaded content.
+	// AWS requires the request to be signed; anonymous requests must not influence
+	// how the stored object is served.
+	if r != nil && getRequestAuthType(r) != authTypeAnonymous {
+		for queryParam, headerValue := range r.URL.Query() {
+			if normalizedHeader, ok := s3_constants.PassThroughHeaders[strings.ToLower(queryParam)]; ok && len(headerValue) > 0 && headerValue[0] != "" {
+				w.Header().Set(normalizedHeader, headerValue[0])
+			}
+		}
+	}
+}
+
+// HeadObjectHandler handles S3 HEAD object requests
+//
+// Special behavior for implicit directories:
+// When a HEAD request is made on a path without a trailing slash, and that path represents
+// a directory with children (either a 0-byte file marker or an actual directory), this handler
+// returns 404 Not Found instead of 200 OK. This behavior improves compatibility with s3fs and
+// matches AWS S3's handling of implicit directories.
+//
+// Rationale:
+//   - AWS S3 typically doesn't create directory markers when files are uploaded (e.g., uploading
+//     "dataset/file.txt" doesn't create a marker at "dataset")
+//   - Some S3 clients (like PyArrow with s3fs) create directory markers, which can confuse s3fs
+//   - s3fs's info() method calls HEAD first; if it succeeds with size=0, s3fs incorrectly reports
+//     the object as a file instead of checking for children
+//   - By returning 404 for implicit directories, we force s3fs to fall back to LIST-based discovery,
+//     which correctly identifies directories by checking for children
+//
+// Examples:
+//
+//	HEAD /bucket/dataset (no trailing slash, has children) → 404 Not Found (implicit directory)
+//	HEAD /bucket/dataset/ (trailing slash) → 200 OK (explicit directory request)
+//	HEAD /bucket/empty.txt (0-byte file, no children) → 200 OK (legitimate empty file)
+//	HEAD /bucket/file.txt (regular file) → 200 OK (normal operation)
+//
+// This behavior only applies to:
+//   - Non-versioned buckets (versioned buckets use different semantics)
+//   - Paths without trailing slashes (trailing slash indicates explicit directory request)
+//   - Objects that are either 0-byte files or actual directories
+//   - Objects that have at least one child (checked via hasChildren)
+func (s3a *S3ApiServer) HeadObjectHandler(w http.ResponseWriter, r *http.Request) {
+
+	bucket, object := s3_constants.GetBucketAndObject(r)
+	glog.V(3).Infof("HeadObjectHandler %s %s", bucket, object)
+	if _, err := s3a.validateTableBucketObjectPathOrVerify(bucket, object); err != nil {
+		s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
+		return
+	}
+
+	// Check for SOSAPI virtual objects (system.xml, capacity.xml)
+	// These are dynamically generated and don't exist on disk
+	if s3a.handleSOSAPIHeadObject(w, r, bucket, object) {
+		return // SOSAPI request was handled
+	}
+
+	// Reject named versions before directory or conditional handling can
+	// answer the request as a plain object.
+	versionId := r.URL.Query().Get("versionId")
+	if errCode := s3a.checkVersionIdConfigured(bucket, versionId); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
+	// Handle directory objects with shared logic
+	if s3a.handleDirectoryObjectRequest(w, r, bucket, object, "HeadObjectHandler") {
+		return // Directory object request was handled
+	}
+
+	// Check conditional headers and handle early return if conditions fail
+	result, handled := s3a.processConditionalHeaders(w, r, bucket, object, "HeadObjectHandler")
+	if handled {
+		return
+	}
+
+	var (
+		entry                *filer_pb.Entry // Declare entry at function scope for SSE processing
+		targetVersionId      string
+		versioningConfigured bool
+		err                  error
+	)
+
+	// Check if versioning is configured for the bucket (Enabled or Suspended)
+	// Note: We need to check this even if versionId is empty, because versioned buckets
+	// handle even "get latest version" requests differently (through .versions directory)
+	versioningConfigured, err = s3a.isVersioningConfigured(bucket)
+	if err != nil {
+		if err == filer_pb.ErrNotFound {
+			s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchBucket)
+			return
+		}
+		glog.Errorf("Error checking versioning status for bucket %s: %v", bucket, err)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		return
+	}
+
+	if versioningConfigured {
+		// Handle versioned HEAD - all versions are stored in .versions directory
+
+		if versionId != "" {
+			// Request for specific version
+			glog.V(2).Infof("HeadObject: requesting specific version %s for %s/%s", versionId, bucket, object)
+			entry, err = s3a.getSpecificObjectVersion(bucket, object, versionId)
+			if err != nil {
+				glog.Errorf("Failed to get specific version %s for %s/%s: %v", versionId, bucket, object, err)
+				if errors.Is(err, filer_pb.ErrNotFound) {
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchVersion)
+				} else {
+					s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+				}
+				return
+			}
+			targetVersionId = versionId
+		} else {
+			// Request for latest version - OPTIMIZATION:
+			// Check if .versions/ directory exists quickly (no retries) to decide path
+			// - If .versions/ exists: real versions available, use getLatestObjectVersion
+			// - If .versions/ doesn't exist (ErrNotFound): only null version at regular path, use it directly
+			// - If transient error: fall back to getLatestObjectVersion which has retry logic
+			bucketDir := s3a.bucketDir(bucket)
+			normalizedObject := s3_constants.NormalizeObjectKey(object)
+			versionsDir := normalizedObject + s3_constants.VersionsFolder
+
+			// Quick check (no retries) for .versions/ directory
+			versionsEntry, versionsErr := s3a.getEntry(bucketDir, versionsDir)
+
+			if versionsErr == nil && versionsEntry != nil {
+				// .versions/ exists, meaning real versions are stored there
+				// Use getLatestObjectVersion which will properly find the newest version
+				entry, err = s3a.getLatestObjectVersion(bucket, object)
+				if err != nil {
+					glog.Errorf("HeadObject: Failed to get latest version for %s/%s: %v", bucket, object, err)
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+					return
+				}
+			} else if errors.Is(versionsErr, filer_pb.ErrNotFound) {
+				// .versions/ doesn't exist (confirmed not found), check regular path for null version
+				regularEntry, regularErr := s3a.getEntry(bucketDir, normalizedObject)
+				// A physical parent or bare-key object is not a trailing-slash null marker.
+				if regularErr == nil && isNullVersionObject(regularEntry, normalizedObject) {
+					// Found object at regular path - this is the null version
+					entry = regularEntry
+					targetVersionId = "null"
+				} else {
+					// No object at regular path either - object doesn't exist
+					glog.V(3).Infof("HeadObject: object not found at regular path or .versions for %s/%s", bucket, object)
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+					return
+				}
+			} else {
+				// Transient error checking .versions/, fall back to getLatestObjectVersion with retries
+				glog.V(2).Infof("HeadObject: transient error checking .versions for %s/%s: %v, falling back to getLatestObjectVersion", bucket, object, versionsErr)
+				entry, err = s3a.getLatestObjectVersion(bucket, object)
+				if err != nil {
+					glog.Errorf("HeadObject: Failed to get latest version for %s/%s: %v", bucket, object, err)
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+					return
+				}
+			}
+			// Extract version ID if not already set
+			if targetVersionId == "" {
+				if entry.Extended != nil {
+					if versionIdBytes, exists := entry.Extended[s3_constants.ExtVersionIdKey]; exists {
+						targetVersionId = string(versionIdBytes)
+					}
+				}
+				// If no version ID found in entry, this is a pre-versioning object
+				if targetVersionId == "" {
+					targetVersionId = "null"
+				}
+			}
+		}
+
+		// Check if this is a delete marker
+		if entry.Extended != nil {
+			if deleteMarker, exists := entry.Extended[s3_constants.ExtDeleteMarkerKey]; exists && string(deleteMarker) == "true" {
+				s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+				return
+			}
+		}
+
+		// For versioned objects, log the target version
+		if targetVersionId == "null" {
+			glog.V(2).Infof("HeadObject: pre-versioning object %s/%s", bucket, object)
+		} else {
+			glog.V(2).Infof("HeadObject: version %s for %s/%s", targetVersionId, bucket, object)
+		}
+
+	}
+
+	// Fetch the correct entry for SSE processing (respects versionId)
+	// For versioned objects, reuse already-fetched entry; for non-versioned, try to reuse from conditional check
+	var objectEntryForSSE *filer_pb.Entry
+	if versioningConfigured {
+		objectEntryForSSE = entry
+	} else {
+		// For non-versioned objects, try to reuse entry from conditional header check
+		if result.Entry != nil {
+			// Reuse entry fetched during conditional header check (optimization)
+			objectEntryForSSE = result.Entry
+			glog.V(3).Infof("HeadObjectHandler: Reusing entry from conditional header check for %s/%s", bucket, object)
+		} else {
+			// Fetch entry for SSE processing
+			// This is needed for all SSE types (SSE-C, SSE-KMS, SSE-S3) to:
+			// 1. Detect encryption from object metadata (SSE-KMS/SSE-S3 don't send headers on HEAD)
+			// 2. Add proper response headers
+			var fetchErr error
+			objectEntryForSSE, fetchErr = s3a.fetchObjectEntry(bucket, object)
+			if fetchErr != nil {
+				glog.Warningf("HeadObjectHandler: failed to get entry for %s/%s: %v", bucket, object, fetchErr)
+				s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+				return
+			}
+			if objectEntryForSSE == nil {
+				s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+				return
+			}
+		}
+	}
+
+	// Safety check: entry must be valid
+	if objectEntryForSSE == nil {
+		glog.Errorf("HeadObjectHandler: objectEntryForSSE is nil for %s/%s (should not happen)", bucket, object)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		return
+	}
+
+	// Re-check bucket policy with object entry for tag-based conditions (e.g., s3:ExistingObjectTag)
+	if errCode := s3a.recheckPolicyWithObjectEntry(r, bucket, object, string(s3_constants.ACTION_READ), objectEntryForSSE.Extended, "HeadObjectHandler"); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
+	// Return version and lock metadata only after authorizing this entry.
+	if versioningConfigured {
+		w.Header().Set("x-amz-version-id", targetVersionId)
+		s3a.addObjectLockHeadersToResponse(w, objectEntryForSSE)
+	}
+
+	// Implicit Directory Handling for s3fs Compatibility
+	// ====================================================
+	//
+	// Background:
+	//   Some S3 clients (like PyArrow with s3fs) create directory markers when writing datasets.
+	//   These can be either:
+	//   1. 0-byte files with directory MIME type (e.g., "application/octet-stream")
+	//   2. Actual directories in the filer (created by PyArrow's write_dataset)
+	//
+	// Problem:
+	//   s3fs's info() method calls HEAD on the path. If HEAD returns 200 with size=0,
+	//   s3fs incorrectly reports it as a file (type='file', size=0) instead of checking
+	//   for children. This causes PyArrow to fail with "Parquet file size is 0 bytes".
+	//
+	// Solution:
+	//   For non-versioned objects without trailing slash, if the object is a 0-byte file
+	//   or directory AND has children, return 404 instead of 200. This forces s3fs to
+	//   fall back to LIST-based discovery, which correctly identifies it as a directory.
+	//
+	// AWS S3 Compatibility:
+	//   AWS S3 typically doesn't create directory markers for implicit directories, so
+	//   HEAD on "dataset" (when only "dataset/file.txt" exists) returns 404. Our behavior
+	//   matches this by returning 404 for implicit directories with children.
+	//
+	// Edge Cases Handled:
+	//   - Empty files (0-byte, no children) → 200 OK (legitimate empty file)
+	//   - Empty directories (no children) → 404 Not Found (directories are not objects)
+	//   - Explicit directory requests (trailing slash) → 200 OK (handled earlier)
+	//   - Versioned objects → Skip this check (different semantics)
+	//
+	// Performance:
+	//   Only adds overhead for 0-byte files or directories without trailing slash.
+	//   Cost: One LIST operation with Limit=1 (~1-5ms).
+	//
+	if !versioningConfigured && !strings.HasSuffix(object, "/") {
+		// Check if this is an implicit directory (either a 0-byte file or actual directory with children)
+		// PyArrow may create 0-byte files when writing datasets, or the filer may have actual directories
+		if objectEntryForSSE.Attributes != nil {
+			isZeroByteFile := objectEntryForSSE.Attributes.FileSize == 0 && !objectEntryForSSE.IsDirectory
+			// A directory with data (a promoted file) is retrievable; empty directories 404 for LIST fallback.
+			if isBareDirectory(objectEntryForSSE) {
+				s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+				return
+			}
+			if isZeroByteFile {
+				// Check if it has children (making it an implicit directory)
+				if s3a.hasChildren(r.Context(), bucket, object) {
+					// This is an implicit directory with children
+					// Return 404 to force clients (like s3fs) to use LIST-based discovery
+					s3a.writeAnonymousAwareNotFound(w, r, bucket, s3err.ErrNoSuchKey)
+					return
+				}
+			}
+		}
+	}
+
+	// For HEAD requests, we already have all metadata - just set headers directly
+	totalSize := int64(filer.FileSize(objectEntryForSSE))
+	responseSize := totalSize
+	statusCode := http.StatusOK
+
+	// A partNumber HEAD is a ranged HEAD of that part: report the part's size and range
+	if partNumber := requestedPartNumber(r); partNumber > 0 {
+		startOffset, endOffset, errCode := s3a.partByteRange(w, r, objectEntryForSSE, partNumber)
+		if errCode != s3err.ErrNone {
+			s3err.WriteErrorResponse(w, r, errCode)
+			return
+		}
+		responseSize = endOffset - startOffset + 1
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", startOffset, endOffset, totalSize))
+		statusCode = http.StatusPartialContent
+		glog.V(3).Infof("HeadObject: part %d is bytes %d-%d/%d", partNumber, startOffset, endOffset, totalSize)
+	} else if r.Header.Get("Range") != "" {
+		// A ranged HEAD reports the range like GET does: 206 with its Content-Range and length
+		offset, size, isRangeRequest, rangeErr := s3a.parseAndValidateRange(w, r, objectEntryForSSE, totalSize, bucket, object)
+		if rangeErr != nil {
+			return
+		}
+		if isRangeRequest {
+			responseSize = size
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+size-1, totalSize))
+			statusCode = http.StatusPartialContent
+		}
+	}
+
+	s3a.setResponseHeaders(w, r, objectEntryForSSE, responseSize)
+
+	// Detect and handle SSE
+	glog.V(3).Infof("HeadObjectHandler: Retrieved entry for %s/%s - %d chunks", bucket, object, len(objectEntryForSSE.Chunks))
+	sseType := s3a.detectPrimarySSEType(objectEntryForSSE)
+	glog.V(2).Infof("HeadObjectHandler: Detected SSE type: %s", sseType)
+	if sseType != "" && sseType != "None" {
+		// Validate SSE headers for encrypted objects
+		switch sseType {
+		case s3_constants.SSETypeC:
+			customerKey, err := ParseSSECHeaders(r)
+			if err != nil {
+				s3err.WriteErrorResponse(w, r, MapSSECErrorToS3Error(err))
+				return
+			}
+			if customerKey == nil {
+				s3err.WriteErrorResponse(w, r, s3err.ErrSSECustomerKeyMissing)
+				return
+			}
+			// Validate key MD5
+			if objectEntryForSSE.Extended != nil {
+				storedKeyMD5 := string(objectEntryForSSE.Extended[s3_constants.AmzServerSideEncryptionCustomerKeyMD5])
+				if storedKeyMD5 != "" && customerKey.KeyMD5 != storedKeyMD5 {
+					s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
+					return
+				}
+			}
+		}
+		// Add SSE response headers
+		s3a.addSSEResponseHeadersFromEntry(w, r, objectEntryForSSE, sseType)
+	}
+
+	w.WriteHeader(statusCode)
+}
+
+// fetchObjectEntry fetches the filer entry for an object
+// Returns nil if not found (not an error), or propagates other errors
+func (s3a *S3ApiServer) fetchObjectEntry(bucket, object string) (*filer_pb.Entry, error) {
+	fetchedEntry, fetchErr := s3a.getObjectEntryRoutedByKey(bucket, object)
+	if fetchErr != nil {
+		if errors.Is(fetchErr, filer_pb.ErrNotFound) {
+			return nil, nil // Not found is not an error for SSE check
+		}
+		return nil, fetchErr // Propagate other errors
+	}
+	return fetchedEntry, nil
+}
+
+// fetchObjectEntryRequired fetches the filer entry for an object
+// Returns an error if the object is not found or any other error occurs
+func (s3a *S3ApiServer) fetchObjectEntryRequired(bucket, object string) (*filer_pb.Entry, error) {
+	fetchedEntry, fetchErr := s3a.getObjectEntryRoutedByKey(bucket, object)
+	if fetchErr != nil {
+		return nil, fetchErr // Return error for both not-found and other errors
+	}
+	return fetchedEntry, nil
+}
+
+// addObjectLockHeadersToResponse extracts object lock metadata from entry Extended attributes
+// and adds the appropriate S3 headers to the response
+func (s3a *S3ApiServer) addObjectLockHeadersToResponse(w http.ResponseWriter, entry *filer_pb.Entry) {
+	if entry == nil || entry.Extended == nil {
+		return
+	}
+
+	// Check if this entry has any object lock metadata (indicating it's from an object lock enabled bucket)
+	hasObjectLockMode := false
+	hasRetentionDate := false
+
+	// Add object lock mode header if present
+	if modeBytes, exists := entry.Extended[s3_constants.ExtObjectLockModeKey]; exists && len(modeBytes) > 0 {
+		w.Header().Set(s3_constants.AmzObjectLockMode, string(modeBytes))
+		hasObjectLockMode = true
+	}
+
+	// Add retention until date header if present
+	if dateBytes, exists := entry.Extended[s3_constants.ExtRetentionUntilDateKey]; exists && len(dateBytes) > 0 {
+		dateStr := string(dateBytes)
+		// Convert Unix timestamp to ISO8601 format for S3 compatibility
+		if timestamp, err := strconv.ParseInt(dateStr, 10, 64); err == nil {
+			retainUntilDate := time.Unix(timestamp, 0).UTC()
+			w.Header().Set(s3_constants.AmzObjectLockRetainUntilDate, retainUntilDate.Format(time.RFC3339))
+			hasRetentionDate = true
+		} else {
+			glog.Errorf("addObjectLockHeadersToResponse: failed to parse retention until date from stored metadata (dateStr: %s): %v", dateStr, err)
+		}
+	}
+
+	// Add legal hold header - AWS S3 behavior: always include legal hold for object lock enabled buckets
+	if legalHoldBytes, exists := entry.Extended[s3_constants.ExtLegalHoldKey]; exists && len(legalHoldBytes) > 0 {
+		// Return stored S3 standard "ON"/"OFF" values directly
+		w.Header().Set(s3_constants.AmzObjectLockLegalHold, string(legalHoldBytes))
+	} else if hasObjectLockMode || hasRetentionDate {
+		// If this entry has object lock metadata (indicating object lock enabled bucket)
+		// but no legal hold specifically set, default to "OFF" as per AWS S3 behavior
+		w.Header().Set(s3_constants.AmzObjectLockLegalHold, s3_constants.LegalHoldOff)
+	}
+}
+
+// detectPrimarySSEType determines the primary SSE type by examining chunk metadata
+func (s3a *S3ApiServer) detectPrimarySSEType(entry *filer_pb.Entry) string {
+	if entry == nil {
+		return "None"
+	}
+
+	metadataType := "None"
+	hasSSEC := entry.Extended[s3_constants.AmzServerSideEncryptionCustomerAlgorithm] != nil
+	if hasSSEC {
+		metadataType = s3_constants.SSETypeC
+	} else {
+		switch string(entry.Extended[s3_constants.AmzServerSideEncryption]) {
+		case s3_constants.SSEAlgorithmAES256:
+			metadataType = s3_constants.SSETypeS3
+			if _, hasKMSKey := entry.Extended[s3_constants.AmzServerSideEncryptionAwsKmsKeyId]; hasKMSKey {
+				metadataType = s3_constants.SSETypeKMS
+			}
+		case s3_constants.SSEAlgorithmKMS:
+			metadataType = s3_constants.SSETypeKMS
+		}
+	}
+
+	// Count chunk types to determine primary (multipart objects)
+	ssecChunks := 0
+	ssekmsChunks := 0
+	sses3Chunks := 0
+
+	for _, chunk := range entry.GetChunks() {
+		switch chunk.GetSseType() {
+		case filer_pb.SSEType_SSE_C:
+			ssecChunks++
+		case filer_pb.SSEType_SSE_KMS:
+			if len(chunk.GetSseMetadata()) > 0 {
+				ssekmsChunks++
+			}
+		case filer_pb.SSEType_SSE_S3:
+			if len(chunk.GetSseMetadata()) > 0 {
+				sses3Chunks++
+			}
+		}
+	}
+
+	// Primary type is the one with more chunks
+	// Note: Tie-breaking follows precedence order SSE-C > SSE-KMS > SSE-S3
+	// Mixed encryption in an object indicates potential corruption and should not occur in normal operation
+	if ssecChunks > ssekmsChunks && ssecChunks > sses3Chunks {
+		return s3_constants.SSETypeC
+	} else if ssekmsChunks > ssecChunks && ssekmsChunks > sses3Chunks {
+		return s3_constants.SSETypeKMS
+	} else if sses3Chunks > ssecChunks && sses3Chunks > ssekmsChunks {
+		return s3_constants.SSETypeS3
+	} else if ssecChunks > 0 {
+		// Equal number or ties - precedence: SSE-C first
+		return s3_constants.SSETypeC
+	} else if ssekmsChunks > 0 {
+		return s3_constants.SSETypeKMS
+	} else if sses3Chunks > 0 {
+		return s3_constants.SSETypeS3
+	}
+
+	return metadataType
+}
+
+// createMultipartSSECDecryptedReaderDirect creates a reader that decrypts each chunk independently for multipart SSE-C objects (direct volume path)
+// Note: encryptedStream parameter is unused (always nil) as this function fetches chunks directly to avoid double I/O.
+// It's kept in the signature for API consistency with non-Direct versions.
+//
+// Per-chunk metadata is validated upfront (so a malformed chunk fails fast
+// without opening any HTTP connections); chunk fetches happen LAZILY through
+// lazyMultipartChunkReader, so at most one volume-server connection is open
+// at a time. See buildMultipartSSES3Reader for the rationale (issue #8908).
+//
+// SSE-C multipart behavior (differs from SSE-KMS/SSE-S3):
+//   - Upload: CreateSSECEncryptedReader generates a RANDOM IV per part (no base IV + offset).
+//   - Metadata: PartOffset tracks position within the encrypted stream.
+//   - Decryption: use stored IV and advance the CTR stream by PartOffset.
+//
+// SSE-KMS/SSE-S3 instead use base IV + calculateIVWithOffset(partOffset) at
+// encryption time. CopyObject currently applies calculateIVWithOffset to SSE-C
+// as well, which may be incorrect (TODO: investigate consistency).
+func (s3a *S3ApiServer) createMultipartSSECDecryptedReaderDirect(ctx context.Context, encryptedStream io.ReadCloser, customerKey *SSECustomerKey, entry *filer_pb.Entry) (io.Reader, error) {
+	// Close the original encrypted stream since chunks are fetched individually.
+	if encryptedStream != nil {
+		defer encryptedStream.Close()
+	}
+
+	// Sort a copy of the slice so entry.Chunks is not reordered (other code
+	// paths, e.g. ETag computation, can rely on the original chunk order).
+	originalChunks := entry.GetChunks()
+	chunks := make([]*filer_pb.FileChunk, len(originalChunks))
+	copy(chunks, originalChunks)
+	sort.Slice(chunks, func(i, j int) bool {
+		return chunks[i].GetOffset() < chunks[j].GetOffset()
+	})
+
+	preparedChunks := make([]preparedMultipartChunk, 0, len(chunks))
+	for _, chunk := range chunks {
+		if chunk.GetSseType() != filer_pb.SSEType_SSE_C {
+			preparedChunks = append(preparedChunks, preparedMultipartChunk{chunk: chunk})
+			continue
+		}
+		if len(chunk.GetSseMetadata()) == 0 {
+			return nil, fmt.Errorf("SSE-C chunk %s missing per-chunk metadata", chunk.GetFileIdString())
+		}
+		ssecMetadata, err := DeserializeSSECMetadata(chunk.GetSseMetadata())
+		if err != nil {
+			return nil, fmt.Errorf("failed to deserialize SSE-C metadata for chunk %s: %v", chunk.GetFileIdString(), err)
+		}
+		chunkIV, err := base64.StdEncoding.DecodeString(ssecMetadata.IV)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode IV for SSE-C chunk %s: %v", chunk.GetFileIdString(), err)
+		}
+		// Guard cipher.NewCTR against a missing/short IV (base64 decode of
+		// an empty or malformed field would otherwise reach it and panic).
+		// Uses the shared ValidateIV helper so all three SSE prep paths
+		// (SSE-S3, SSE-KMS, SSE-C) enforce IV length identically.
+		if err := ValidateIV(chunkIV, fmt.Sprintf("SSE-C chunk %s IV", chunk.GetFileIdString())); err != nil {
+			return nil, err
+		}
+		if ssecMetadata.PartOffset < 0 {
+			return nil, fmt.Errorf("invalid SSE-C part offset %d for chunk %s", ssecMetadata.PartOffset, chunk.GetFileIdString())
+		}
+		// Capture per-chunk values into the wrap closure.
+		fileId := chunk.GetFileIdString()
+		ivCopy := chunkIV
+		partOffset := uint64(ssecMetadata.PartOffset)
+		preparedChunks = append(preparedChunks, preparedMultipartChunk{
+			chunk: chunk,
+			wrap: func(raw io.ReadCloser) (io.Reader, error) {
+				glog.V(4).Infof("Decrypting SSE-C chunk %s with IV=%x, PartOffset=%d",
+					fileId, ivCopy[:8], partOffset)
+				dec, decErr := CreateSSECDecryptedReaderWithOffset(raw, customerKey, ivCopy, partOffset)
+				if decErr != nil {
+					return nil, fmt.Errorf("failed to decrypt chunk: %v", decErr)
+				}
+				return dec, nil
+			},
+		})
+	}
+
+	return &lazyMultipartChunkReader{
+		chunks: preparedChunks,
+		fetch: func(c *filer_pb.FileChunk) (io.ReadCloser, error) {
+			return s3a.createEncryptedChunkReader(ctx, c)
+		},
+	}, nil
+}
+
+// createMultipartSSEKMSDecryptedReaderDirect creates a reader that decrypts each chunk independently for multipart SSE-KMS objects (direct volume path)
+// Note: encryptedStream parameter is unused (always nil) as this function fetches chunks directly to avoid double I/O.
+// It's kept in the signature for API consistency with non-Direct versions.
+//
+// Per-chunk metadata is validated upfront (so a malformed chunk fails fast
+// without opening any HTTP connections); chunk fetches happen LAZILY through
+// lazyMultipartChunkReader, so at most one volume-server connection is open
+// at a time. See buildMultipartSSES3Reader for the rationale (issue #8908).
+func (s3a *S3ApiServer) createMultipartSSEKMSDecryptedReaderDirect(ctx context.Context, encryptedStream io.ReadCloser, entry *filer_pb.Entry) (io.Reader, error) {
+	// Close the original encrypted stream since chunks are fetched individually.
+	if encryptedStream != nil {
+		defer encryptedStream.Close()
+	}
+
+	return buildMultipartSSEKMSReader(entry.GetChunks(), func(chunk *filer_pb.FileChunk) (io.ReadCloser, error) {
+		return s3a.createEncryptedChunkReader(ctx, chunk)
+	})
+}
+
+// buildMultipartSSEKMSReader composes a decrypted reader from a set of
+// multipart SSE-KMS chunks. Mirrors buildMultipartSSES3Reader: chunks are
+// validated upfront (per-chunk metadata parses, IV has the right length) and
+// fetched + decrypted lazily through lazyMultipartChunkReader, so at most one
+// volume-server HTTP body is live at a time. Exposed as a free function so
+// tests can inject a mock chunk fetcher and pin the "no fetch on bad
+// metadata" contract without spinning up an S3ApiServer.
+func buildMultipartSSEKMSReader(chunks []*filer_pb.FileChunk, fetchChunk func(*filer_pb.FileChunk) (io.ReadCloser, error)) (io.Reader, error) {
+	sortedChunks := make([]*filer_pb.FileChunk, len(chunks))
+	copy(sortedChunks, chunks)
+	sort.Slice(sortedChunks, func(i, j int) bool {
+		return sortedChunks[i].GetOffset() < sortedChunks[j].GetOffset()
+	})
+
+	preparedChunks := make([]preparedMultipartChunk, 0, len(sortedChunks))
+	for _, chunk := range sortedChunks {
+		if chunk.GetSseType() != filer_pb.SSEType_SSE_KMS {
+			preparedChunks = append(preparedChunks, preparedMultipartChunk{chunk: chunk})
+			continue
+		}
+		if len(chunk.GetSseMetadata()) == 0 {
+			return nil, fmt.Errorf("SSE-KMS chunk %s missing per-chunk metadata", chunk.GetFileIdString())
+		}
+		kmsKey, err := DeserializeSSEKMSMetadata(chunk.GetSseMetadata())
+		if err != nil {
+			return nil, fmt.Errorf("failed to deserialize SSE-KMS metadata for chunk %s: %v", chunk.GetFileIdString(), err)
+		}
+		// Validate IV length up front, mirroring the SSE-S3 / SSE-C
+		// preparation paths. CreateSSEKMSDecryptedReader does call
+		// ValidateIV internally, but only when the wrap closure runs --
+		// after the chunk's volume-server fetch has already started. We
+		// want the "reject malformed chunks before any fetch" contract to
+		// hold for SSE-KMS too, so a missing or short IV must fail here
+		// in the prep loop rather than turn into a mid-stream error.
+		if err := ValidateIV(kmsKey.IV, fmt.Sprintf("SSE-KMS chunk %s IV", chunk.GetFileIdString())); err != nil {
+			return nil, err
+		}
+		// Capture kmsKey and chunk into the wrap closure so each prepared
+		// entry decrypts with its own per-chunk SSE-KMS key.
+		fileId := chunk.GetFileIdString()
+		preparedChunks = append(preparedChunks, preparedMultipartChunk{
+			chunk: chunk,
+			wrap: func(raw io.ReadCloser) (io.Reader, error) {
+				glog.V(4).Infof("Decrypting SSE-KMS chunk %s with KeyID=%s", fileId, kmsKey.KeyID)
+				dec, decErr := CreateSSEKMSDecryptedReader(raw, kmsKey)
+				if decErr != nil {
+					return nil, fmt.Errorf("failed to decrypt chunk: %v", decErr)
+				}
+				return dec, nil
+			},
+		})
+	}
+
+	return &lazyMultipartChunkReader{
+		chunks: preparedChunks,
+		fetch:  fetchChunk,
+	}, nil
+}
+
+// createMultipartSSES3DecryptedReaderDirect creates a reader that decrypts each chunk independently for multipart SSE-S3 objects (direct volume path)
+// Note: encryptedStream parameter is unused (always nil) as this function fetches chunks directly to avoid double I/O.
+// It's kept in the signature for API consistency with non-Direct versions.
+func (s3a *S3ApiServer) createMultipartSSES3DecryptedReaderDirect(ctx context.Context, encryptedStream io.ReadCloser, entry *filer_pb.Entry) (io.Reader, error) {
+	// Close the original encrypted stream since chunks are fetched individually.
+	if encryptedStream != nil {
+		defer encryptedStream.Close()
+	}
+
+	return buildMultipartSSES3Reader(entry.GetChunks(), GetSSES3KeyManager(), func(chunk *filer_pb.FileChunk) (io.ReadCloser, error) {
+		return s3a.createEncryptedChunkReader(ctx, chunk)
+	})
+}
+
+// buildMultipartSSES3Reader composes a decrypted reader from a set of multipart
+// SSE-S3 chunks. Chunks are fetched via fetchChunk and decrypted using their
+// per-chunk metadata (each multipart part has its own DEK and IV). Exposed as a
+// standalone helper so tests can inject a mock chunk fetcher.
+//
+// All per-chunk metadata is validated upfront so a malformed chunk fails fast
+// without opening any HTTP connections to volume servers. The actual chunk
+// fetch and decryption happens LAZILY as the returned reader is read: at most
+// one chunk's HTTP connection is open at a time. Eagerly opening every chunk's
+// HTTP response (the previous behavior) caused later chunks' connections to
+// sit idle while earlier chunks were still being consumed, which under load
+// could trip volume-server idle/keepalive limits and yield truncated reads
+// (issue #8908).
+func buildMultipartSSES3Reader(chunks []*filer_pb.FileChunk, keyManager *SSES3KeyManager, fetchChunk func(*filer_pb.FileChunk) (io.ReadCloser, error)) (io.Reader, error) {
+	// Sort a copy of the slice so callers do not observe their input chunks
+	// reordered (the backing array is shared with entry.Chunks, which other
+	// code may rely on being in its original order, e.g. for ETag computation).
+	sortedChunks := make([]*filer_pb.FileChunk, len(chunks))
+	copy(sortedChunks, chunks)
+	sort.Slice(sortedChunks, func(i, j int) bool {
+		return sortedChunks[i].GetOffset() < sortedChunks[j].GetOffset()
+	})
+
+	// Validate every chunk's SSE-S3 metadata before returning a reader. This
+	// keeps the eager-validation contract that callers and tests rely on
+	// (malformed metadata fails immediately), without holding open any
+	// volume-server HTTP connections.
+	preparedChunks := make([]preparedMultipartChunk, 0, len(sortedChunks))
+	for _, chunk := range sortedChunks {
+		if chunk.GetSseType() != filer_pb.SSEType_SSE_S3 {
+			preparedChunks = append(preparedChunks, preparedMultipartChunk{chunk: chunk})
+			continue
+		}
+		if len(chunk.GetSseMetadata()) == 0 {
+			return nil, fmt.Errorf("SSE-S3 chunk %s missing per-chunk metadata", chunk.GetFileIdString())
+		}
+		meta, err := DeserializeSSES3Metadata(chunk.GetSseMetadata(), keyManager)
+		if err != nil {
+			return nil, fmt.Errorf("failed to deserialize SSE-S3 metadata for chunk %s: %v", chunk.GetFileIdString(), err)
+		}
+		// DeserializeSSES3Metadata does not require an IV, so validate the
+		// length here before it reaches cipher.NewCTR, which would otherwise
+		// panic on a nil or short IV. Uses the shared ValidateIV helper so
+		// all three SSE prep paths (SSE-S3, SSE-KMS, SSE-C) enforce IV
+		// length identically.
+		if err := ValidateIV(meta.IV, fmt.Sprintf("SSE-S3 chunk %s IV", chunk.GetFileIdString())); err != nil {
+			return nil, err
+		}
+		// Capture meta and chunk by-value into the wrap closure so each
+		// prepared entry decrypts with its own per-chunk key + IV.
+		fileId := chunk.GetFileIdString()
+		preparedChunks = append(preparedChunks, preparedMultipartChunk{
+			chunk: chunk,
+			wrap: func(raw io.ReadCloser) (io.Reader, error) {
+				glog.V(4).Infof("Decrypting SSE-S3 chunk %s with KeyID=%s, IV length=%d",
+					fileId, meta.KeyID, len(meta.IV))
+				dec, err := CreateSSES3DecryptedReader(raw, meta, meta.IV)
+				if err != nil {
+					return nil, fmt.Errorf("failed to decrypt SSE-S3 chunk: %v", err)
+				}
+				return dec, nil
+			},
+		})
+	}
+
+	return &lazyMultipartChunkReader{
+		chunks: preparedChunks,
+		fetch:  fetchChunk,
+	}, nil
+}
+
+// preparedMultipartChunk pairs a chunk with the per-SSE wrapping logic the
+// lazy reader applies to its raw HTTP body. wrap is nil for chunks that
+// stream as-is (no SSE on the chunk, even though the object is multipart-SSE);
+// otherwise wrap is the SSE-specific decryption setup, which receives the
+// already-opened raw chunk body and returns the plaintext reader.
+type preparedMultipartChunk struct {
+	chunk *filer_pb.FileChunk
+	wrap  func(raw io.ReadCloser) (io.Reader, error)
+}
+
+// lazyMultipartChunkReader streams a sequence of multipart chunks one at a
+// time. It opens each chunk's underlying HTTP fetch (and applies the
+// SSE-specific decryption wrapper) only when the previous chunk has been
+// fully consumed, so volume-server connections do not pile up for large
+// objects. This is the same shape used by all three SSE multipart read
+// paths (SSE-S3, SSE-KMS, SSE-C); only the per-chunk wrap closure differs.
+type lazyMultipartChunkReader struct {
+	chunks   []preparedMultipartChunk
+	fetch    func(*filer_pb.FileChunk) (io.ReadCloser, error)
+	idx      int
+	current  io.Reader // current chunk's plaintext reader (or raw reader for non-SSE chunks)
+	closer   io.Closer // current chunk's underlying HTTP body, to close on advance/Close
+	finished bool
+}
+
+func (l *lazyMultipartChunkReader) Read(p []byte) (int, error) {
+	for {
+		if l.finished {
+			return 0, io.EOF
+		}
+		if l.current == nil {
+			if l.idx >= len(l.chunks) {
+				l.finished = true
+				return 0, io.EOF
+			}
+			pc := l.chunks[l.idx]
+			l.idx++
+			chunkReader, err := l.fetch(pc.chunk)
+			if err != nil {
+				l.finished = true
+				return 0, fmt.Errorf("failed to create chunk reader: %v", err)
+			}
+			if pc.wrap == nil {
+				// Non-SSE chunk in an otherwise SSE-multipart object: stream
+				// raw bytes through.
+				l.current = chunkReader
+				l.closer = chunkReader
+				glog.V(4).Infof("Streaming non-encrypted chunk %s", pc.chunk.GetFileIdString())
+			} else {
+				wrapped, wrapErr := pc.wrap(chunkReader)
+				if wrapErr != nil {
+					chunkReader.Close()
+					l.finished = true
+					return 0, wrapErr
+				}
+				l.current = wrapped
+				l.closer = chunkReader
+			}
+		}
+		n, err := l.current.Read(p)
+		if err == io.EOF {
+			closeErr := l.closer.Close()
+			l.current = nil
+			l.closer = nil
+			if n > 0 {
+				return n, nil
+			}
+			if closeErr != nil {
+				glog.V(2).Infof("Error closing chunk reader: %v", closeErr)
+			}
+			continue
+		}
+		if err != nil {
+			// Non-EOF read error: the underlying chunk body is in an
+			// indeterminate state. Mark ourselves finished so a retried
+			// Read does not try to drain the same broken stream; let
+			// Close() release the chunk body. This matches the failure
+			// semantics of the fetch and wrap error paths above.
+			l.finished = true
+		}
+		return n, err
+	}
+}
+
+func (l *lazyMultipartChunkReader) Close() error {
+	l.finished = true
+	if l.closer != nil {
+		err := l.closer.Close()
+		l.current = nil
+		l.closer = nil
+		return err
+	}
+	return nil
+}
+
+// createEncryptedChunkReader creates a reader for a single encrypted chunk
+// Context propagation ensures cancellation if the S3 client disconnects
+func (s3a *S3ApiServer) createEncryptedChunkReader(ctx context.Context, chunk *filer_pb.FileChunk) (io.ReadCloser, error) {
+	return s3a.fetchChunkData(ctx, chunk.GetFileIdString(), chunk.CipherKey, chunk.IsCompressed, 0, int64(chunk.Size), true)
+}
+
+// MultipartSSEReader wraps multiple readers and ensures all underlying readers are properly closed
+type MultipartSSEReader struct {
+	multiReader io.Reader
+	readers     []io.Reader
+}
+
+// NewMultipartSSEReader creates a new multipart reader that can properly close all underlying readers
+func NewMultipartSSEReader(readers []io.Reader) *MultipartSSEReader {
+	return &MultipartSSEReader{
+		multiReader: io.MultiReader(readers...),
+		readers:     readers,
+	}
+}
+
+// Read implements the io.Reader interface
+func (m *MultipartSSEReader) Read(p []byte) (n int, err error) {
+	return m.multiReader.Read(p)
+}
+
+// Close implements the io.Closer interface and closes all underlying readers that support closing
+func (m *MultipartSSEReader) Close() error {
+	var lastErr error
+	for i, reader := range m.readers {
+		if closer, ok := reader.(io.Closer); ok {
+			if err := closer.Close(); err != nil {
+				glog.V(2).Infof("Error closing reader %d: %v", i, err)
+				lastErr = err // Keep track of the last error, but continue closing others
+			}
+		}
+	}
+	return lastErr
+}
+
+// PartBoundaryInfo holds information about a part's chunk boundaries
+type PartBoundaryInfo struct {
+	PartNumber int    `json:"part"`
+	StartChunk int    `json:"start"`
+	EndChunk   int    `json:"end"` // exclusive
+	ETag       string `json:"etag"`
+	// Byte offsets of the part; zero EndOffset means a legacy record carrying
+	// chunk indexes only.
+	StartOffset int64 `json:"startOffset,omitempty"`
+	EndOffset   int64 `json:"endOffset,omitempty"` // exclusive
+}
+
+// partRange returns the inclusive byte range of a part, preferring byte
+// offsets; ok is false when a legacy record's chunk indexes do not address
+// the entry's chunk list.
+func partRange(partInfo *PartBoundaryInfo, chunks []*filer_pb.FileChunk) (startOffset, endOffset int64, ok bool) {
+	if partInfo.EndOffset > partInfo.StartOffset {
+		return partInfo.StartOffset, partInfo.EndOffset - 1, true
+	}
+	if partInfo.StartChunk < 0 || partInfo.EndChunk <= partInfo.StartChunk || partInfo.EndChunk > len(chunks) {
+		return 0, 0, false
+	}
+	lastChunk := chunks[partInfo.EndChunk-1]
+	return chunks[partInfo.StartChunk].Offset, lastChunk.Offset + int64(lastChunk.Size) - 1, true
+}
+
+// rc is a helper type that wraps a Reader and Closer for proper resource cleanup
+type rc struct {
+	io.Reader
+	io.Closer
+}
+
+// getMultipartInfo retrieves multipart metadata for a given part number
+// Returns: (partsCount, partInfo, hasBoundaries)
+// - partsCount: total number of parts in the multipart object
+// - partInfo: boundary information for the requested part (nil if not found or not a multipart object)
+// - hasBoundaries: the entry carries part boundaries, so a nil partInfo means the object has no such part
+func (s3a *S3ApiServer) getMultipartInfo(entry *filer_pb.Entry, partNumber int) (int, *PartBoundaryInfo, bool) {
+	if entry == nil {
+		return 0, nil, false
+	}
+	if entry.Extended == nil {
+		// Not a multipart object or no metadata
+		return len(entry.GetChunks()), nil, false
+	}
+
+	// Try to get parts count from metadata
+	partsCount := len(entry.GetChunks()) // default fallback
+	if partsCountBytes, exists := entry.Extended[s3_constants.SeaweedFSMultipartPartsCount]; exists {
+		if count, err := strconv.Atoi(string(partsCountBytes)); err == nil && count > 0 {
+			partsCount = count
+		}
+	}
+
+	// Try to get part boundaries from metadata
+	boundariesJSON, exists := entry.Extended[s3_constants.SeaweedFSMultipartPartBoundaries]
+	if !exists {
+		return partsCount, nil, false
+	}
+	var boundaries []PartBoundaryInfo
+	if err := json.Unmarshal(boundariesJSON, &boundaries); err != nil {
+		glog.Warningf("getMultipartInfo: failed to unmarshal part boundaries: %v", err)
+		return partsCount, nil, false
+	}
+	for i := range boundaries {
+		if boundaries[i].PartNumber == partNumber {
+			return partsCount, &boundaries[i], true
+		}
+	}
+
+	// The object records its parts and this is not one of them
+	return partsCount, nil, true
+}
+
+// requestedPartNumber returns the partNumber query parameter, or 0 when it is
+// absent or not a positive integer.
+func requestedPartNumber(r *http.Request) int {
+	partNumberStr := r.URL.Query().Get("partNumber")
+	if partNumberStr == "" {
+		partNumberStr = r.URL.Query().Get("PartNumber")
+	}
+	partNumber, parseErr := strconv.Atoi(partNumberStr)
+	if parseErr != nil || partNumber <= 0 {
+		return 0
+	}
+	return partNumber
+}
+
+// partByteRange resolves the inclusive byte range a partNumber request reads,
+// narrowed by a client Range within the part, and sets the parts count header.
+// The object ETag is kept as is, matching AWS.
+func (s3a *S3ApiServer) partByteRange(w http.ResponseWriter, r *http.Request, entry *filer_pb.Entry, partNumber int) (startOffset, endOffset int64, errCode s3err.ErrorCode) {
+	// Part numbers need not be consecutive, so an object that records its part
+	// boundaries is asked for the part itself rather than for a count.
+	partsCount, partInfo, hasBoundaries := s3a.getMultipartInfo(entry, partNumber)
+	if partInfo == nil && (hasBoundaries || partNumber > partsCount) {
+		glog.Warningf("partByteRange: object has no part %d, it has %d parts", partNumber, partsCount)
+		return 0, 0, s3err.ErrInvalidPartNumber
+	}
+
+	w.Header().Set(s3_constants.AmzMpPartsCount, strconv.Itoa(partsCount))
+
+	if partInfo != nil {
+		var ok bool
+		startOffset, endOffset, ok = partRange(partInfo, entry.Chunks)
+		if !ok {
+			glog.Errorf("partByteRange: part %d boundary chunks [%d,%d) out of range (chunks: %d)", partNumber, partInfo.StartChunk, partInfo.EndChunk, len(entry.Chunks))
+			return 0, 0, s3err.ErrInternalError
+		}
+	} else {
+		// Fallback: assume 1:1 part-to-chunk mapping (backward compatibility)
+		chunkIndex := partNumber - 1
+		if chunkIndex >= len(entry.Chunks) {
+			glog.Warningf("partByteRange: part %d chunk index %d out of range (chunks: %d)", partNumber, chunkIndex, len(entry.Chunks))
+			return 0, 0, s3err.ErrInvalidPartNumber
+		}
+		partChunk := entry.Chunks[chunkIndex]
+		startOffset, endOffset = partChunk.Offset, partChunk.Offset+int64(partChunk.Size)-1
+	}
+
+	// S3 allows both partNumber and Range together, where Range applies within the selected part
+	if clientRangeHeader := r.Header.Get("Range"); clientRangeHeader != "" {
+		adjustedStart, adjustedEnd, rangeErr := adjustRangeForPart(startOffset, endOffset, clientRangeHeader)
+		if rangeErr != nil {
+			glog.Warningf("partByteRange: invalid Range for part %d: %v", partNumber, rangeErr)
+			return 0, 0, s3err.ErrInvalidRange
+		}
+		startOffset, endOffset = adjustedStart, adjustedEnd
+	}
+
+	return startOffset, endOffset, s3err.ErrNone
+}
+
+// buildRemoteObjectPath builds the filer directory and object name from S3 bucket/object.
+// This is shared by all remote object caching functions.
+func (s3a *S3ApiServer) buildRemoteObjectPath(bucket, object string) (dir, name string) {
+	dir = s3a.bucketDir(bucket)
+	name = s3_constants.NormalizeObjectKey(object)
+	if idx := strings.LastIndex(name, "/"); idx > 0 {
+		dir = dir + "/" + name[:idx]
+		name = name[idx+1:]
+	}
+	return dir, name
+}
+
+// findMountedRemoteMapping resolves the remote mount covering dir from the
+// mount mapping kept in the filer.
+func (s3a *S3ApiServer) findMountedRemoteMapping(ctx context.Context, dir string) (localMountedDir string, mountedLocation *remote_pb.RemoteStorageLocation, err error) {
+	err = s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		mappingContent, readErr := filer.ReadInsideFiler(ctx, client, filer.DirectoryEtcRemote, filer.REMOTE_STORAGE_MOUNT_FILE)
+		if readErr != nil {
+			return readErr
+		}
+		mappings, unmarshalErr := filer.UnmarshalRemoteStorageMappings(mappingContent)
+		if unmarshalErr != nil {
+			return unmarshalErr
+		}
+		var findErr error
+		localMountedDir, mountedLocation, findErr = filer.FindMountedRemoteMapping(mappings, dir)
+		return findErr
+	})
+	return localMountedDir, mountedLocation, err
+}
+
+// openRemoteStream opens a ranged read of a remote-only object straight from
+// its mounted origin, resolving the mount and storage conf from the filer.
+// cached, when set, is the remote generation the local copy was made from: the
+// stream is refused unless the remote still matches it.
+func (s3a *S3ApiServer) openRemoteStream(ctx context.Context, bucket, object string, offset, size int64, cached *filer_pb.RemoteEntry) (io.ReadCloser, error) {
+	dir, name := s3a.buildRemoteObjectPath(bucket, object)
+
+	localMountedDir, mountedLocation, err := s3a.findMountedRemoteMapping(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+
+	var storageConf *remote_pb.RemoteConf
+	err = s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		confContent, readErr := filer.ReadInsideFiler(ctx, client, filer.DirectoryEtcRemote, mountedLocation.Name+filer.REMOTE_STORAGE_CONF_SUFFIX)
+		if readErr != nil {
+			return readErr
+		}
+		storageConf = &remote_pb.RemoteConf{}
+		return proto.Unmarshal(confContent, storageConf)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := weed_server.BuildGuardedRemoteStorageClient(ctx, storageConf, s3a.option.AllowUntrustedRemoteEndpoints)
+	if err != nil {
+		return nil, err
+	}
+	streamer, ok := client.(remote_storage.RemoteStorageStreamReader)
+	if !ok {
+		return nil, fmt.Errorf("remote storage type %s does not support streaming reads", storageConf.Type)
+	}
+
+	loc := filer.MapFullPathToRemoteStorageLocation(util.FullPath(localMountedDir), mountedLocation, util.FullPath(dir).Child(name))
+	if cached != nil {
+		current, statErr := client.StatFile(loc)
+		if statErr != nil {
+			return nil, statErr
+		}
+		if current.GetRemoteSize() != cached.GetRemoteSize() || current.GetRemoteETag() != cached.GetRemoteETag() || current.GetRemoteMtime() != cached.GetRemoteMtime() {
+			return nil, fmt.Errorf("remote %s/%s changed since it was cached", bucket, object)
+		}
+	}
+	return streamer.ReadFileAsStream(ctx, loc, offset, size)
+}
+
+// doCacheRemoteObject calls the filer's CacheRemoteObjectToLocalCluster gRPC endpoint.
+// This is the core caching function used by cacheRemoteObjectForStreaming.
+func (s3a *S3ApiServer) doCacheRemoteObject(ctx context.Context, dir, name string) (*filer_pb.Entry, error) {
+	var cachedEntry *filer_pb.Entry
+	err := s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		resp, cacheErr := client.CacheRemoteObjectToLocalCluster(ctx, &filer_pb.CacheRemoteObjectToLocalClusterRequest{
+			Directory: dir,
+			Name:      name,
+		})
+		if cacheErr != nil {
+			return cacheErr
+		}
+		if resp != nil && resp.Entry != nil {
+			cachedEntry = resp.Entry
+		}
+		return nil
+	})
+	return cachedEntry, err
+}
+
+func (s3a *S3ApiServer) buildVersionedRemoteObjectPath(bucket, object, versionId string) (dir, name string) {
+	// versionId names a .versions file, so a value that is not a valid path
+	// segment falls back to the unversioned remote path rather than escaping it.
+	if versionId != "" && versionId != "null" && isValidVersionID(versionId) {
+		normalizedObject := s3_constants.NormalizeObjectKey(object)
+		return s3a.bucketDir(bucket) + "/" + normalizedObject + s3_constants.VersionsFolder, s3a.getVersionFileName(versionId)
+	}
+	return s3a.buildRemoteObjectPath(bucket, object)
+}
+
+// cachedEntryHasLocalData reports whether a cache response carries data the
+// copy path can read locally. The streaming caller uses a stricter chunks-
+// only check inline since its downstream cannot read from inline Content.
+func cachedEntryHasLocalData(entry *filer_pb.Entry) bool {
+	return entry != nil && (len(entry.GetChunks()) > 0 || len(entry.Content) > 0)
+}
+
+// remoteCacheStreamingTimeoutNS bounds (nanoseconds) how long the streaming read
+// path waits for the filer to finish caching a remote-only object. Without a
+// bound a multi-GB download outlasts the client's read timeout, so the request
+// is canceled before the caller can emit 503 + Retry-After. Kept under common S3
+// client read timeouts (~60s) given the 30s dedup attempt that precedes it.
+// Atomic so tests can shorten it without racing the read path.
+var remoteCacheStreamingTimeoutNS = int64(20 * time.Second)
+
+// remoteCacheWait resolves how long a read of dir may wait for the local cache.
+// Zero means the mount opted out of caching, so the read is served from the
+// origin instead -- except for a version-specific read, which has no origin key
+// to fall back to and therefore keeps the size tiers.
+func (s3a *S3ApiServer) remoteCacheWait(ctx context.Context, dir string, remoteSize int64, versionId string) time.Duration {
+	_, mountedLocation, mountErr := s3a.findMountedRemoteMapping(ctx, dir)
+	if mountErr != nil {
+		glog.V(2).Infof("remoteCacheWait: find mount for %s: %v", dir, mountErr)
+	}
+	wait := remote_storage.CacheWaitTimeout(remoteSize, mountedLocation)
+	if wait <= 0 && versionId != "" && versionId != "null" {
+		return remote_storage.CacheWaitTimeout(remoteSize, nil)
+	}
+	return wait
+}
+
+// cacheRemoteObjectForStreamingWithShortTimeout polls for cache completion with an adaptive timeout.
+// Timeout comes from the file size or the mount's cache_wait_ms: small files wait longer to
+// maximize cache hits, large files fail-fast to improve TTFB. Returns the cached entry and error
+// to allow callers to distinguish between transient errors (timeout) and permanent errors (not
+// found, permission denied). The filer continues caching on detached context, so retry finds
+// cached chunks.
+func (s3a *S3ApiServer) cacheRemoteObjectForStreamingWithShortTimeout(r *http.Request, entry *filer_pb.Entry, bucket, object, versionId string) (*filer_pb.Entry, error) {
+	dir, name := s3a.buildVersionedRemoteObjectPath(bucket, object, versionId)
+
+	pollTimeout := s3a.remoteCacheWait(r.Context(), dir, entry.GetRemoteEntry().GetRemoteSize(), versionId)
+	if pollTimeout <= 0 {
+		// The mount opted out of caching: report it uncached so the caller serves the origin.
+		glog.V(2).Infof("cacheRemoteObjectForStreamingWithShortTimeout: caching disabled for %s/%s", dir, name)
+		return nil, nil
+	}
+
+	cacheCtx, cancel := context.WithTimeout(r.Context(), pollTimeout)
+	defer cancel()
+
+	glog.V(2).Infof("cacheRemoteObjectForStreamingWithShortTimeout: polling cache status for %s/%s (timeout=%v)", dir, name, pollTimeout)
+
+	cachedEntry, err := s3a.doCacheRemoteObject(cacheCtx, dir, name)
+	if err != nil {
+		// Distinguish transient errors (timeout/cancellation) from permanent errors
+		if cacheCtx.Err() != nil {
+			glog.V(2).Infof("cacheRemoteObjectForStreamingWithShortTimeout: %s/%s not cached within %v", dir, name, pollTimeout)
+			return nil, cacheCtx.Err()
+		}
+		glog.V(2).Infof("cacheRemoteObjectForStreamingWithShortTimeout: cache error for %s/%s: %v", dir, name, err)
+		return nil, err
+	}
+
+	if cachedEntry != nil && len(cachedEntry.GetChunks()) > 0 {
+		glog.V(1).Infof("cacheRemoteObjectForStreamingWithShortTimeout: successfully cached %s/%s (%d chunks)", dir, name, len(cachedEntry.GetChunks()))
+	}
+
+	// Even an uncached response can carry newer ACLs or tags that must be checked.
+	return cachedEntry, nil
+}
+
+// cacheRemoteObjectForStreaming caches a remote-only object to the local cluster for streaming.
+// Bounded so a slow large-file download returns to the caller (which emits 503 +
+// Retry-After) before the client gives up; the filer keeps caching on a detached
+// context, so a retry streams from the cached chunks. Returns the cached entry
+// only when chunks are present; the caller cannot read inline Content here.
+func (s3a *S3ApiServer) cacheRemoteObjectForStreaming(r *http.Request, entry *filer_pb.Entry, bucket, object, versionId string) *filer_pb.Entry {
+	timeout := time.Duration(atomic.LoadInt64(&remoteCacheStreamingTimeoutNS))
+	cacheCtx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+
+	dir, name := s3a.buildVersionedRemoteObjectPath(bucket, object, versionId)
+
+	glog.V(1).Infof("cacheRemoteObjectForStreaming: caching %s/%s (remote size: %d, versionId: %s)", dir, name, entry.RemoteEntry.RemoteSize, versionId)
+
+	cachedEntry, err := s3a.doCacheRemoteObject(cacheCtx, dir, name)
+	if err != nil {
+		// A bounded-wait timeout (or client disconnect) is not a cache failure:
+		// the filer keeps downloading and the caller maps a nil return to 503.
+		if cacheCtx.Err() != nil {
+			glog.V(1).Infof("cacheRemoteObjectForStreaming: %s/%s not ready within %v (will retry)", dir, name, timeout)
+		} else {
+			glog.Errorf("cacheRemoteObjectForStreaming: failed to cache %s/%s: %v", dir, name, err)
+		}
+		return nil
+	}
+
+	if cachedEntry != nil && len(cachedEntry.GetChunks()) > 0 {
+		glog.V(1).Infof("cacheRemoteObjectForStreaming: successfully cached %s/%s (%d chunks)", dir, name, len(cachedEntry.GetChunks()))
+		return cachedEntry
+	}
+
+	return nil
+}
+
+// cacheRemoteObjectForCopy caches a remote-only source before CopyObject /
+// CopyObjectPart reads it; otherwise the copy would write a destination with
+// FileSize > 0 but no chunks/content. Bounded so a stuck cache can't hang
+// the copy. Returns nil if caching failed or produced no local data.
+func (s3a *S3ApiServer) cacheRemoteObjectForCopy(ctx context.Context, bucket, object, versionId string) *filer_pb.Entry {
+	const cacheTimeout = 30 * time.Second
+	cacheCtx, cancel := context.WithTimeout(ctx, cacheTimeout)
+	defer cancel()
+
+	dir, name := s3a.buildVersionedRemoteObjectPath(bucket, object, versionId)
+
+	glog.V(1).Infof("cacheRemoteObjectForCopy: caching %s/%s (versionId: %s)", dir, name, versionId)
+
+	cachedEntry, err := s3a.doCacheRemoteObject(cacheCtx, dir, name)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			glog.Warningf("cacheRemoteObjectForCopy: timeout caching %s/%s after %v", dir, name, cacheTimeout)
+		} else {
+			glog.Errorf("cacheRemoteObjectForCopy: failed to cache %s/%s: %v", dir, name, err)
+		}
+		return nil
+	}
+
+	if cachedEntryHasLocalData(cachedEntry) {
+		glog.V(1).Infof("cacheRemoteObjectForCopy: successfully cached %s/%s (chunks=%d, inline=%d)", dir, name, len(cachedEntry.GetChunks()), len(cachedEntry.Content))
+		return cachedEntry
+	}
+
+	return nil
+}
+
+// startBackgroundRemoteCache initiates caching without blocking the request.
+// This enables fast TTFB: the client's request returns immediately (via 503 if not
+// cached), while a background task fills the cache. Subsequent requests will find
+// cached chunks via singleflight deduplication in the filer's CacheRemoteObjectToLocalCluster.
+// Uses detached context with reasonable timeout to prevent goroutine pile-up.
+func (s3a *S3ApiServer) startBackgroundRemoteCache(bucket, object, versionId string, entry *filer_pb.Entry) {
+	if !entry.IsInRemoteOnly() {
+		return
+	}
+
+	dir, name := s3a.buildVersionedRemoteObjectPath(bucket, object, versionId)
+
+	// Start background cache without blocking. The filer's CacheRemoteObjectToLocalCluster
+	// uses singleflight internally, so concurrent requests will all benefit from the same
+	// cache operation.
+	go func() {
+		// Use timeout to bound goroutine and prevent pile-up if RPC stalls under load
+		bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if s3a.remoteCacheWait(bgCtx, dir, entry.GetRemoteEntry().GetRemoteSize(), versionId) <= 0 {
+			glog.V(2).Infof("startBackgroundRemoteCache: caching disabled for %s/%s", dir, name)
+			return
+		}
+		_, err := s3a.doCacheRemoteObject(bgCtx, dir, name)
+		if err != nil {
+			glog.V(2).Infof("startBackgroundRemoteCache: cache failed for %s/%s: %v", bucket, object, err)
+		} else {
+			glog.V(2).Infof("startBackgroundRemoteCache: cached %s/%s in background", bucket, object)
+		}
+	}()
+}
+
+// resolvedSourceVersionId falls back to the version recorded on the entry
+// when the request didn't carry one — necessary for latest-version reads
+// in versioning-enabled buckets, where the entry lives at .versions/v_<id>.
+func resolvedSourceVersionId(requestedVersionId string, entry *filer_pb.Entry) string {
+	if requestedVersionId != "" {
+		return requestedVersionId
+	}
+	if entry == nil || entry.Extended == nil {
+		return ""
+	}
+	if v, ok := entry.Extended[s3_constants.ExtVersionIdKey]; ok {
+		return string(v)
+	}
+	return ""
+}

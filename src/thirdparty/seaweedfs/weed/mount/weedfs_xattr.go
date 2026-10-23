@@ -1,0 +1,242 @@
+//go:build !freebsd
+
+package mount
+
+import (
+	"runtime"
+	"strings"
+	"syscall"
+
+	"github.com/seaweedfs/go-fuse/v2/fuse"
+)
+
+const (
+	// https://man7.org/linux/man-pages/man7/xattr.7.html#:~:text=The%20VFS%20imposes%20limitations%20that,in%20listxattr(2)).
+	MAX_XATTR_NAME_SIZE  = 255
+	MAX_XATTR_VALUE_SIZE = 65536
+	XATTR_PREFIX         = "xattr-" // same as filer
+)
+
+// GetXAttr reads an extended attribute, and should return the
+// number of bytes. If the buffer is too small, return ERANGE,
+// with the required buffer size.
+func (wfs *WFS) GetXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr string, dest []byte) (size uint32, code fuse.Status) {
+
+	if wfs.option.DisableXAttr {
+		return 0, fuse.Status(syscall.ENOTSUP)
+	}
+
+	//validate attr name
+	if len(attr) > MAX_XATTR_NAME_SIZE {
+		if runtime.GOOS == "darwin" {
+			return 0, fuse.EPERM
+		} else {
+			return 0, fuse.ERANGE
+		}
+	}
+	if len(attr) == 0 {
+		return 0, fuse.EINVAL
+	}
+
+	ctx, cancelFunc := ctxFromCancel(cancel)
+	defer cancelFunc()
+	_, _, entry, status := wfs.maybeReadEntry(ctx, header.NodeId)
+	if status != fuse.OK {
+		return 0, status
+	}
+	if entry == nil {
+		return 0, fuse.ENOENT
+	}
+	if entry.Extended == nil {
+		return 0, fuse.ENOATTR
+	}
+	data, found := entry.Extended[XATTR_PREFIX+attr]
+	if !found {
+		return 0, fuse.ENOATTR
+	}
+	if len(dest) < len(data) {
+		return uint32(len(data)), fuse.ERANGE
+	}
+	copy(dest, data)
+
+	return uint32(len(data)), fuse.OK
+}
+
+// SetXAttr writes an extended attribute.
+// https://man7.org/linux/man-pages/man2/setxattr.2.html
+//
+//	 By default (i.e., flags is zero), the extended attribute will be
+//	created if it does not exist, or the value will be replaced if
+//	the attribute already exists.  To modify these semantics, one of
+//	the following values can be specified in flags:
+//
+//	XATTR_CREATE
+//	       Perform a pure create, which fails if the named attribute
+//	       exists already.
+//
+//	XATTR_REPLACE
+//	       Perform a pure replace operation, which fails if the named
+//	       attribute does not already exist.
+func (wfs *WFS) SetXAttr(cancel <-chan struct{}, input *fuse.SetXAttrIn, attr string, data []byte) fuse.Status {
+
+	if wfs.option.DisableXAttr {
+		return fuse.Status(syscall.ENOTSUP)
+	}
+
+	if wfs.IsOverQuotaWithUncommitted() {
+		return fuse.Status(syscall.ENOSPC)
+	}
+
+	//validate attr name
+	if len(attr) > MAX_XATTR_NAME_SIZE {
+		if runtime.GOOS == "darwin" {
+			return fuse.EPERM
+		} else {
+			return fuse.ERANGE
+		}
+	}
+	if len(attr) == 0 {
+		return fuse.EINVAL
+	}
+	//validate attr value
+	if len(data) > MAX_XATTR_VALUE_SIZE {
+		if runtime.GOOS == "darwin" {
+			return fuse.Status(syscall.E2BIG)
+		} else {
+			return fuse.ERANGE
+		}
+	}
+
+	ctx, cancelFunc := ctxFromCancel(cancel)
+	defer cancelFunc()
+	path, fh, entry, status := wfs.maybeReadEntry(ctx, input.NodeId)
+	if status != fuse.OK {
+		return status
+	}
+	if entry == nil {
+		return fuse.ENOENT
+	}
+	if fh != nil {
+		fh.entryLock.Lock()
+		defer fh.entryLock.Unlock()
+	}
+
+	if entry.Extended == nil {
+		entry.Extended = make(map[string][]byte)
+	}
+	_, exists := entry.Extended[XATTR_PREFIX+attr]
+	switch input.Flags {
+	case xattr_CREATE:
+		if exists {
+			return fuse.Status(syscall.EEXIST)
+		}
+	case xattr_REPLACE:
+		if !exists {
+			return fuse.ENODATA
+		}
+	}
+
+	// data aliases the FUSE request's pooled input buffer, which is
+	// recycled once this handler returns. Copy before storing so a
+	// later request reusing the buffer cannot corrupt the value.
+	entry.Extended[XATTR_PREFIX+attr] = append([]byte(nil), data...)
+
+	if fh != nil {
+		fh.dirtyMetadata = true
+		return fuse.OK
+	}
+	if path == "" {
+		// removed while open: the remembered entry is all there is to update
+		wfs.rememberRemovedDir(input.NodeId, entry)
+		return fuse.OK
+	}
+
+	return wfs.saveEntry(path, entry)
+
+}
+
+// ListXAttr lists extended attributes as '\0' delimited byte
+// slice, and return the number of bytes. If the buffer is too
+// small, return ERANGE, with the required buffer size.
+func (wfs *WFS) ListXAttr(cancel <-chan struct{}, header *fuse.InHeader, dest []byte) (n uint32, code fuse.Status) {
+
+	if wfs.option.DisableXAttr {
+		return 0, fuse.Status(syscall.ENOTSUP)
+	}
+
+	ctx, cancelFunc := ctxFromCancel(cancel)
+	defer cancelFunc()
+	_, _, entry, status := wfs.maybeReadEntry(ctx, header.NodeId)
+	if status != fuse.OK {
+		return 0, status
+	}
+	if entry == nil {
+		return 0, fuse.ENOENT
+	}
+	if entry.Extended == nil {
+		return 0, fuse.OK
+	}
+
+	var data []byte
+	for k := range entry.Extended {
+		if strings.HasPrefix(k, XATTR_PREFIX) {
+			data = append(data, k[len(XATTR_PREFIX):]...)
+			data = append(data, 0)
+		}
+	}
+	if len(dest) < len(data) {
+		return uint32(len(data)), fuse.ERANGE
+	}
+
+	copy(dest, data)
+
+	return uint32(len(data)), fuse.OK
+}
+
+// RemoveXAttr removes an extended attribute.
+func (wfs *WFS) RemoveXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr string) fuse.Status {
+
+	if wfs.option.DisableXAttr {
+		return fuse.Status(syscall.ENOTSUP)
+	}
+
+	if len(attr) == 0 {
+		return fuse.EINVAL
+	}
+	ctx, cancelFunc := ctxFromCancel(cancel)
+	defer cancelFunc()
+	path, fh, entry, status := wfs.maybeReadEntry(ctx, header.NodeId)
+	if status != fuse.OK {
+		return status
+	}
+	if entry == nil {
+		return fuse.OK
+	}
+	if fh != nil {
+		fh.entryLock.Lock()
+		defer fh.entryLock.Unlock()
+	}
+
+	if entry.Extended == nil {
+		return fuse.ENOATTR
+	}
+	_, found := entry.Extended[XATTR_PREFIX+attr]
+
+	if !found {
+		return fuse.ENOATTR
+	}
+
+	delete(entry.Extended, XATTR_PREFIX+attr)
+
+	if fh != nil {
+		fh.dirtyMetadata = true
+		return fuse.OK
+	}
+	if path == "" {
+		// removed while open: the remembered entry is all there is to update
+		wfs.rememberRemovedDir(header.NodeId, entry)
+		return fuse.OK
+	}
+
+	return wfs.saveEntry(path, entry)
+}

@@ -1,0 +1,991 @@
+package storage
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"time"
+)
+
+// closeEcVolumes closes all EC volumes in the given DiskLocation to release file handles.
+func closeEcVolumes(dl *DiskLocation) {
+	for _, ecVol := range dl.ecVolumes {
+		ecVol.Close()
+	}
+}
+
+// TestIncompleteEcEncodingCleanup tests the cleanup logic for incomplete EC encoding scenarios
+func TestIncompleteEcEncodingCleanup(t *testing.T) {
+	tests := []struct {
+		name              string
+		volumeId          needle.VolumeId
+		collection        string
+		createDatFile     bool
+		createEcxFile     bool
+		createEcjFile     bool
+		numShards         int
+		expectCleanup     bool
+		expectLoadSuccess bool
+	}{
+		{
+			name:              "Incomplete EC: shards without .ecx, .dat exists - should cleanup",
+			volumeId:          100,
+			collection:        "",
+			createDatFile:     true,
+			createEcxFile:     false,
+			createEcjFile:     false,
+			numShards:         14, // All shards but no .ecx
+			expectCleanup:     true,
+			expectLoadSuccess: false,
+		},
+		{
+			name:              "Distributed EC: shards without .ecx, .dat deleted - should NOT cleanup",
+			volumeId:          101,
+			collection:        "",
+			createDatFile:     false,
+			createEcxFile:     false,
+			createEcjFile:     false,
+			numShards:         5, // Partial shards, distributed
+			expectCleanup:     false,
+			expectLoadSuccess: false,
+		},
+		{
+			// Full-size shards beside a .dat are NOT an interrupted local
+			// encode (which leaves equally-truncated shards smaller than the
+			// .dat); they may be sole copies of a distributed volume, so the
+			// safe behavior is to keep them rather than delete on a low count.
+			name:              "Distributed EC: full-size shards with .ecx, < 10 of them, .dat exists - keep",
+			volumeId:          102,
+			collection:        "",
+			createDatFile:     true,
+			createEcxFile:     true,
+			createEcjFile:     false,
+			numShards:         7, // Less than DataShardsCount (10), but full size
+			expectCleanup:     false,
+			expectLoadSuccess: false,
+		},
+		{
+			name:              "Valid local EC: shards with .ecx, >= 10 shards, .dat exists - should load",
+			volumeId:          103,
+			collection:        "",
+			createDatFile:     true,
+			createEcxFile:     true,
+			createEcjFile:     false,
+			numShards:         14, // All shards
+			expectCleanup:     false,
+			expectLoadSuccess: true, // Would succeed if .ecx was valid
+		},
+		{
+			name:              "Distributed EC: shards with .ecx, .dat deleted - should load",
+			volumeId:          104,
+			collection:        "",
+			createDatFile:     false,
+			createEcxFile:     true,
+			createEcjFile:     false,
+			numShards:         10, // Enough shards
+			expectCleanup:     false,
+			expectLoadSuccess: true, // Would succeed if .ecx was valid
+		},
+		{
+			name:              "Incomplete EC with collection: shards without .ecx, .dat exists - should cleanup",
+			volumeId:          105,
+			collection:        "test_collection",
+			createDatFile:     true,
+			createEcxFile:     false,
+			createEcjFile:     false,
+			numShards:         14,
+			expectCleanup:     true,
+			expectLoadSuccess: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Use per-subtest temp directory for stronger isolation
+			tempDir := t.TempDir()
+
+			// Create DiskLocation
+			minFreeSpace := util.MinFreeSpace{Type: util.AsPercent, Percent: 1, Raw: "1"}
+			diskLocation := &DiskLocation{
+				Directory:              tempDir,
+				DirectoryUuid:          "test-uuid",
+				IdxDirectory:           tempDir,
+				DiskType:               types.HddType,
+				MaxVolumeCount:         100,
+				OriginalMaxVolumeCount: 100,
+				MinFreeSpace:           minFreeSpace,
+			}
+			diskLocation.volumes = make(map[needle.VolumeId]*Volume)
+			diskLocation.ecVolumes = make(map[needle.VolumeId]*erasure_coding.EcVolume)
+
+			// Setup test files
+			baseFileName := erasure_coding.EcShardFileName(tt.collection, tempDir, int(tt.volumeId))
+
+			// Use deterministic but small size: 10MB .dat => 1MB per shard
+			datFileSize := int64(10 * 1024 * 1024) // 10MB
+			expectedShardSize := calculateExpectedShardSize(datFileSize, erasure_coding.DataShardsCount)
+
+			// Create .dat file if needed
+			if tt.createDatFile {
+				datFile, err := os.Create(baseFileName + ".dat")
+				if err != nil {
+					t.Fatalf("Failed to create .dat file: %v", err)
+				}
+				if err := datFile.Truncate(datFileSize); err != nil {
+					t.Fatalf("Failed to truncate .dat file: %v", err)
+				}
+				if err := datFile.Close(); err != nil {
+					t.Fatalf("Failed to close .dat file: %v", err)
+				}
+			}
+
+			// Create EC shard files
+			for i := 0; i < tt.numShards; i++ {
+				shardFile, err := os.Create(baseFileName + erasure_coding.ToExt(i))
+				if err != nil {
+					t.Fatalf("Failed to create shard file: %v", err)
+				}
+				if err := shardFile.Truncate(expectedShardSize); err != nil {
+					t.Fatalf("Failed to truncate shard file: %v", err)
+				}
+				if err := shardFile.Close(); err != nil {
+					t.Fatalf("Failed to close shard file: %v", err)
+				}
+			}
+
+			// Create .ecx file if needed
+			if tt.createEcxFile {
+				ecxFile, err := os.Create(baseFileName + ".ecx")
+				if err != nil {
+					t.Fatalf("Failed to create .ecx file: %v", err)
+				}
+				if _, err := ecxFile.WriteString("dummy ecx data"); err != nil {
+					ecxFile.Close()
+					t.Fatalf("Failed to write .ecx file: %v", err)
+				}
+				if err := ecxFile.Close(); err != nil {
+					t.Fatalf("Failed to close .ecx file: %v", err)
+				}
+			}
+
+			// Create .ecj file if needed
+			if tt.createEcjFile {
+				ecjFile, err := os.Create(baseFileName + ".ecj")
+				if err != nil {
+					t.Fatalf("Failed to create .ecj file: %v", err)
+				}
+				if _, err := ecjFile.WriteString("dummy ecj data"); err != nil {
+					ecjFile.Close()
+					t.Fatalf("Failed to write .ecj file: %v", err)
+				}
+				if err := ecjFile.Close(); err != nil {
+					t.Fatalf("Failed to close .ecj file: %v", err)
+				}
+			}
+
+			// Run loadAllEcShards
+			loadErr := diskLocation.loadAllEcShards(nil)
+			if loadErr != nil {
+				t.Logf("loadAllEcShards returned error (expected in some cases): %v", loadErr)
+			}
+
+			// Close EC volumes before idempotency test to avoid leaking file handles
+			closeEcVolumes(diskLocation)
+			diskLocation.ecVolumes = make(map[needle.VolumeId]*erasure_coding.EcVolume)
+
+			// Test idempotency - running again should not cause issues
+			loadErr2 := diskLocation.loadAllEcShards(nil)
+			if loadErr2 != nil {
+				t.Logf("Second loadAllEcShards returned error: %v", loadErr2)
+			}
+			t.Cleanup(func() {
+				closeEcVolumes(diskLocation)
+			})
+
+			// Verify cleanup expectations
+			if tt.expectCleanup {
+				// Check that files were cleaned up
+				if util.FileExists(baseFileName + ".ecx") {
+					t.Errorf("Expected .ecx to be cleaned up but it still exists")
+				}
+				if util.FileExists(baseFileName + ".ecj") {
+					t.Errorf("Expected .ecj to be cleaned up but it still exists")
+				}
+				for i := 0; i < erasure_coding.TotalShardsCount; i++ {
+					shardFile := baseFileName + erasure_coding.ToExt(i)
+					if util.FileExists(shardFile) {
+						t.Errorf("Expected shard %d to be cleaned up but it still exists", i)
+					}
+				}
+				// .dat file should still exist (not cleaned up)
+				if tt.createDatFile && !util.FileExists(baseFileName+".dat") {
+					t.Errorf("Expected .dat file to remain but it was deleted")
+				}
+			} else {
+				// Check that files were NOT cleaned up
+				for i := 0; i < tt.numShards; i++ {
+					shardFile := baseFileName + erasure_coding.ToExt(i)
+					if !util.FileExists(shardFile) {
+						t.Errorf("Expected shard %d to remain but it was cleaned up", i)
+					}
+				}
+				if tt.createEcxFile && !util.FileExists(baseFileName+".ecx") {
+					t.Errorf("Expected .ecx to remain but it was cleaned up")
+				}
+			}
+
+			// Verify load expectations
+			if tt.expectLoadSuccess {
+				if diskLocation.EcShardCount() == 0 {
+					t.Errorf("Expected EC shards to be loaded for volume %d", tt.volumeId)
+				}
+			}
+
+		})
+	}
+}
+
+// TestValidateEcVolume tests the validateEcVolume function
+func TestValidateEcVolume(t *testing.T) {
+	tempDir := t.TempDir()
+
+	minFreeSpace := util.MinFreeSpace{Type: util.AsPercent, Percent: 1, Raw: "1"}
+	diskLocation := &DiskLocation{
+		Directory:     tempDir,
+		DirectoryUuid: "test-uuid",
+		IdxDirectory:  tempDir,
+		DiskType:      types.HddType,
+		MinFreeSpace:  minFreeSpace,
+	}
+
+	tests := []struct {
+		name          string
+		volumeId      needle.VolumeId
+		collection    string
+		createDatFile bool
+		numShards     int
+		expectValid   bool
+	}{
+		{
+			name:          "Valid: .dat exists with 10+ shards",
+			volumeId:      200,
+			collection:    "",
+			createDatFile: true,
+			numShards:     10,
+			expectValid:   true,
+		},
+		{
+			// Full-size shards smaller in count than dataShards may be sole
+			// copies of a distributed volume (a real interrupted local encode
+			// leaves equally-truncated shards, not full-size ones), so they
+			// are kept rather than deleted in favor of the .dat.
+			name:          "Keep: .dat exists with < 10 full-size shards (possible distributed sole copies)",
+			volumeId:      201,
+			collection:    "",
+			createDatFile: true,
+			numShards:     9,
+			expectValid:   true,
+		},
+		{
+			name:          "Valid: .dat deleted (distributed EC) with any shards",
+			volumeId:      202,
+			collection:    "",
+			createDatFile: false,
+			numShards:     5,
+			expectValid:   true,
+		},
+		{
+			name:          "Valid: .dat deleted (distributed EC) with no shards",
+			volumeId:      203,
+			collection:    "",
+			createDatFile: false,
+			numShards:     0,
+			expectValid:   true,
+		},
+		{
+			name:          "Invalid: zero-byte shard files should not count",
+			volumeId:      204,
+			collection:    "",
+			createDatFile: true,
+			numShards:     0, // Will create 10 zero-byte files below
+			expectValid:   false,
+		},
+		{
+			// Inconsistent shard sizes signal corruption or mixed generations,
+			// not a clean interrupted encode; deleting them could destroy the
+			// only copy, so validation keeps them.
+			name:          "Keep: .dat exists with different size shards (inconsistent, not trusted for deletion)",
+			volumeId:      205,
+			collection:    "",
+			createDatFile: true,
+			numShards:     10, // Will create shards with varying sizes
+			expectValid:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			baseFileName := erasure_coding.EcShardFileName(tt.collection, tempDir, int(tt.volumeId))
+
+			// For proper testing, we need to use realistic sizes that match EC encoding
+			// EC uses large blocks (1GB) and small blocks (1MB)
+			// For test purposes, use a small .dat file size that still exercises the logic
+			// 10MB .dat file = 1MB per shard (one small batch, fast and deterministic)
+			datFileSize := int64(10 * 1024 * 1024) // 10MB
+			expectedShardSize := calculateExpectedShardSize(datFileSize, erasure_coding.DataShardsCount)
+
+			// Create .dat file if needed
+			if tt.createDatFile {
+				datFile, err := os.Create(baseFileName + ".dat")
+				if err != nil {
+					t.Fatalf("Failed to create .dat file: %v", err)
+				}
+				// Write minimal data (don't need to fill entire 10GB for tests)
+				datFile.Truncate(datFileSize)
+				datFile.Close()
+			}
+
+			// Create EC shard files with correct size
+			for i := 0; i < tt.numShards; i++ {
+				shardFile, err := os.Create(baseFileName + erasure_coding.ToExt(i))
+				if err != nil {
+					t.Fatalf("Failed to create shard file: %v", err)
+				}
+				// Use truncate to create file of correct size without allocating all the space
+				if err := shardFile.Truncate(expectedShardSize); err != nil {
+					shardFile.Close()
+					t.Fatalf("Failed to truncate shard file: %v", err)
+				}
+				if err := shardFile.Close(); err != nil {
+					t.Fatalf("Failed to close shard file: %v", err)
+				}
+			}
+
+			// For zero-byte test case, create empty files for all data shards
+			if tt.volumeId == 204 {
+				for i := 0; i < erasure_coding.DataShardsCount; i++ {
+					shardFile, err := os.Create(baseFileName + erasure_coding.ToExt(i))
+					if err != nil {
+						t.Fatalf("Failed to create empty shard file: %v", err)
+					}
+					// Don't write anything - leave as zero-byte
+					shardFile.Close()
+				}
+			}
+
+			// For mismatched shard size test case, create shards with different sizes
+			if tt.volumeId == 205 {
+				for i := 0; i < erasure_coding.DataShardsCount; i++ {
+					shardFile, err := os.Create(baseFileName + erasure_coding.ToExt(i))
+					if err != nil {
+						t.Fatalf("Failed to create shard file: %v", err)
+					}
+					// Write different amount of data to each shard
+					data := make([]byte, 100+i*10)
+					shardFile.Write(data)
+					shardFile.Close()
+				}
+			}
+
+			// Test validation
+			isValid := diskLocation.validateEcVolume(tt.collection, tt.volumeId)
+			if isValid != tt.expectValid {
+				t.Errorf("Expected validation result %v but got %v", tt.expectValid, isValid)
+			}
+		})
+	}
+}
+
+// TestRemoveEcVolumeFiles tests the removeEcVolumeFiles function
+func TestRemoveEcVolumeFiles(t *testing.T) {
+	tests := []struct {
+		name           string
+		separateIdxDir bool
+	}{
+		{"Same directory for data and index", false},
+		{"Separate idx directory", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+
+			var dataDir, idxDir string
+			if tt.separateIdxDir {
+				dataDir = filepath.Join(tempDir, "data")
+				idxDir = filepath.Join(tempDir, "idx")
+				os.MkdirAll(dataDir, 0755)
+				os.MkdirAll(idxDir, 0755)
+			} else {
+				dataDir = tempDir
+				idxDir = tempDir
+			}
+
+			minFreeSpace := util.MinFreeSpace{Type: util.AsPercent, Percent: 1, Raw: "1"}
+			diskLocation := &DiskLocation{
+				Directory:     dataDir,
+				DirectoryUuid: "test-uuid",
+				IdxDirectory:  idxDir,
+				DiskType:      types.HddType,
+				MinFreeSpace:  minFreeSpace,
+			}
+
+			volumeId := needle.VolumeId(300)
+			collection := ""
+			dataBaseFileName := erasure_coding.EcShardFileName(collection, dataDir, int(volumeId))
+			idxBaseFileName := erasure_coding.EcShardFileName(collection, idxDir, int(volumeId))
+
+			// Create all EC shard files in data directory
+			for i := 0; i < erasure_coding.TotalShardsCount; i++ {
+				shardFile, err := os.Create(dataBaseFileName + erasure_coding.ToExt(i))
+				if err != nil {
+					t.Fatalf("Failed to create shard file: %v", err)
+				}
+				if _, err := shardFile.WriteString("dummy shard data"); err != nil {
+					shardFile.Close()
+					t.Fatalf("Failed to write shard file: %v", err)
+				}
+				if err := shardFile.Close(); err != nil {
+					t.Fatalf("Failed to close shard file: %v", err)
+				}
+			}
+
+			// Create .ecx file in idx directory
+			ecxFile, err := os.Create(idxBaseFileName + ".ecx")
+			if err != nil {
+				t.Fatalf("Failed to create .ecx file: %v", err)
+			}
+			if _, err := ecxFile.WriteString("dummy ecx data"); err != nil {
+				ecxFile.Close()
+				t.Fatalf("Failed to write .ecx file: %v", err)
+			}
+			if err := ecxFile.Close(); err != nil {
+				t.Fatalf("Failed to close .ecx file: %v", err)
+			}
+
+			// Create .ecj file in idx directory
+			ecjFile, err := os.Create(idxBaseFileName + ".ecj")
+			if err != nil {
+				t.Fatalf("Failed to create .ecj file: %v", err)
+			}
+			if _, err := ecjFile.WriteString("dummy ecj data"); err != nil {
+				ecjFile.Close()
+				t.Fatalf("Failed to write .ecj file: %v", err)
+			}
+			if err := ecjFile.Close(); err != nil {
+				t.Fatalf("Failed to close .ecj file: %v", err)
+			}
+
+			// Create .dat file in data directory (should NOT be removed)
+			datFile, err := os.Create(dataBaseFileName + ".dat")
+			if err != nil {
+				t.Fatalf("Failed to create .dat file: %v", err)
+			}
+			if _, err := datFile.WriteString("dummy dat data"); err != nil {
+				datFile.Close()
+				t.Fatalf("Failed to write .dat file: %v", err)
+			}
+			if err := datFile.Close(); err != nil {
+				t.Fatalf("Failed to close .dat file: %v", err)
+			}
+
+			// Call removeEcVolumeFiles
+			diskLocation.removeEcVolumeFiles(collection, volumeId)
+
+			// Verify all EC shard files are removed from data directory
+			for i := 0; i < erasure_coding.TotalShardsCount; i++ {
+				shardFile := dataBaseFileName + erasure_coding.ToExt(i)
+				if util.FileExists(shardFile) {
+					t.Errorf("Shard file %d should be removed but still exists", i)
+				}
+			}
+
+			// Verify .ecx file is removed from idx directory
+			if util.FileExists(idxBaseFileName + ".ecx") {
+				t.Errorf(".ecx file should be removed but still exists")
+			}
+
+			// Verify .ecj file is removed from idx directory
+			if util.FileExists(idxBaseFileName + ".ecj") {
+				t.Errorf(".ecj file should be removed but still exists")
+			}
+
+			// Verify .dat file is NOT removed from data directory
+			if !util.FileExists(dataBaseFileName + ".dat") {
+				t.Errorf(".dat file should NOT be removed but was deleted")
+			}
+		})
+	}
+}
+
+// TestEcCleanupWithSeparateIdxDirectory tests EC cleanup when idx directory is different
+func TestEcCleanupWithSeparateIdxDirectory(t *testing.T) {
+	tempDir := t.TempDir()
+
+	idxDir := filepath.Join(tempDir, "idx")
+	dataDir := filepath.Join(tempDir, "data")
+	os.MkdirAll(idxDir, 0755)
+	os.MkdirAll(dataDir, 0755)
+
+	minFreeSpace := util.MinFreeSpace{Type: util.AsPercent, Percent: 1, Raw: "1"}
+	diskLocation := &DiskLocation{
+		Directory:     dataDir,
+		DirectoryUuid: "test-uuid",
+		IdxDirectory:  idxDir,
+		DiskType:      types.HddType,
+		MinFreeSpace:  minFreeSpace,
+	}
+	diskLocation.volumes = make(map[needle.VolumeId]*Volume)
+	diskLocation.ecVolumes = make(map[needle.VolumeId]*erasure_coding.EcVolume)
+
+	volumeId := needle.VolumeId(400)
+	collection := ""
+
+	// Create shards in data directory (shards only go to Directory, not IdxDirectory)
+	dataBaseFileName := erasure_coding.EcShardFileName(collection, dataDir, int(volumeId))
+	for i := 0; i < erasure_coding.TotalShardsCount; i++ {
+		shardFile, err := os.Create(dataBaseFileName + erasure_coding.ToExt(i))
+		if err != nil {
+			t.Fatalf("Failed to create shard file: %v", err)
+		}
+		if _, err := shardFile.WriteString("dummy shard data"); err != nil {
+			t.Fatalf("Failed to write shard file: %v", err)
+		}
+		if err := shardFile.Close(); err != nil {
+			t.Fatalf("Failed to close shard file: %v", err)
+		}
+	}
+
+	// Create .dat in data directory
+	datFile, err := os.Create(dataBaseFileName + ".dat")
+	if err != nil {
+		t.Fatalf("Failed to create .dat file: %v", err)
+	}
+	if _, err := datFile.WriteString("dummy data"); err != nil {
+		t.Fatalf("Failed to write .dat file: %v", err)
+	}
+	if err := datFile.Close(); err != nil {
+		t.Fatalf("Failed to close .dat file: %v", err)
+	}
+
+	// Do not create .ecx: trigger orphaned-shards cleanup when .dat exists
+
+	// Run loadAllEcShards
+	loadErr := diskLocation.loadAllEcShards(nil)
+	if loadErr != nil {
+		t.Logf("loadAllEcShards error: %v", loadErr)
+	}
+	t.Cleanup(func() {
+		closeEcVolumes(diskLocation)
+	})
+
+	// Verify cleanup occurred in data directory (shards)
+	for i := 0; i < erasure_coding.TotalShardsCount; i++ {
+		shardFile := dataBaseFileName + erasure_coding.ToExt(i)
+		if util.FileExists(shardFile) {
+			t.Errorf("Shard file %d should be cleaned up but still exists", i)
+		}
+	}
+
+	// Verify .dat in data directory still exists (only EC files are cleaned up)
+	if !util.FileExists(dataBaseFileName + ".dat") {
+		t.Errorf(".dat file should remain but was deleted")
+	}
+}
+
+// TestDistributedEcVolumeNoFileDeletion verifies that distributed EC volumes
+// (where .dat is deleted) do NOT have their shard files deleted when load fails
+// This tests the critical bug fix where DestroyEcVolume was incorrectly deleting files
+func TestDistributedEcVolumeNoFileDeletion(t *testing.T) {
+	tempDir := t.TempDir()
+
+	minFreeSpace := util.MinFreeSpace{Type: util.AsPercent, Percent: 1, Raw: "1"}
+	diskLocation := &DiskLocation{
+		Directory:     tempDir,
+		DirectoryUuid: "test-uuid",
+		IdxDirectory:  tempDir,
+		DiskType:      types.HddType,
+		MinFreeSpace:  minFreeSpace,
+		ecVolumes:     make(map[needle.VolumeId]*erasure_coding.EcVolume),
+	}
+
+	collection := ""
+	volumeId := needle.VolumeId(500)
+	baseFileName := erasure_coding.EcShardFileName(collection, tempDir, int(volumeId))
+
+	// Create EC shards (only 5 shards - less than DataShardsCount, but OK for distributed EC)
+	numDistributedShards := 5
+	for i := 0; i < numDistributedShards; i++ {
+		shardFile, err := os.Create(baseFileName + erasure_coding.ToExt(i))
+		if err != nil {
+			t.Fatalf("Failed to create shard file: %v", err)
+		}
+		if _, err := shardFile.WriteString("dummy shard data"); err != nil {
+			shardFile.Close()
+			t.Fatalf("Failed to write shard file: %v", err)
+		}
+		if err := shardFile.Close(); err != nil {
+			t.Fatalf("Failed to close shard file: %v", err)
+		}
+	}
+
+	// Create .ecx file to trigger EC loading
+	ecxFile, err := os.Create(baseFileName + ".ecx")
+	if err != nil {
+		t.Fatalf("Failed to create .ecx file: %v", err)
+	}
+	if _, err := ecxFile.WriteString("dummy ecx data"); err != nil {
+		ecxFile.Close()
+		t.Fatalf("Failed to write .ecx file: %v", err)
+	}
+	if err := ecxFile.Close(); err != nil {
+		t.Fatalf("Failed to close .ecx file: %v", err)
+	}
+
+	// NO .dat file - this is a distributed EC volume
+
+	// Run loadAllEcShards - this should fail but NOT delete shard files
+	loadErr := diskLocation.loadAllEcShards(nil)
+	if loadErr != nil {
+		t.Logf("loadAllEcShards returned error (expected): %v", loadErr)
+	}
+	t.Cleanup(func() {
+		closeEcVolumes(diskLocation)
+	})
+
+	// CRITICAL CHECK: Verify shard files still exist (should NOT be deleted)
+	for i := 0; i < 5; i++ {
+		shardFile := baseFileName + erasure_coding.ToExt(i)
+		if !util.FileExists(shardFile) {
+			t.Errorf("CRITICAL BUG: Shard file %s was deleted for distributed EC volume!", shardFile)
+		}
+	}
+
+	// Verify .ecx file still exists (should NOT be deleted for distributed EC)
+	if !util.FileExists(baseFileName + ".ecx") {
+		t.Errorf("CRITICAL BUG: .ecx file was deleted for distributed EC volume!")
+	}
+
+	t.Logf("SUCCESS: Distributed EC volume files preserved (not deleted)")
+}
+
+// TestLoadExistingVolumeSkipsVifWhenEcxPresent pins the skip behavior on
+// the LoadVolume / MountVolume path (skipIfEcVolumesExists=false) for the
+// .vif + .ecx disk layout without .dat. Two variants cover both
+// IdxDirectory==Directory and the split-idx-dir fallback.
+func TestLoadExistingVolumeSkipsVifWhenEcxPresent(t *testing.T) {
+	const vid needle.VolumeId = 42
+
+	cases := []struct {
+		name      string
+		splitDirs bool
+	}{
+		{name: "same-idx-dir", splitDirs: false},
+		{name: "split-idx-dir", splitDirs: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			idxDir := dataDir
+			if tc.splitDirs {
+				idxDir = t.TempDir()
+			}
+
+			minFreeSpace := util.MinFreeSpace{Type: util.AsPercent, Percent: 1, Raw: "1"}
+			diskLocation := &DiskLocation{
+				Directory:              dataDir,
+				DirectoryUuid:          "test-uuid",
+				IdxDirectory:           idxDir,
+				DiskType:               types.HddType,
+				MaxVolumeCount:         100,
+				OriginalMaxVolumeCount: 100,
+				MinFreeSpace:           minFreeSpace,
+			}
+			diskLocation.volumes = make(map[needle.VolumeId]*Volume)
+			diskLocation.ecVolumes = make(map[needle.VolumeId]*erasure_coding.EcVolume)
+
+			vifPath := erasure_coding.EcShardFileName("", dataDir, int(vid)) + ".vif"
+			ecxPath := erasure_coding.EcShardFileName("", idxDir, int(vid)) + ".ecx"
+			if err := os.WriteFile(vifPath, []byte{}, 0644); err != nil {
+				t.Fatalf("write .vif: %v", err)
+			}
+			if err := os.WriteFile(ecxPath, []byte{}, 0644); err != nil {
+				t.Fatalf("write .ecx: %v", err)
+			}
+
+			loaded := diskLocation.loadExistingVolume(filepath.Base(vifPath), NeedleMapInMemory, false, 0, 0)
+			if loaded {
+				t.Fatalf("loadExistingVolume should refuse to load a .vif-only entry when .ecx is present (volume %d)", vid)
+			}
+			if _, exists := diskLocation.volumes[vid]; exists {
+				t.Fatalf("volume %d should not be registered in l.volumes (would create phantom regular volume)", vid)
+			}
+			datPath := erasure_coding.EcShardFileName("", dataDir, int(vid)) + ".dat"
+			if util.FileExists(datPath) {
+				t.Fatalf("guard must not create a placeholder .dat for volume %d", vid)
+			}
+		})
+	}
+}
+
+// TestLoadAllEcShardsDeletesStaleZeroSizedShards: zero-sized shard files that
+// are old enough to be failed-operation residue (issue 10730) are deleted by
+// the scan; a fresh zero-sized file (possibly an in-flight copy's just-created
+// file) is left alone.
+func TestLoadAllEcShardsDeletesStaleZeroSizedShards(t *testing.T) {
+	dir := t.TempDir()
+	diskLocation := NewDiskLocation(dir, 10, util.MinFreeSpace{}, dir, types.HardDriveType, nil, stats.DefaultDiskIOProbeConfig())
+
+	stale := filepath.Join(dir, "123.ec00")
+	fresh := filepath.Join(dir, "123.ec01")
+	for _, p := range []string{stale, fresh} {
+		if f, err := os.Create(p); err != nil {
+			t.Fatalf("create %s: %v", p, err)
+		} else {
+			f.Close()
+		}
+	}
+	oldTime := time.Now().Add(-2 * staleZeroShardAge)
+	if err := os.Chtimes(stale, oldTime, oldTime); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	if err := diskLocation.loadAllEcShards(nil); err != nil {
+		t.Fatalf("loadAllEcShards: %v", err)
+	}
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale zero-sized shard %s not deleted (err=%v)", stale, err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("fresh zero-sized shard %s must survive the scan: %v", fresh, err)
+	}
+}
+
+// TestLoadEcShardRefusesEmptyShardFile: the startup scan skips 0-byte shard
+// files, but the mount RPC path (MountEcShards -> LoadEcShard) opens the file
+// directly. A 0-byte shard beside an index WITH entries is residue of a
+// failed copy — registering it would advertise a size-0 claim that serves
+// nothing and, with placement pinned to the owning disk, would keep
+// attracting re-copies to a file that was never valid. AddEcVolumeShard must
+// refuse it and the loader must leave nothing registered. (A 0-byte shard
+// beside a 0-byte index is the legitimate empty-volume layout and keeps
+// mounting — TestMountEcShards_EmptyEcxMountsSuccessfully.)
+func TestLoadEcShardRefusesEmptyShardFile(t *testing.T) {
+	dir := t.TempDir()
+	diskLocation := NewDiskLocation(dir, 10, util.MinFreeSpace{}, dir, types.HardDriveType, nil, stats.DefaultDiskIOProbeConfig())
+	defer diskLocation.Close() // also stops NewDiskLocation's background goroutine
+
+	// A usable .ecx sits alongside, so without the size gate the load would
+	// succeed and register the empty shard — the .ecx must not mask the gate.
+	empty := filepath.Join(dir, "123.ec00")
+	if f, err := os.Create(empty); err != nil {
+		t.Fatalf("create %s: %v", empty, err)
+	} else {
+		f.Close()
+	}
+	if err := os.WriteFile(filepath.Join(dir, "123.ecx"), make([]byte, 16), 0o644); err != nil {
+		t.Fatalf("seed .ecx: %v", err)
+	}
+
+	_, err := diskLocation.LoadEcShard("", needle.VolumeId(123), erasure_coding.ShardId(0))
+	if err == nil {
+		t.Fatalf("loading a 0-byte shard file must fail")
+	}
+	if !strings.Contains(err.Error(), "empty (0 bytes)") {
+		t.Fatalf("a 0-byte shard should be refused as empty, got: %v", err)
+	}
+	if _, found := diskLocation.FindEcShard(needle.VolumeId(123), erasure_coding.ShardId(0)); found {
+		t.Errorf("a 0-byte shard file must not register a shard claim")
+	}
+	if _, found := diskLocation.FindEcVolume(needle.VolumeId(123)); found {
+		t.Errorf("a refused shard load must not leave an empty EcVolume registered")
+	}
+}
+
+// TestLoadEcShardDuplicateReleasesTheNewShard: a mount retry re-loads a shard
+// this disk already registered. AddEcVolumeShard keeps the existing shard and
+// reports added=false — the loader must then release the duplicate it just
+// opened (fd + mount gauge), or every retry leaks both.
+func TestLoadEcShardDuplicateReleasesTheNewShard(t *testing.T) {
+	dir := t.TempDir()
+	diskLocation := NewDiskLocation(dir, 10, util.MinFreeSpace{}, dir, types.HardDriveType, nil, stats.DefaultDiskIOProbeConfig())
+	defer diskLocation.Close() // also stops NewDiskLocation's background goroutine
+
+	if err := os.WriteFile(filepath.Join(dir, "124.ec00"), []byte("shard bytes"), 0o644); err != nil {
+		t.Fatalf("seed .ec00: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "124.ecx"), make([]byte, 16), 0o644); err != nil {
+		t.Fatalf("seed .ecx: %v", err)
+	}
+
+	gauge := stats.VolumeServerVolumeGauge.WithLabelValues("", "ec_shards")
+	before := testutil.ToFloat64(gauge)
+
+	if _, err := diskLocation.LoadEcShard("", needle.VolumeId(124), erasure_coding.ShardId(0)); err != nil {
+		t.Fatalf("first LoadEcShard: %v", err)
+	}
+	ecVolume, err := diskLocation.LoadEcShard("", needle.VolumeId(124), erasure_coding.ShardId(0))
+	if err != nil {
+		t.Fatalf("duplicate LoadEcShard must succeed as a no-op: %v", err)
+	}
+	if len(ecVolume.Shards) != 1 {
+		t.Errorf("duplicate load registered %d shards; want 1", len(ecVolume.Shards))
+	}
+	if after := testutil.ToFloat64(gauge); after != before+1 {
+		t.Errorf("mount gauge at %v after a duplicate load; want %v (the duplicate's Mount must be released)", after, before+1)
+	}
+}
+
+// TestLoadEcShardWaitsForPendingDestroy: DestroyEcVolume deletes the map entry
+// and destroys files outside ecVolumesLock, so a remount could otherwise open
+// shard files mid-unlink. The ecVolumesDestroying tombstone must hold the mount
+// until the destroy closes it, and the mount must then proceed and clear it.
+func TestLoadEcShardWaitsForPendingDestroy(t *testing.T) {
+	dir := t.TempDir()
+	diskLocation := NewDiskLocation(dir, 10, util.MinFreeSpace{}, dir, types.HardDriveType, nil, stats.DefaultDiskIOProbeConfig())
+	defer diskLocation.Close()
+
+	if err := os.WriteFile(filepath.Join(dir, "125.ec00"), []byte("shard bytes"), 0o644); err != nil {
+		t.Fatalf("seed .ec00: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "125.ecx"), make([]byte, 16), 0o644); err != nil {
+		t.Fatalf("seed .ecx: %v", err)
+	}
+
+	done := make(chan struct{})
+	diskLocation.ecVolumesLock.Lock()
+	diskLocation.ecVolumesDestroying[needle.VolumeId(125)] = done
+	diskLocation.ecVolumesLock.Unlock()
+
+	mounted := make(chan error, 1)
+	go func() {
+		_, err := diskLocation.LoadEcShard("", needle.VolumeId(125), erasure_coding.ShardId(0))
+		mounted <- err
+	}()
+
+	select {
+	case <-mounted:
+		t.Fatal("LoadEcShard returned while a destroy generation was still in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(done)
+	select {
+	case err := <-mounted:
+		if err != nil {
+			t.Fatalf("LoadEcShard after destroy completion: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("LoadEcShard did not proceed after the destroy finished")
+	}
+
+	if _, found := diskLocation.FindEcShard(needle.VolumeId(125), erasure_coding.ShardId(0)); !found {
+		t.Fatal("shard must be registered once the pending destroy is over")
+	}
+	diskLocation.ecVolumesLock.RLock()
+	_, tombstoneLeft := diskLocation.ecVolumesDestroying[needle.VolumeId(125)]
+	diskLocation.ecVolumesLock.RUnlock()
+	if tombstoneLeft {
+		t.Error("a successful remount must clear the vid's destroy tombstone")
+	}
+}
+
+// TestDestroyEcVolumeClosesTombstone: once DestroyEcVolume returns, the
+// tombstone is closed so waits unblock, and a fresh remount re-opens the
+// regenerated files rather than anything the destroy unlinked.
+func TestDestroyEcVolumeClosesTombstone(t *testing.T) {
+	dir := t.TempDir()
+	diskLocation := NewDiskLocation(dir, 10, util.MinFreeSpace{}, dir, types.HardDriveType, nil, stats.DefaultDiskIOProbeConfig())
+	defer diskLocation.Close()
+
+	seedShard := func() {
+		if err := os.WriteFile(filepath.Join(dir, "126.ec00"), []byte("shard bytes"), 0o644); err != nil {
+			t.Fatalf("seed .ec00: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "126.ecx"), make([]byte, 16), 0o644); err != nil {
+			t.Fatalf("seed .ecx: %v", err)
+		}
+	}
+	seedShard()
+
+	if _, err := diskLocation.LoadEcShard("", needle.VolumeId(126), erasure_coding.ShardId(0)); err != nil {
+		t.Fatalf("initial LoadEcShard: %v", err)
+	}
+	diskLocation.DestroyEcVolume(needle.VolumeId(126))
+
+	if _, found := diskLocation.FindEcVolume(needle.VolumeId(126)); found {
+		t.Fatal("destroyed volume must not stay in ecVolumes")
+	}
+	diskLocation.ecVolumesLock.RLock()
+	done, ok := diskLocation.ecVolumesDestroying[needle.VolumeId(126)]
+	diskLocation.ecVolumesLock.RUnlock()
+	if !ok {
+		t.Fatal("destroy must leave a tombstone behind for remounts to compare against")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tombstone must be closed once DestroyEcVolume returns")
+	}
+	if util.FileExists(filepath.Join(dir, "126.ec00")) {
+		t.Fatal("destroy must have removed the shard file")
+	}
+
+	seedShard()
+	if _, err := diskLocation.LoadEcShard("", needle.VolumeId(126), erasure_coding.ShardId(0)); err != nil {
+		t.Fatalf("remount after destroy: %v", err)
+	}
+	diskLocation.ecVolumesLock.RLock()
+	_, tombstoneLeft := diskLocation.ecVolumesDestroying[needle.VolumeId(126)]
+	diskLocation.ecVolumesLock.RUnlock()
+	if tombstoneLeft {
+		t.Error("remount must clear the stale destroy tombstone")
+	}
+}
+
+// TestLoadAllEcShardsSplitDirZeroSizedCleanup: the scan merges Directory and
+// IdxDirectory listings, so a stale zero-sized file in one directory and a
+// fresh same-named file in the other are different files behind one entry
+// name. Each candidate's own age must decide: the stale one is deleted, the
+// fresh one (possibly an in-flight copy's just-created file) survives.
+func TestLoadAllEcShardsSplitDirZeroSizedCleanup(t *testing.T) {
+	dataDir := t.TempDir()
+	idxDir := t.TempDir()
+	diskLocation := NewDiskLocation(dataDir, 10, util.MinFreeSpace{}, idxDir, types.HardDriveType, nil, stats.DefaultDiskIOProbeConfig())
+
+	fresh := filepath.Join(dataDir, "124.ec00")
+	stale := filepath.Join(idxDir, "124.ec00")
+	for _, p := range []string{fresh, stale} {
+		if f, err := os.Create(p); err != nil {
+			t.Fatalf("create %s: %v", p, err)
+		} else {
+			f.Close()
+		}
+	}
+	oldTime := time.Now().Add(-2 * staleZeroShardAge)
+	if err := os.Chtimes(stale, oldTime, oldTime); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	if err := diskLocation.loadAllEcShards(nil); err != nil {
+		t.Fatalf("loadAllEcShards: %v", err)
+	}
+
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("fresh zero-sized shard %s must survive the scan: %v", fresh, err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale zero-sized shard %s not deleted (err=%v)", stale, err)
+	}
+}

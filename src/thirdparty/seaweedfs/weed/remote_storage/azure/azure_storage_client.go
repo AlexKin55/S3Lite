@@ -1,0 +1,651 @@
+package azure
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"os"
+	"reflect"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
+	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+)
+
+const (
+	defaultBlockSize       = 4 * 1024 * 1024
+	defaultConcurrency     = 16
+	defaultReadConcurrency = 16
+
+	// DefaultAzureOpTimeout is the timeout for short metadata operations
+	// (GetProperties, Delete, conditional updates, etc.). Blob body transfers
+	// (ReadFile / WriteFile) are NOT bounded by this timeout: they use
+	// parallel 4 MiB block transfers and rely on the SDK's per-try TryTimeout
+	// to bound each individual block.
+	DefaultAzureOpTimeout = 60 * time.Second
+)
+
+// DefaultAzBlobClientOptions returns the default Azure blob client options
+// with consistent retry configuration across the application.
+// This centralizes the retry policy to ensure uniform behavior between
+// remote storage and replication sink implementations.
+//
+// TryTimeout bounds a single HTTP attempt (headers + body) in the Azure SDK.
+// With parallel 4 MiB block transfers (DownloadBuffer / UploadStream) a 60s
+// TryTimeout is comfortable. A previous regression set this to 10s "to fail
+// faster on auth issues" — that silently broke large-blob reads: a single
+// non-parallelized Download of more than ~40 MiB over a typical WAN link
+// cannot finish in 10s, so re-caching a large remote object (e.g. a 2 GB
+// blob mounted via `remote.mount` and fetched through the S3 gateway) failed
+// every attempt with a generic context-deadline error.
+func DefaultAzBlobClientOptions() *azblob.ClientOptions {
+	return &azblob.ClientOptions{
+		ClientOptions: azcore.ClientOptions{
+			Retry: policy.RetryOptions{
+				MaxRetries:    3,
+				TryTimeout:    60 * time.Second,
+				RetryDelay:    1 * time.Second,
+				MaxRetryDelay: 10 * time.Second,
+			},
+		},
+	}
+}
+
+// invalidMetadataChars matches any character that is not valid in Azure metadata keys.
+// Azure metadata keys must be valid C# identifiers: letters, digits, and underscores only.
+var invalidMetadataChars = regexp.MustCompile(`[^a-zA-Z0-9_]`)
+
+// sanitizeMetadataKey converts an S3 metadata key to a valid Azure metadata key.
+// Azure metadata keys must be valid C# identifiers (letters, digits, underscores only, cannot start with digit).
+// To prevent collisions, invalid characters are replaced with their hex representation (_XX_).
+// Examples:
+//   - "my-key" -> "my_2d_key"
+//   - "my.key" -> "my_2e_key"
+//   - "key@value" -> "key_40_value"
+func sanitizeMetadataKey(key string) string {
+	// Replace each invalid character with _XX_ where XX is the hex code
+	result := invalidMetadataChars.ReplaceAllStringFunc(key, func(s string) string {
+		return fmt.Sprintf("_%02x_", s[0])
+	})
+
+	// Azure metadata keys cannot start with a digit
+	if len(result) > 0 && result[0] >= '0' && result[0] <= '9' {
+		result = "_" + result
+	}
+
+	return result
+}
+
+func init() {
+	remote_storage.RemoteStorageClientMakers["azure"] = new(azureRemoteStorageMaker)
+}
+
+// resolveAzureAccount completes the configured account from the environment. A
+// configured client id asks for Entra ID, so a key left over in the environment
+// must not quietly take the request back to shared key auth.
+func resolveAzureAccount(conf *remote_pb.RemoteConf) (accountName, accountKey string) {
+	accountName, accountKey = conf.AzureAccountName, conf.AzureAccountKey
+	if len(accountName) == 0 {
+		accountName = os.Getenv("AZURE_STORAGE_ACCOUNT")
+	}
+	if len(accountKey) == 0 && len(conf.AzureClientId) == 0 {
+		accountKey = os.Getenv("AZURE_STORAGE_ACCESS_KEY")
+	}
+	return
+}
+
+type azureRemoteStorageMaker struct{}
+
+func (s azureRemoteStorageMaker) HasBucket() bool {
+	return true
+}
+
+func (s azureRemoteStorageMaker) Make(conf *remote_pb.RemoteConf) (remote_storage.RemoteStorageClient, error) {
+	return MakeWithHTTPClient(conf, nil)
+}
+
+// MakeWithHTTPClient builds an azure client using the supplied *http.Client for
+// its transport (or the SDK default when nil). Callers that need to pin the dial
+// path against DNS rebinding pass a client whose transport has a guarded
+// DialContext, mirroring the S3 backend.
+func MakeWithHTTPClient(conf *remote_pb.RemoteConf, httpClient *http.Client) (remote_storage.RemoteStorageClient, error) {
+
+	client := &azureRemoteStorageClient{
+		conf: conf,
+	}
+
+	accountName, accountKey := resolveAzureAccount(conf)
+	if len(accountName) == 0 {
+		return nil, fmt.Errorf("neither azure_account_name nor the AZURE_STORAGE_ACCOUNT environment variable is set")
+	}
+
+	azClient, err := NewAzBlobClient(accountName, accountKey, conf.AzureClientId, conf.AzureEndpoint, httpClient)
+	if err != nil {
+		return nil, err
+	}
+
+	client.client = azClient
+
+	return client, nil
+}
+
+type azureRemoteStorageClient struct {
+	conf   *remote_pb.RemoteConf
+	client *azblob.Client
+}
+
+var _ = remote_storage.RemoteStorageClient(&azureRemoteStorageClient{})
+var _ = remote_storage.RemoteStorageConcurrentReader(&azureRemoteStorageClient{})
+
+func (az *azureRemoteStorageClient) uploadConcurrency() int {
+	if n := int(az.conf.GetUploadConcurrency()); n > 0 {
+		return n
+	}
+	return defaultConcurrency
+}
+
+func (az *azureRemoteStorageClient) downloadConcurrency() int {
+	if n := int(az.conf.GetDownloadConcurrency()); n > 0 {
+		return n
+	}
+	return defaultReadConcurrency
+}
+
+func (az *azureRemoteStorageClient) ListDirectory(ctx context.Context, loc *remote_pb.RemoteStorageLocation, visitFn remote_storage.VisitFunc) (err error) {
+	pathKey := loc.Path[1:]
+	if pathKey != "" && !strings.HasSuffix(pathKey, "/") {
+		pathKey += "/"
+	}
+
+	containerClient := az.client.ServiceClient().NewContainerClient(loc.Bucket)
+	pager := containerClient.NewListBlobsHierarchyPager("/", &container.ListBlobsHierarchyOptions{
+		Prefix: &pathKey,
+	})
+
+	for pager.More() {
+		resp, pageErr := pager.NextPage(ctx)
+		if pageErr != nil {
+			return fmt.Errorf("azure list directory %s%s: %w", loc.Bucket, loc.Path, pageErr)
+		}
+
+		for _, prefix := range resp.Segment.BlobPrefixes {
+			if prefix.Name == nil {
+				continue
+			}
+			dirKey := "/" + strings.TrimSuffix(*prefix.Name, "/")
+			dir, name := util.FullPath(dirKey).DirAndName()
+			if err = visitFn(dir, name, true, nil); err != nil {
+				return fmt.Errorf("azure processing directory prefix %s: %w", *prefix.Name, err)
+			}
+		}
+
+		for _, blobItem := range resp.Segment.BlobItems {
+			if blobItem.Name == nil {
+				continue
+			}
+			key := "/" + *blobItem.Name
+			if strings.HasSuffix(key, "/") {
+				continue // skip directory markers
+			}
+			dir, name := util.FullPath(key).DirAndName()
+
+			remoteEntry := &filer_pb.RemoteEntry{
+				StorageName: az.conf.Name,
+			}
+			if blobItem.Properties != nil {
+				if blobItem.Properties.LastModified != nil {
+					remoteEntry.RemoteMtime = blobItem.Properties.LastModified.Unix()
+				}
+				if blobItem.Properties.ContentLength != nil {
+					remoteEntry.RemoteSize = *blobItem.Properties.ContentLength
+				}
+				if blobItem.Properties.ETag != nil {
+					remoteEntry.RemoteETag = string(*blobItem.Properties.ETag)
+				}
+				remoteEntry.RemoteContentEncoding = remoteContentEncoding(blobItem.Properties.ContentEncoding)
+			}
+
+			if err = visitFn(dir, name, false, remoteEntry); err != nil {
+				return fmt.Errorf("azure processing blob %s: %w", *blobItem.Name, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (az *azureRemoteStorageClient) StatFile(loc *remote_pb.RemoteStorageLocation) (remoteEntry *filer_pb.RemoteEntry, err error) {
+	key := loc.Path[1:]
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultAzureOpTimeout)
+	defer cancel()
+	resp, err := az.client.ServiceClient().NewContainerClient(loc.Bucket).NewBlobClient(key).GetProperties(ctx, nil)
+	if err != nil {
+		if bloberror.HasCode(err, bloberror.BlobNotFound) {
+			return nil, remote_storage.ErrRemoteObjectNotFound
+		}
+		return nil, fmt.Errorf("stat azure %s%s: %w", loc.Bucket, loc.Path, err)
+	}
+	remoteEntry = &filer_pb.RemoteEntry{
+		StorageName: az.conf.Name,
+	}
+	if resp.ContentLength != nil {
+		remoteEntry.RemoteSize = *resp.ContentLength
+	}
+	if resp.LastModified != nil {
+		remoteEntry.RemoteMtime = resp.LastModified.Unix()
+	}
+	if resp.ETag != nil {
+		remoteEntry.RemoteETag = string(*resp.ETag)
+	}
+	remoteEntry.RemoteContentEncoding = remoteContentEncoding(resp.ContentEncoding)
+	return remoteEntry, nil
+}
+
+// blob properties report no Content-Encoding as nil; the remote entry records
+// that authoritatively as empty
+func remoteContentEncoding(encoding *string) *string {
+	if encoding == nil {
+		empty := ""
+		return &empty
+	}
+	return encoding
+}
+
+func (az *azureRemoteStorageClient) Traverse(loc *remote_pb.RemoteStorageLocation, visitFn remote_storage.VisitFunc) (err error) {
+
+	pathKey := loc.Path[1:]
+	containerClient := az.client.ServiceClient().NewContainerClient(loc.Bucket)
+
+	// List blobs with pager
+	pager := containerClient.NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
+		Prefix: &pathKey,
+	})
+
+	for pager.More() {
+		resp, err := pager.NextPage(context.Background())
+		if err != nil {
+			return fmt.Errorf("azure traverse %s%s: %w", loc.Bucket, loc.Path, err)
+		}
+
+		for _, blobItem := range resp.Segment.BlobItems {
+			if blobItem.Name == nil {
+				continue
+			}
+			key := "/" + *blobItem.Name
+			dir, name := util.FullPath(key).DirAndName()
+
+			remoteEntry := &filer_pb.RemoteEntry{
+				StorageName: az.conf.Name,
+			}
+			if blobItem.Properties != nil {
+				if blobItem.Properties.LastModified != nil {
+					remoteEntry.RemoteMtime = blobItem.Properties.LastModified.Unix()
+				}
+				if blobItem.Properties.ContentLength != nil {
+					remoteEntry.RemoteSize = *blobItem.Properties.ContentLength
+				}
+				if blobItem.Properties.ETag != nil {
+					remoteEntry.RemoteETag = string(*blobItem.Properties.ETag)
+				}
+				remoteEntry.RemoteContentEncoding = remoteContentEncoding(blobItem.Properties.ContentEncoding)
+			}
+
+			err = visitFn(dir, name, false, remoteEntry)
+			if err != nil {
+				return fmt.Errorf("azure processing %s%s: %w", loc.Bucket, loc.Path, err)
+			}
+		}
+	}
+
+	return
+}
+
+func (az *azureRemoteStorageClient) ReadFile(loc *remote_pb.RemoteStorageLocation, offset int64, size int64) (data []byte, err error) {
+	return az.ReadFileWithConcurrency(loc, offset, size, 0)
+}
+
+// ReadFileWithConcurrency fetches a byte range of a blob using the Azure SDK's
+// parallel block downloader. The blob is split into `defaultBlockSize` (4 MiB)
+// blocks that are fetched in parallel up to `concurrency` at a time. This
+// keeps each individual HTTP GET small enough to complete well within the
+// SDK's per-try TryTimeout, so large-blob reads remain reliable even on
+// slower WAN links.
+func (az *azureRemoteStorageClient) ReadFileWithConcurrency(loc *remote_pb.RemoteStorageLocation, offset int64, size int64, concurrency int) (data []byte, err error) {
+
+	if offset < 0 {
+		return nil, fmt.Errorf("invalid offset %d for %s%s", offset, loc.Bucket, loc.Path)
+	}
+	if size < 0 {
+		return nil, fmt.Errorf("invalid size %d for %s%s", size, loc.Bucket, loc.Path)
+	}
+
+	if concurrency <= 0 {
+		concurrency = az.downloadConcurrency()
+	}
+	if concurrency > math.MaxUint16 {
+		concurrency = math.MaxUint16
+	}
+
+	key := loc.Path[1:]
+	blobClient := az.client.ServiceClient().NewContainerClient(loc.Bucket).NewBlockBlobClient(key)
+
+	// DownloadBuffer requires a pre-sized destination. If the caller asked for
+	// "read to end" (size == 0), discover the blob length via GetProperties
+	// first so we can allocate accurately.
+	if size == 0 {
+		propsCtx, cancelProps := context.WithTimeout(context.Background(), DefaultAzureOpTimeout)
+		props, propsErr := blobClient.GetProperties(propsCtx, nil)
+		cancelProps()
+		if propsErr != nil {
+			if bloberror.HasCode(propsErr, bloberror.BlobNotFound) {
+				return nil, remote_storage.ErrRemoteObjectNotFound
+			}
+			return nil, fmt.Errorf("get properties %s%s: %w", loc.Bucket, loc.Path, propsErr)
+		}
+		if props.ContentLength == nil {
+			return nil, fmt.Errorf("azure %s%s: missing ContentLength", loc.Bucket, loc.Path)
+		}
+		size = *props.ContentLength - offset
+		if size <= 0 {
+			return []byte{}, nil
+		}
+	}
+
+	data = make([]byte, size)
+	n, err := blobClient.DownloadBuffer(context.Background(), data, &blob.DownloadBufferOptions{
+		Range: blob.HTTPRange{
+			Offset: offset,
+			Count:  size,
+		},
+		BlockSize:   defaultBlockSize,
+		Concurrency: uint16(concurrency),
+	})
+	if err != nil {
+		if bloberror.HasCode(err, bloberror.BlobNotFound) {
+			return nil, remote_storage.ErrRemoteObjectNotFound
+		}
+		return nil, fmt.Errorf("failed to download file %s%s: %w", loc.Bucket, loc.Path, err)
+	}
+	// Pre-sized buffer: a short read stays zero-padded. Reject it rather than
+	// cache corrupt content.
+	if n != size {
+		return nil, fmt.Errorf("short read from %s%s at offset %d: got %d bytes, want %d", loc.Bucket, loc.Path, offset, n, size)
+	}
+
+	return data, nil
+}
+
+func (az *azureRemoteStorageClient) ReadFileAsStream(ctx context.Context, loc *remote_pb.RemoteStorageLocation, offset int64, size int64) (reader io.ReadCloser, err error) {
+	key := loc.Path[1:]
+	blobClient := az.client.ServiceClient().NewContainerClient(loc.Bucket).NewBlockBlobClient(key)
+
+	downloadResponse, err := blobClient.DownloadStream(ctx, &blob.DownloadStreamOptions{
+		Range: blob.HTTPRange{
+			Offset: offset,
+			Count:  size,
+		},
+	})
+	if err != nil {
+		if bloberror.HasCode(err, bloberror.BlobNotFound) {
+			return nil, remote_storage.ErrRemoteObjectNotFound
+		}
+		return nil, fmt.Errorf("failed to open stream for %s%s: %v", loc.Bucket, loc.Path, err)
+	}
+	return downloadResponse.Body, nil
+}
+
+func (az *azureRemoteStorageClient) WriteDirectory(loc *remote_pb.RemoteStorageLocation, entry *filer_pb.Entry) (err error) {
+	return nil
+}
+
+func (az *azureRemoteStorageClient) RemoveDirectory(loc *remote_pb.RemoteStorageLocation) (err error) {
+	// the trailing slash keeps sibling prefixes that share the name intact
+	prefix := loc.Path[1:]
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	if prefix == "" {
+		// the mount root maps to the whole container; wiping every blob from a
+		// single namespace event is too destructive, so keep them
+		glog.Warningf("azure %s: skip removing directory mapped to the container root", loc.Bucket)
+		return nil
+	}
+
+	containerClient := az.client.ServiceClient().NewContainerClient(loc.Bucket)
+	pager := containerClient.NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
+		Prefix: &prefix,
+	})
+	for pager.More() {
+		resp, pageErr := pager.NextPage(context.Background())
+		if pageErr != nil {
+			return fmt.Errorf("azure list %s/%s: %w", loc.Bucket, prefix, pageErr)
+		}
+		for _, blobItem := range resp.Segment.BlobItems {
+			if blobItem.Name == nil {
+				continue
+			}
+			_, delErr := containerClient.NewBlobClient(*blobItem.Name).Delete(context.Background(), &blob.DeleteOptions{
+				DeleteSnapshots: to.Ptr(blob.DeleteSnapshotsOptionTypeInclude),
+			})
+			if delErr != nil && !bloberror.HasCode(delErr, bloberror.BlobNotFound) {
+				return fmt.Errorf("azure delete %s/%s: %w", loc.Bucket, *blobItem.Name, delErr)
+			}
+		}
+	}
+	return nil
+}
+
+func (az *azureRemoteStorageClient) WriteFile(loc *remote_pb.RemoteStorageLocation, entry *filer_pb.Entry, reader io.Reader) (remoteEntry *filer_pb.RemoteEntry, err error) {
+
+	key := loc.Path[1:]
+	blobClient := az.client.ServiceClient().NewContainerClient(loc.Bucket).NewBlockBlobClient(key)
+
+	// Upload from reader
+	metadata := toMetadata(entry.Extended)
+	httpHeaders := &blob.HTTPHeaders{}
+	if entry.Attributes != nil && entry.Attributes.Mime != "" {
+		httpHeaders.BlobContentType = &entry.Attributes.Mime
+	}
+	if contentEncoding := remote_storage.EntryContentEncoding(entry); contentEncoding != "" {
+		httpHeaders.BlobContentEncoding = &contentEncoding
+	}
+
+	_, err = blobClient.UploadStream(context.Background(), reader, &blockblob.UploadStreamOptions{
+		BlockSize:   defaultBlockSize,
+		Concurrency: az.uploadConcurrency(),
+		HTTPHeaders: httpHeaders,
+		Metadata:    metadata,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("azure upload to %s%s: %w", loc.Bucket, loc.Path, err)
+	}
+
+	// read back the remote entry
+	return az.readFileRemoteEntry(loc)
+}
+
+func (az *azureRemoteStorageClient) readFileRemoteEntry(loc *remote_pb.RemoteStorageLocation) (*filer_pb.RemoteEntry, error) {
+	return az.StatFile(loc)
+}
+
+func toMetadata(attributes map[string][]byte) map[string]*string {
+	metadata := make(map[string]*string)
+	for k, v := range attributes {
+		if strings.HasPrefix(k, s3_constants.AmzUserMetaPrefix) {
+			// S3 stores metadata keys in lowercase; normalize for consistency.
+			key := strings.ToLower(k[len(s3_constants.AmzUserMetaPrefix):])
+
+			// Sanitize key to prevent collisions and ensure Azure compliance
+			key = sanitizeMetadataKey(key)
+
+			val := string(v)
+			metadata[key] = &val
+		}
+	}
+	return metadata
+}
+
+func (az *azureRemoteStorageClient) UpdateFileMetadata(loc *remote_pb.RemoteStorageLocation, oldEntry *filer_pb.Entry, newEntry *filer_pb.Entry) (remoteEntry *filer_pb.RemoteEntry, err error) {
+	if reflect.DeepEqual(oldEntry.Extended, newEntry.Extended) {
+		return nil, nil
+	}
+	metadata := toMetadata(newEntry.Extended)
+
+	key := loc.Path[1:]
+	blobClient := az.client.ServiceClient().NewContainerClient(loc.Bucket).NewBlobClient(key)
+
+	updated := false
+	var writeETag *azcore.ETag
+	if !reflect.DeepEqual(toMetadata(oldEntry.Extended), metadata) {
+		metaResp, metaErr := blobClient.SetMetadata(context.Background(), metadata, nil)
+		if metaErr != nil {
+			return nil, metaErr
+		}
+		writeETag = metaResp.ETag
+		updated = true
+	}
+
+	if encoding := remote_storage.EntryContentEncoding(newEntry); encoding != remote_storage.EntryContentEncoding(oldEntry) {
+		// SetHTTPHeaders replaces the whole header set, so carry the rest over
+		props, getErr := blobClient.GetProperties(context.Background(), nil)
+		if getErr != nil {
+			return nil, fmt.Errorf("azure get properties %s%s: %w", loc.Bucket, loc.Path, getErr)
+		}
+		httpHeaders := blob.ParseHTTPHeaders(props)
+		httpHeaders.BlobContentEncoding = nil
+		if encoding != "" {
+			httpHeaders.BlobContentEncoding = &encoding
+		}
+		hdrResp, hdrErr := blobClient.SetHTTPHeaders(context.Background(), httpHeaders, nil)
+		if hdrErr != nil {
+			return nil, fmt.Errorf("azure set http headers %s%s: %w", loc.Bucket, loc.Path, hdrErr)
+		}
+		writeETag = hdrResp.ETag
+		updated = true
+	}
+	if !updated {
+		return nil, nil
+	}
+	remoteEntry, err = az.StatFile(loc)
+	if err == nil && writeETag != nil {
+		// the stat can describe a concurrent replacement; the write response
+		// names the object this update produced
+		remoteEntry.RemoteETag = string(*writeETag)
+	}
+	return remoteEntry, err
+}
+
+func (az *azureRemoteStorageClient) DeleteFile(loc *remote_pb.RemoteStorageLocation) (err error) {
+	key := loc.Path[1:]
+	blobClient := az.client.ServiceClient().NewContainerClient(loc.Bucket).NewBlobClient(key)
+
+	_, err = blobClient.Delete(context.Background(), &blob.DeleteOptions{
+		DeleteSnapshots: to.Ptr(blob.DeleteSnapshotsOptionTypeInclude),
+	})
+	if err != nil {
+		// Make delete idempotent - don't return error if blob doesn't exist
+		if bloberror.HasCode(err, bloberror.BlobNotFound) {
+			return nil
+		}
+		return fmt.Errorf("azure delete %s%s: %w", loc.Bucket, loc.Path, err)
+	}
+	return
+}
+
+// DeleteFileIfUnchanged deletes the blob only while it is still the one the
+// stat describes, enforced with an If-Match ETag precondition. A replacement
+// that lands between the stat and the delete fails the precondition instead
+// of being deleted.
+func (az *azureRemoteStorageClient) DeleteFileIfUnchanged(loc *remote_pb.RemoteStorageLocation, stamp *filer_pb.RemoteEntry) (bool, error) {
+	live, err := az.StatFile(loc)
+	if err != nil {
+		if errors.Is(err, remote_storage.ErrRemoteObjectNotFound) {
+			return true, nil
+		}
+		return false, err
+	}
+	if !remote_storage.StillCurrent(stamp, live) {
+		return false, nil
+	}
+	key := loc.Path[1:]
+	blobClient := az.client.ServiceClient().NewContainerClient(loc.Bucket).NewBlobClient(key)
+	options := &blob.DeleteOptions{
+		DeleteSnapshots: to.Ptr(blob.DeleteSnapshotsOptionTypeInclude),
+	}
+	if live.RemoteETag != "" {
+		options.AccessConditions = &blob.AccessConditions{
+			ModifiedAccessConditions: &blob.ModifiedAccessConditions{
+				IfMatch: to.Ptr(azcore.ETag(live.RemoteETag)),
+			},
+		}
+	}
+	if _, err := blobClient.Delete(context.Background(), options); err != nil {
+		if bloberror.HasCode(err, bloberror.BlobNotFound) {
+			return true, nil
+		}
+		if bloberror.HasCode(err, bloberror.ConditionNotMet) {
+			return false, nil
+		}
+		return false, fmt.Errorf("azure delete %s%s: %w", loc.Bucket, loc.Path, err)
+	}
+	return true, nil
+}
+
+func (az *azureRemoteStorageClient) ListBuckets() (buckets []*remote_storage.Bucket, err error) {
+	pager := az.client.NewListContainersPager(nil)
+
+	for pager.More() {
+		resp, err := pager.NextPage(context.Background())
+		if err != nil {
+			return buckets, err
+		}
+
+		for _, containerItem := range resp.ContainerItems {
+			if containerItem.Name != nil {
+				bucket := &remote_storage.Bucket{
+					Name: *containerItem.Name,
+				}
+				if containerItem.Properties != nil && containerItem.Properties.LastModified != nil {
+					bucket.CreatedAt = *containerItem.Properties.LastModified
+				}
+				buckets = append(buckets, bucket)
+			}
+		}
+	}
+	return
+}
+
+func (az *azureRemoteStorageClient) CreateBucket(name string) (err error) {
+	containerClient := az.client.ServiceClient().NewContainerClient(name)
+	_, err = containerClient.Create(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("create bucket %s: %w", name, err)
+	}
+	return
+}
+
+func (az *azureRemoteStorageClient) DeleteBucket(name string) (err error) {
+	containerClient := az.client.ServiceClient().NewContainerClient(name)
+	_, err = containerClient.Delete(context.Background(), nil)
+	if err != nil {
+		return fmt.Errorf("delete bucket %s: %w", name, err)
+	}
+	return
+}

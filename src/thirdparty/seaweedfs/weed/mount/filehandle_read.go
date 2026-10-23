@@ -1,0 +1,186 @@
+package mount
+
+import (
+	"context"
+	"fmt"
+	"io"
+
+	"google.golang.org/protobuf/proto"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+)
+
+func (fh *FileHandle) lockForRead(startOffset int64, size int) {
+	fh.dirtyPages.LockForRead(startOffset, startOffset+int64(size))
+}
+func (fh *FileHandle) unlockForRead(startOffset int64, size int) {
+	fh.dirtyPages.UnlockForRead(startOffset, startOffset+int64(size))
+}
+
+func (fh *FileHandle) readFromDirtyPages(buff []byte, startOffset int64, tsNs int64) (maxStop int64) {
+	maxStop = fh.dirtyPages.ReadDirtyDataAt(buff, startOffset, tsNs)
+	return
+}
+
+func (fh *FileHandle) readFromChunks(buff []byte, offset int64) (int64, int64, error) {
+	return fh.readFromChunksWithContext(context.Background(), buff, offset)
+}
+
+func (fh *FileHandle) readFromChunksWithContext(ctx context.Context, buff []byte, offset int64) (int64, int64, error) {
+	fh.entryLock.RLock()
+	defer fh.entryLock.RUnlock()
+
+	fileFullPath := fh.FullPath()
+
+	entry := fh.GetEntry()
+
+	// IsInRemoteOnly inspects entry.Chunks, so take the LockedEntry lock the
+	// async uploader appends under.
+	entry.RLock()
+	remoteOnly := entry.Entry.IsInRemoteOnly()
+	entry.RUnlock()
+	if remoteOnly {
+		glog.V(4).Infof("download remote entry %s", fileFullPath)
+		err := fh.downloadRemoteEntry(ctx, entry)
+		if err != nil {
+			glog.V(1).Infof("download remote entry %s: %v", fileFullPath, err)
+			return 0, 0, err
+		}
+	}
+
+	// Snapshot size, inline content, and the chunk list under the LockedEntry
+	// lock. Async upload workers append chunks under this lock (AddChunks), so
+	// reading entry.Chunks / FileSize without it races with the slice
+	// reallocation and can crash in filer.TotalSize. The captured slice headers
+	// stay valid afterwards: append never mutates the old backing array, and
+	// truncate is excluded by the fh.entryLock held for this whole read.
+	entry.RLock()
+	pbEntry := entry.Entry
+	fileSize := int64(pbEntry.Attributes.FileSize)
+	if fileSize == 0 {
+		fileSize = int64(filer.FileSize(pbEntry))
+	}
+	content := pbEntry.Content
+	chunks := pbEntry.Chunks
+	entry.RUnlock()
+
+	if fileSize == 0 {
+		glog.V(1).Infof("empty fh %v", fileFullPath)
+		return 0, 0, io.EOF
+	} else if offset == fileSize {
+		return 0, 0, io.EOF
+	} else if offset >= fileSize {
+		glog.V(1).Infof("invalid read, fileSize %d, offset %d for %s", fileSize, offset, fileFullPath)
+		return 0, 0, io.EOF
+	}
+
+	if offset < int64(len(content)) {
+		totalRead := copy(buff, content[offset:])
+		glog.V(4).Infof("file handle read cached %s [%d,%d] %d", fileFullPath, offset, offset+int64(totalRead), totalRead)
+		return int64(totalRead), 0, nil
+	}
+
+	// Peer chunk sharing: try a peer mount's cache before the volume tier.
+	// Any failure falls through transparently. See design-weed-mount-
+	// peer-chunk-sharing.md §4.3.
+	if fh.wfs.option.PeerEnabled && fh.wfs.peerGrpcServer != nil {
+		totalRead, ts, err := fh.tryPeerRead(ctx, fileSize, buff, offset, chunks)
+		if err == nil {
+			glog.V(4).Infof("peer read successful for %s [%d,%d] %d", fileFullPath, offset, offset+int64(totalRead), totalRead)
+			return int64(totalRead), ts, nil
+		}
+		// Skip the "failed" log for benign skip reasons (local cache
+		// hit, no peer owner yet, etc.) — the cache/volume fallback is
+		// the expected outcome, not a failure.
+		if err != errPeerReadSkipped {
+			glog.V(4).Infof("peer read failed for %s, falling back to volume: %v", fileFullPath, err)
+		}
+	}
+
+	// Fall back to normal chunk reading
+	totalRead, ts, err := fh.entryChunkGroup.ReadDataAt(ctx, fileSize, buff, offset)
+
+	if err != nil && err != io.EOF {
+		glog.Errorf("file handle read %s: %v", fileFullPath, err)
+	}
+
+	// glog.V(4).Infof("file handle read %s [%d,%d] %d : %v", fileFullPath, offset, offset+int64(totalRead), totalRead, err)
+
+	return int64(totalRead), ts, err
+}
+
+func (fh *FileHandle) downloadRemoteEntry(ctx context.Context, entry *LockedEntry) error {
+
+	fileFullPath := fh.FullPath()
+	dir, _ := fileFullPath.DirAndName()
+
+	// callWait 0: this RPC streams a whole remote object filer-side, so a
+	// healthy download can legitimately outlast any metadata-call bound. The
+	// attempt stays bound to the caller's context instead.
+	err := fh.wfs.withFilerClient(ctx, false, 0, func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
+
+		request := &filer_pb.CacheRemoteObjectToLocalClusterRequest{
+			Directory: string(dir),
+			Name:      entry.Name,
+		}
+
+		glog.V(4).Infof("download entry: %v", request)
+		resp, err := client.CacheRemoteObjectToLocalCluster(ctx, request)
+		if err != nil {
+			return fmt.Errorf("CacheRemoteObjectToLocalCluster file %s: %v", fileFullPath, err)
+		}
+
+		// Entry and base are kept in local uid/gid form like every other
+		// install path; the response carries filer ids. Without mapping, an
+		// unchanged re-delivery compares unequal and destroys dirty pages.
+		localEntry := proto.Clone(resp.Entry).(*filer_pb.Entry)
+		if localEntry.Attributes != nil && fh.wfs.option.UidGidMapper != nil {
+			localEntry.Attributes.Uid, localEntry.Attributes.Gid = fh.wfs.option.UidGidMapper.FilerToLocal(localEntry.Attributes.Uid, localEntry.Attributes.Gid)
+		}
+
+		versionTsNs := ackVersionTsNs(resp)
+
+		// Two concurrent reads can both be here (the handle lock is shared;
+		// invalidation is excluded by the exclusive one). Install as one unit,
+		// and only if at least as new — an older response landing last would
+		// keep the newer version over an older entry, fencing out corrections.
+		installed := false
+		fh.remoteInstallMu.Lock()
+		switch {
+		case versionTsNs >= fh.entryVersionTsNs.Load():
+			fh.SetEntry(localEntry)
+			fh.setAuthoritativeBase(proto.Clone(localEntry).(*filer_pb.Entry))
+			fh.advanceEntryVersion(versionTsNs, resp.GetLogSignature())
+			installed = true
+		case versionTsNs == 0 && fh.GetEntry().GetEntry().IsInRemoteOnly():
+			// Unversioned response (pre-upgrade filer) and the handle still has
+			// no local chunks to read: take the content, but claim no position.
+			// A response that is merely *older* is refused instead — its content
+			// predates what the handle already reflects.
+			fh.SetEntry(localEntry)
+			fh.setAuthoritativeBase(proto.Clone(localEntry).(*filer_pb.Entry))
+		}
+		fh.remoteInstallMu.Unlock()
+
+		// Only publish state we accepted, and only when it carries a position
+		// to order it by: an unversioned event would clear the cache entry's
+		// version and let an older subscriber event roll the cache back.
+		// Async: a sync apply deadlocks against the apply loop's invalidate, which needs this read's file-handle lock.
+		if installed && versionTsNs != 0 {
+			event := resp.GetMetadataEvent()
+			if event == nil {
+				event = metadataUpdateEvent(request.Directory, resp.Entry)
+				if event != nil {
+					event.TsNs = versionTsNs
+				}
+			}
+			fh.wfs.applyLocalMetadataEventAsync(event)
+		}
+
+		return nil
+	})
+
+	return err
+}

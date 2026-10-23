@@ -1,0 +1,111 @@
+package mysql2
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/filer/abstract_sql"
+	"github.com/seaweedfs/seaweedfs/weed/filer/mysql"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+)
+
+const (
+	CONNECTION_URL_PATTERN = "%s:%s@tcp(%s:%d)/%s?collation=utf8mb4_bin"
+)
+
+var _ filer.BucketAware = (*MysqlStore2)(nil)
+
+func init() {
+	filer.Stores = append(filer.Stores, &MysqlStore2{})
+}
+
+type MysqlStore2 struct {
+	abstract_sql.AbstractSqlStore
+}
+
+func (store *MysqlStore2) GetName() string {
+	return "mysql2"
+}
+
+func (store *MysqlStore2) Initialize(configuration util.Configuration, prefix string) (err error) {
+	// Fewer idle slots than concurrent operations means a fresh connection per
+	// operation, until the filer runs out of ephemeral ports. connection_max_open
+	// stays unset: a listing runs a second query from its own callback, so a
+	// bounded pool deadlocks once the concurrency reaches it.
+	configuration.SetDefault(prefix+"connection_max_idle", 50)
+	configuration.SetDefault(prefix+"connection_max_lifetime_seconds", 300)
+	// Default on so minimal configs avoid the duplicate-key roundtrip the
+	// inode-index KvPut would otherwise emit on every write.
+	configuration.SetDefault(prefix+"enableUpsert", true)
+	return store.initialize(
+		configuration.GetString(prefix+"createTable"),
+		configuration.GetString(prefix+"upsertQuery"),
+		configuration.GetBool(prefix+"enableUpsert"),
+		configuration.GetString(prefix+"username"),
+		configuration.GetString(prefix+"password"),
+		configuration.GetString(prefix+"hostname"),
+		configuration.GetInt(prefix+"port"),
+		configuration.GetString(prefix+"database"),
+		configuration.GetInt(prefix+"connection_max_idle"),
+		configuration.GetInt(prefix+"connection_max_open"),
+		configuration.GetInt(prefix+"connection_max_lifetime_seconds"),
+		configuration.GetBool(prefix+"interpolateParams"),
+	)
+}
+
+func (store *MysqlStore2) initialize(createTable, upsertQuery string, enableUpsert bool, user, password, hostname string, port int, database string, maxIdle, maxOpen,
+	maxLifetimeSeconds int, interpolateParams bool) (err error) {
+
+	store.SupportBucketTable = true
+	if createTable == "" {
+		createTable = mysql.DefaultCreateTableQuery
+	}
+	if !enableUpsert {
+		upsertQuery = ""
+	} else if upsertQuery == "" {
+		upsertQuery = mysql.DefaultUpsertQuery
+	}
+	gen := &mysql.SqlGenMysql{
+		CreateTableSqlTemplate: createTable,
+		DropTableSqlTemplate:   "DROP TABLE IF EXISTS `%s`",
+		UpsertQueryTemplate:    upsertQuery,
+	}
+	store.SqlGenerator = gen
+
+	sqlUrl := fmt.Sprintf(CONNECTION_URL_PATTERN, user, password, hostname, port, database)
+	adaptedSqlUrl := fmt.Sprintf(CONNECTION_URL_PATTERN, user, "<ADAPTED>", hostname, port, database)
+	if interpolateParams {
+		sqlUrl += "&interpolateParams=true"
+		adaptedSqlUrl += "&interpolateParams=true"
+	}
+
+	db, dbErr := sql.Open("mysql", sqlUrl)
+	if dbErr != nil {
+		if db != nil {
+			db.Close()
+		}
+		return fmt.Errorf("can not connect to %s error:%w", adaptedSqlUrl, dbErr)
+	}
+
+	if err = store.UseConnectionPools(db, func() (*sql.DB, error) {
+		return sql.Open("mysql", sqlUrl)
+	}, maxIdle, maxOpen, maxLifetimeSeconds); err != nil {
+		return err
+	}
+
+	if err = store.DB.Ping(); err != nil {
+		return fmt.Errorf("connect to %s error:%v", adaptedSqlUrl, err)
+	}
+
+	if err = store.CreateTable(context.Background(), abstract_sql.DEFAULT_TABLE); err != nil && !strings.Contains(err.Error(), "table already exist") {
+		return fmt.Errorf("init table %s: %v", abstract_sql.DEFAULT_TABLE, err)
+	}
+
+	mysql.ConfigureListOrdering(store.DB, gen)
+
+	return nil
+}

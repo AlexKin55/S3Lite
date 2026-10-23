@@ -1,0 +1,91 @@
+package stats
+
+// This file contains metric names for all errors
+// The naming convention is ErrorSomeThing = "error.some.thing"
+const (
+	// volume server
+	WriteToLocalDisk   = "writeToLocalDisk"
+	WriteToReplicas    = "writeToReplicas"
+	DownloadLimitCond  = "downloadLimitCondition"
+	UploadLimitCond    = "uploadLimitCondition"
+	ReadProxyReq       = "readProxyRequest"
+	ReadRedirectReq    = "readRedirectRequest"
+	ReadDeletedNeedle  = "readDeletedNeedle"
+	EmptyReadProxyLoc  = "emptyReadProxyLocaction"
+	FailedReadProxyReq = "failedReadProxyRequest"
+
+	ErrorSizeMismatchOffsetSize = "errorSizeMismatchOffsetSize"
+	ErrorSizeMismatch           = "errorSizeMismatch"
+	ErrorCRC                    = "errorCRC"
+	ErrorIndexOutOfRange        = "errorIndexOutOfRange"
+	ErrorGetNotFound            = "errorGetNotFound"
+	ErrorGetInternal            = "errorGetInternal"
+
+	// master topology
+	ErrorWriteToLocalDisk = "errorWriteToLocalDisk"
+	ErrorUnmarshalPairs   = "errorUnmarshalPairs"
+	ErrorWriteToReplicas  = "errorWriteToReplicas"
+
+	// master client
+	FailedToKeepConnected = "failedToKeepConnected"
+	FailedToSend          = "failedToSend"
+	FailedToReceive       = "failedToReceive"
+	RedirectedToLeader    = "redirectedToLeader"
+	OnPeerUpdate          = "onPeerUpdate"
+	Failed                = "failed"
+
+	// filer handler
+	DirList            = "dirList"
+	ContentSaveToFiler = "contentSaveToFiler"
+	AutoChunk          = "autoChunk"
+	ChunkProxy         = "chunkProxy"
+	ChunkAssign        = "chunkAssign"
+	ChunkUpload        = "chunkUpload"
+	ChunkMerge         = "chunkMerge"
+
+	ChunkDoUploadRetry       = "chunkDoUploadRetry"
+	ChunkUploadRetry         = "chunkUploadRetry"
+	ChunkAssignRetry         = "chunkAssignRetry"
+	ErrorReadNotFound        = "read.notfound"
+	ErrorReadInternal        = "read.internal.error"
+	ErrorWriteEntry          = "write.entry.failed"
+	RepeatErrorUploadContent = "upload.content.repeat.failed"
+	ErrorChunkAssign         = "chunkAssign.failed"
+	ErrorReadChunk           = "read.chunk.failed"
+	ErrorReadCache           = "read.cache.failed"
+	ErrorReadStream          = "read.stream.failed"
+
+	// s3 handler
+	ErrorCompletedNoSuchUpload      = "errorCompletedNoSuchUpload"
+	ErrorCompleteEntityTooSmall     = "errorCompleteEntityTooSmall"
+	ErrorCompletedPartEmpty         = "errorCompletedPartEmpty"
+	ErrorCompletedPartNumber        = "errorCompletedPartNumber"
+	ErrorCompletedPartNotFound      = "errorCompletedPartNotFound"
+	ErrorCompletedEtagInvalid       = "errorCompletedEtagInvalid"
+	ErrorCompletedEtagMismatch      = "errorCompletedEtagMismatch"
+	ErrorCompletedPartEntryMismatch = "errorCompletedPartEntryMismatch"
+
+	// ReplicationOpWrite is the label value for write replication operations.
+	ReplicationOpWrite = "write"
+	// ReplicationOpDelete is the label value for delete replication operations.
+	ReplicationOpDelete = "delete"
+	// ReplicationSuccess is the label value for successful replication operations.
+	ReplicationSuccess = "success"
+	// ReplicationFailure is the label value for failed replication operations.
+	ReplicationFailure = "failure"
+
+	// FailureTimeout is the failure reason label for deadline-exceeded errors.
+	FailureTimeout = "timeout"
+	// FailureConnectionRefused is the failure reason label for connection-refused errors.
+	FailureConnectionRefused = "connection_refused"
+	// FailureContextCancelled is the failure reason label for context-cancelled errors.
+	FailureContextCancelled = "context_cancelled"
+	// FailureServerError is the failure reason label for generic server-side errors.
+	FailureServerError = "server_error"
+
+	// remote-mount cache read labels
+	RemoteCacheSourceFiler = "filer"
+	RemoteCacheSourceS3    = "s3"
+	RemoteCacheResultHit   = "hit"
+	RemoteCacheResultMiss  = "miss"
+)

@@ -1,0 +1,349 @@
+package s3api
+
+import (
+	"context"
+	"errors"
+	"net/http"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+)
+
+// GetObjectAclHandler Get object ACL
+// https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObjectAcl.html
+func (s3a *S3ApiServer) GetObjectAclHandler(w http.ResponseWriter, r *http.Request) {
+	// collect parameters
+	bucket, object := s3_constants.GetBucketAndObject(r)
+	glog.V(3).Infof("GetObjectAclHandler %s %s", bucket, object)
+	if err := s3a.validateTableBucketObjectPath(bucket, object); err != nil {
+		s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
+		return
+	}
+
+	if err := s3a.checkBucket(r, bucket); err != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, err)
+		return
+	}
+
+	// Check for specific version ID in query parameters
+	versionId := r.URL.Query().Get("versionId")
+	if errCode := s3a.checkVersionIdConfigured(bucket, versionId); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
+	// Check if versioning is configured for the bucket (Enabled or Suspended)
+	versioningConfigured, err := s3a.isVersioningConfigured(bucket)
+	if err != nil {
+		if err == filer_pb.ErrNotFound {
+			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchBucket)
+			return
+		}
+		glog.Errorf("GetObjectAclHandler: Error checking versioning status for bucket %s: %v", bucket, err)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		return
+	}
+
+	var entry *filer_pb.Entry
+
+	if versioningConfigured {
+		// Handle versioned object ACL retrieval - use same logic as GetObjectHandler
+		if versionId != "" {
+			// Request for specific version
+			glog.V(2).Infof("GetObjectAclHandler: requesting ACL for specific version %s of %s/%s", versionId, bucket, object)
+			entry, err = s3a.getSpecificObjectVersion(bucket, object, versionId)
+		} else {
+			// Request for latest version
+			glog.V(2).Infof("GetObjectAclHandler: requesting ACL for latest version of %s/%s", bucket, object)
+			entry, err = s3a.getLatestObjectVersion(bucket, object)
+		}
+
+		if err != nil {
+			glog.Errorf("GetObjectAclHandler: Failed to get object version %s for %s/%s: %v", versionId, bucket, object, err)
+			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+			return
+		}
+
+		// Check if this is a delete marker
+		if entry.Extended != nil {
+			if deleteMarker, exists := entry.Extended[s3_constants.ExtDeleteMarkerKey]; exists && string(deleteMarker) == "true" {
+				s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+				return
+			}
+		}
+	} else {
+		// Handle regular (non-versioned) object ACL retrieval
+		entry, err = s3a.fetchObjectEntryRequired(bucket, object)
+		if err != nil {
+			if errors.Is(err, filer_pb.ErrNotFound) {
+				s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+				return
+			}
+			glog.Errorf("GetObjectAclHandler: error checking object %s/%s: %v", bucket, object, err)
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+			return
+		}
+	}
+
+	if entry == nil {
+		s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+		return
+	}
+
+	action := s3_constants.S3_ACTION_GET_OBJECT_ACL
+	if versionId != "" {
+		action = s3_constants.S3_ACTION_GET_OBJECT_VERSION_ACL
+	}
+	if errCode := s3a.recheckPolicyWithObjectEntry(r, bucket, object, action, entry.Extended, "GetObjectAclHandler"); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
+	// Get object owner from metadata, fallback to request account
+	var objectOwner string
+	var objectOwnerDisplayName string
+	amzAccountId := r.Header.Get(s3_constants.AmzAccountId)
+
+	if entry.Extended != nil {
+		if ownerBytes, exists := entry.Extended[s3_constants.ExtAmzOwnerKey]; exists {
+			objectOwner = string(ownerBytes)
+		}
+	}
+
+	// Fallback to current account if no owner stored
+	if objectOwner == "" {
+		objectOwner = amzAccountId
+	}
+
+	objectOwnerDisplayName = s3a.iam.GetAccountNameById(objectOwner)
+
+	// Build ACL response from stored ACL metadata (or the owner's default grant).
+	response := AccessControlPolicy{
+		Owner: CanonicalUser{
+			ID:          objectOwner,
+			DisplayName: objectOwnerDisplayName,
+		},
+		AccessControlList: buildAccessControlList(s3a.iam, GetAcpGrants(entry.Extended), objectOwner, objectOwnerDisplayName),
+	}
+
+	writeSuccessResponseXML(w, r, response)
+}
+
+// PutObjectAclHandler Put object ACL
+// https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObjectAcl.html
+func (s3a *S3ApiServer) PutObjectAclHandler(w http.ResponseWriter, r *http.Request) {
+	// collect parameters
+	bucket, object := s3_constants.GetBucketAndObject(r)
+	glog.V(3).Infof("PutObjectAclHandler %s %s", bucket, object)
+	if err := s3a.validateTableBucketObjectPath(bucket, object); err != nil {
+		s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
+		return
+	}
+
+	if err := s3a.checkBucket(r, bucket); err != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, err)
+		return
+	}
+
+	// Check for specific version ID in query parameters
+	versionId := r.URL.Query().Get("versionId")
+	if errCode := s3a.checkVersionIdConfigured(bucket, versionId); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
+	// Check if versioning is configured for the bucket (Enabled or Suspended)
+	versioningConfigured, err := s3a.isVersioningConfigured(bucket)
+	if err != nil {
+		if err == filer_pb.ErrNotFound {
+			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchBucket)
+			return
+		}
+		glog.Errorf("PutObjectAclHandler: Error checking versioning status for bucket %s: %v", bucket, err)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		return
+	}
+
+	var entry *filer_pb.Entry
+
+	if versioningConfigured {
+		// Handle versioned object ACL modification - use same logic as GetObjectHandler
+		if versionId != "" {
+			// Request for specific version
+			glog.V(2).Infof("PutObjectAclHandler: modifying ACL for specific version %s of %s/%s", versionId, bucket, object)
+			entry, err = s3a.getSpecificObjectVersion(bucket, object, versionId)
+		} else {
+			// Request for latest version
+			glog.V(2).Infof("PutObjectAclHandler: modifying ACL for latest version of %s/%s", bucket, object)
+			entry, err = s3a.getLatestObjectVersion(bucket, object)
+		}
+
+		if err != nil {
+			glog.Errorf("PutObjectAclHandler: Failed to get object version %s for %s/%s: %v", versionId, bucket, object, err)
+			s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+			return
+		}
+
+		// Check if this is a delete marker
+		if entry.Extended != nil {
+			if deleteMarker, exists := entry.Extended[s3_constants.ExtDeleteMarkerKey]; exists && string(deleteMarker) == "true" {
+				s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+				return
+			}
+		}
+	} else {
+		// Handle regular (non-versioned) object ACL modification
+		entry, err = s3a.fetchObjectEntryRequired(bucket, object)
+		if err != nil {
+			if errors.Is(err, filer_pb.ErrNotFound) {
+				s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+				return
+			}
+			glog.Errorf("PutObjectAclHandler: error checking object %s/%s: %v", bucket, object, err)
+			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+			return
+		}
+	}
+
+	if entry == nil {
+		s3err.WriteErrorResponse(w, r, s3err.ErrNoSuchKey)
+		return
+	}
+
+	putAction := s3_constants.S3_ACTION_PUT_OBJECT_ACL
+	if versionId != "" {
+		putAction = s3_constants.S3_ACTION_PUT_OBJECT_VERSION_ACL
+	}
+	if errCode := s3a.recheckPolicyWithObjectEntry(r, bucket, object, putAction, entry.Extended, "PutObjectAclHandler"); errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
+	// Get current object owner from metadata
+	var objectOwner string
+	amzAccountId := r.Header.Get(s3_constants.AmzAccountId)
+
+	if entry.Extended != nil {
+		if ownerBytes, exists := entry.Extended[s3_constants.ExtAmzOwnerKey]; exists {
+			objectOwner = string(ownerBytes)
+		}
+	}
+
+	// **PERMISSION CHECKS**
+
+	isAdmin := s3a.isUserAdmin(r)
+
+	// Without stored owner metadata there is no way to prove a non-admin
+	// caller owns this object, so they must not modify its ACL or claim it.
+	// Admins keep the fallback below to take over ownerless objects, which
+	// can be produced by non-S3 filer writes.
+	if objectOwner == "" && !isAdmin {
+		glog.V(3).Infof("PutObjectAclHandler: Access denied - object %s/%s has no owner metadata", bucket, object)
+		s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
+		return
+	}
+
+	// Fallback to current account if no owner stored
+	if objectOwner == "" {
+		objectOwner = amzAccountId
+	}
+
+	// 1. Check if user is admin (admins can modify any ACL)
+	if !isAdmin {
+		// 2. Check object ownership - only object owner can modify ACL (unless admin)
+		if objectOwner != amzAccountId {
+			glog.V(3).Infof("PutObjectAclHandler: Access denied - user %s is not owner of object %s/%s (owner: %s)",
+				amzAccountId, bucket, object, objectOwner)
+			s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
+			return
+		}
+
+		// 3. Check object-level WRITE_ACP permission. The unified auth path
+		// scopes the base action to the request's bucket/object for both
+		// legacy Actions and IAM/bucket policies; embedding the resource path
+		// in the action here would scope it twice.
+		_, errCode := s3a.iam.authRequest(r, Action(s3_constants.ACTION_WRITE_ACP))
+		if errCode != s3err.ErrNone {
+			glog.V(3).Infof("PutObjectAclHandler: Auth failed for WriteAcp action on %s/%s: %v", bucket, object, errCode)
+			s3err.WriteErrorResponse(w, r, s3err.ErrAccessDenied)
+			return
+		}
+	} else {
+		glog.V(3).Infof("PutObjectAclHandler: Admin user %s granted ACL modification permission for %s/%s", amzAccountId, bucket, object)
+	}
+
+	// Get bucket config for ownership settings
+	bucketConfig, errCode := s3a.getBucketConfig(bucket)
+	if errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
+	bucketOwnership := bucketConfig.Ownership
+	bucketOwnerId := bucketConfig.Owner
+
+	// Extract ACL from request (either canned ACL or XML body)
+	// This function also validates that the owner in the request matches the object owner
+	grants, errCode := ExtractAcl(r, s3a.iam, bucketOwnership, bucketOwnerId, objectOwner, amzAccountId)
+	if errCode != s3err.ErrNone {
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
+	// Store ACL in object metadata
+	if errCode := AssembleEntryWithAcp(entry, objectOwner, grants); errCode != s3err.ErrNone {
+		glog.Errorf("PutObjectAclHandler: failed to assemble entry with ACP: %v", errCode)
+		s3err.WriteErrorResponse(w, r, errCode)
+		return
+	}
+
+	updateDirectory := s3a.objectMetadataUpdateDirectory(bucket, object, versioningConfigured, versionId, entry)
+
+	// Update the object with new ACL metadata
+	err = s3a.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		request := &filer_pb.UpdateEntryRequest{
+			Directory: updateDirectory,
+			Entry:     entry,
+		}
+
+		if _, err := client.UpdateEntry(context.Background(), request); err != nil {
+			return err
+		}
+		return nil
+	})
+
+	if err != nil {
+		glog.Errorf("PutObjectAclHandler: failed to update entry: %v", err)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		return
+	}
+
+	glog.V(3).Infof("PutObjectAclHandler: Successfully updated ACL for %s/%s by user %s", bucket, object, amzAccountId)
+	writeSuccessResponseEmpty(w, r)
+}
+
+// objectMetadataUpdateDirectory returns the filer directory holding the entry an in-place
+// metadata update (ACL or tags) must target. A regular object lives under its full key's
+// parent directory, so a nested key must not fall back to the bucket root, which would
+// rewrite a different object sharing the same basename.
+func (s3a *S3ApiServer) objectMetadataUpdateDirectory(bucket, object string, versioningConfigured bool, versionId string, entry *filer_pb.Entry) string {
+	if versioningConfigured {
+		if versionId != "" && versionId != "null" {
+			return s3a.bucketDir(bucket) + "/" + object + s3_constants.VersionsFolder
+		}
+		var actualVersionId string
+		if entry.Extended != nil {
+			if versionIdBytes, exists := entry.Extended[s3_constants.ExtVersionIdKey]; exists {
+				actualVersionId = string(versionIdBytes)
+			}
+		}
+		if actualVersionId != "null" && actualVersionId != "" {
+			return s3a.bucketDir(bucket) + "/" + object + s3_constants.VersionsFolder
+		}
+	}
+	dir, _ := util.NewFullPath(s3a.bucketDir(bucket), object).DirAndName()
+	return dir
+}

@@ -1,0 +1,515 @@
+package weed_server
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"mime"
+	"mime/multipart"
+	"net/http"
+	"net/url"
+	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/util/request_id"
+	"google.golang.org/grpc/metadata"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+
+	"google.golang.org/grpc"
+
+	"github.com/gorilla/mux"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+)
+
+var serverStats *stats.ServerStats
+var startTime = time.Now()
+var writePool = sync.Pool{New: func() interface{} {
+	return bufio.NewWriterSize(nil, 128*1024)
+},
+}
+
+// ErrCacheNotReady signals that a remote-only object's local cache is still
+// filling. Callers should map it to 503 + Retry-After so SDKs back off and retry.
+var ErrCacheNotReady = errors.New("remote object not cached yet")
+
+// writePrepareWriteFnErr writes an HTTP response for an error from
+// prepareWriteFn, before any 2xx headers have been written. Client cancels are
+// silent; filer_pb.ErrNotFound becomes 404; ErrCacheNotReady becomes 503 +
+// Retry-After; everything else is 500. Strips headers that described the
+// success body (Content-Length / Content-Range / Content-Disposition / ETag /
+// Last-Modified) so they don't get attached to the error response.
+func writePrepareWriteFnErr(w http.ResponseWriter, err error) {
+	for _, h := range []string{"Content-Length", "Content-Range", "Content-Disposition", "ETag", "Last-Modified"} {
+		w.Header().Del(h)
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		glog.V(3).Infof("ProcessRangeRequest: client disconnected: %v", err)
+	case errors.Is(err, filer_pb.ErrNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	case errors.Is(err, ErrCacheNotReady):
+		glog.V(1).Infof("ProcessRangeRequest: cache not ready, returning 503: %v", err)
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	default:
+		glog.Errorf("ProcessRangeRequest: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func init() {
+	serverStats = stats.NewServerStats()
+	go serverStats.Start()
+}
+
+// bodyAllowedForStatus is a copy of http.bodyAllowedForStatus non-exported function.
+func bodyAllowedForStatus(status int) bool {
+	switch {
+	case status >= 100 && status <= 199:
+		return false
+	case status == http.StatusNoContent:
+		return false
+	case status == http.StatusNotModified:
+		return false
+	}
+	return true
+}
+
+func writeJson(w http.ResponseWriter, r *http.Request, httpStatus int, obj interface{}) (err error) {
+	if !bodyAllowedForStatus(httpStatus) {
+		return
+	}
+
+	var bytes []byte
+	if obj != nil {
+		if r.URL.Query().Get("pretty") != "" {
+			bytes, err = json.MarshalIndent(obj, "", "  ")
+		} else {
+			bytes, err = json.Marshal(obj)
+		}
+	}
+	if err != nil {
+		return
+	}
+
+	if httpStatus >= 400 {
+		glog.V(0).Infof("response method:%s URL:%s with httpStatus:%d and JSON:%s",
+			r.Method, redactedURL(r), httpStatus, string(bytes))
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(httpStatus)
+	_, err = w.Write(bytes)
+	return
+}
+
+func redactedURL(r *http.Request) string {
+	if _, ok := r.URL.Query()["jwt"]; !ok {
+		return r.URL.String()
+	}
+	u := *r.URL
+	q := u.Query()
+	q.Set("jwt", "[redacted]")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// wrapper for writeJson - just logs errors
+func writeJsonQuiet(w http.ResponseWriter, r *http.Request, httpStatus int, obj interface{}) {
+	if err := writeJson(w, r, httpStatus, obj); err != nil {
+		glog.V(0).Infof("error writing JSON status %s %d: %v", redactedURL(r), httpStatus, err)
+		glog.V(1).Infof("JSON content: %+v", obj)
+	}
+}
+func writeJsonError(w http.ResponseWriter, r *http.Request, httpStatus int, err error) {
+	m := make(map[string]interface{})
+	m["error"] = err.Error()
+	glog.V(1).Infof("error JSON response status %d: %s", httpStatus, m["error"])
+	writeJsonQuiet(w, r, httpStatus, m)
+}
+
+func debug(params ...interface{}) {
+	glog.V(4).Infoln(params...)
+}
+
+func submitForClientHandler(w http.ResponseWriter, r *http.Request, masterFn operation.GetMasterFn, grpcDialOption grpc.DialOption, fileSizeLimitBytes int64) {
+	ctx := r.Context()
+	m := make(map[string]interface{})
+	if r.Method != http.MethodPost {
+		writeJsonError(w, r, http.StatusMethodNotAllowed, errors.New("Only submit via POST!"))
+		return
+	}
+
+	debug("parsing upload file...")
+	bytesBuffer := bufPool.Get().(*bytes.Buffer)
+	defer bufPool.Put(bytesBuffer)
+	pu, pe := needle.ParseUpload(r, fileSizeLimitBytes, bytesBuffer)
+	if pe != nil {
+		writeJsonError(w, r, http.StatusBadRequest, pe)
+		return
+	}
+
+	debug("assigning file id for", pu.FileName)
+	r.ParseForm()
+	count := uint64(1)
+	if r.FormValue("count") != "" {
+		count, pe = strconv.ParseUint(r.FormValue("count"), 10, 32)
+		if pe != nil {
+			writeJsonError(w, r, http.StatusBadRequest, pe)
+			return
+		}
+	}
+	ar := &operation.VolumeAssignRequest{
+		Count:            count,
+		DataCenter:       r.FormValue("dataCenter"),
+		Rack:             r.FormValue("rack"),
+		Replication:      r.FormValue("replication"),
+		Collection:       r.FormValue("collection"),
+		Ttl:              r.FormValue("ttl"),
+		DiskType:         r.FormValue("disk"),
+		ExpectedDataSize: uint64(max(int64(0), int64(pu.OriginalDataSize))),
+	}
+	assignResult, ae := operation.Assign(ctx, masterFn, grpcDialOption, ar)
+	if ae != nil {
+		writeJsonError(w, r, http.StatusInternalServerError, ae)
+		return
+	}
+
+	url := "http://" + assignResult.Url + "/" + assignResult.Fid
+	if pu.ModifiedTime != 0 {
+		url = url + "?ts=" + strconv.FormatUint(pu.ModifiedTime, 10)
+	}
+
+	debug("upload file to store", url)
+	uploadOption := &operation.UploadOption{
+		UploadUrl:         url,
+		Filename:          pu.FileName,
+		Cipher:            false,
+		IsInputCompressed: pu.IsGzipped,
+		MimeType:          pu.MimeType,
+		PairMap:           pu.PairMap,
+		Jwt:               assignResult.Auth,
+	}
+	uploader, err := operation.NewUploader()
+	if err != nil {
+		writeJsonError(w, r, http.StatusInternalServerError, err)
+		return
+	}
+	uploadResult, err := uploader.UploadData(ctx, pu.Data, uploadOption)
+	if err != nil {
+		writeJsonError(w, r, http.StatusInternalServerError, err)
+		return
+	}
+
+	m["fileName"] = pu.FileName
+	m["fid"] = assignResult.Fid
+	m["fileUrl"] = assignResult.PublicUrl + "/" + assignResult.Fid
+	m["size"] = pu.OriginalDataSize
+	m["eTag"] = uploadResult.ETag
+	writeJsonQuiet(w, r, http.StatusCreated, m)
+	return
+}
+
+func parseURLPath(path string) (vid, fid, filename, ext string, isVolumeIdOnly bool) {
+	switch strings.Count(path, "/") {
+	case 3:
+		parts := strings.Split(path, "/")
+		vid, fid, filename = parts[1], parts[2], parts[3]
+		ext = filepath.Ext(filename)
+	case 2:
+		parts := strings.Split(path, "/")
+		vid, fid = parts[1], parts[2]
+		dotIndex := strings.LastIndex(fid, ".")
+		if dotIndex > 0 {
+			ext = fid[dotIndex:]
+			fid = fid[0:dotIndex]
+		}
+	default:
+		sepIndex := strings.LastIndex(path, "/")
+		commaIndex := strings.LastIndex(path[sepIndex:], ",")
+		if commaIndex <= 0 {
+			vid, isVolumeIdOnly = path[sepIndex+1:], true
+			return
+		}
+		dotIndex := strings.LastIndex(path[sepIndex:], ".")
+		vid = path[sepIndex+1 : commaIndex]
+		fid = path[commaIndex+1:]
+		ext = ""
+		if dotIndex > 0 {
+			fid = path[commaIndex+1 : dotIndex]
+			ext = path[dotIndex:]
+		}
+	}
+	return
+}
+
+var StaticFS fs.FS
+
+func handleStaticResources(defaultMux *http.ServeMux) {
+	defaultMux.Handle("/favicon.ico", http.FileServer(http.FS(StaticFS)))
+	defaultMux.Handle("/seaweedfsstatic/", http.StripPrefix("/seaweedfsstatic", http.FileServer(http.FS(StaticFS))))
+}
+
+func handleStaticResources2(r *mux.Router) {
+	r.Handle("/favicon.ico", http.FileServer(http.FS(StaticFS)))
+	r.PathPrefix("/seaweedfsstatic/").Handler(http.StripPrefix("/seaweedfsstatic", http.FileServer(http.FS(StaticFS))))
+}
+
+func AdjustPassthroughHeaders(w http.ResponseWriter, r *http.Request, filename string) {
+	// Apply S3 passthrough headers from query parameters
+	// AWS S3 supports overriding response headers via query parameters like:
+	// ?response-cache-control=no-cache&response-content-type=application/json
+	for queryParam, headerValue := range r.URL.Query() {
+		if normalizedHeader, ok := s3_constants.PassThroughHeaders[strings.ToLower(queryParam)]; ok && len(headerValue) > 0 {
+			w.Header().Set(normalizedHeader, headerValue[0])
+		}
+	}
+	adjustHeaderContentDisposition(w, r, filename)
+}
+func adjustHeaderContentDisposition(w http.ResponseWriter, r *http.Request, filename string) {
+	if contentDisposition := w.Header().Get("Content-Disposition"); contentDisposition != "" {
+		return
+	}
+	if filename != "" {
+		dispositionType := "inline"
+		if r.FormValue("dl") != "" {
+			if dl, _ := strconv.ParseBool(r.FormValue("dl")); dl {
+				dispositionType = "attachment"
+			}
+		}
+		// Use mime.FormatMediaType for RFC 6266 compliant Content-Disposition,
+		// properly handling non-ASCII characters and special characters
+		w.Header().Set("Content-Disposition", mime.FormatMediaType(dispositionType, map[string]string{"filename": filename}))
+	}
+}
+
+// responseBodyTracker records how many bytes have reached the ResponseWriter.
+// Bytes still sitting in the pooled bufio.Writer do not count: the status line
+// is not committed until the buffer flushes.
+type responseBodyTracker struct {
+	http.ResponseWriter
+	written int64
+}
+
+func (t *responseBodyTracker) Write(p []byte) (int, error) {
+	n, err := t.ResponseWriter.Write(p)
+	t.written += int64(n)
+	return n, err
+}
+
+func ProcessRangeRequest(r *http.Request, w http.ResponseWriter, totalSize int64, mimeType string, prepareWriteFn func(offset int64, size int64) (filer.DoStreamContent, error)) error {
+	rangeReq := r.Header.Get("Range")
+	sink := &responseBodyTracker{ResponseWriter: w}
+	bufferedWriter := writePool.Get().(*bufio.Writer)
+	bufferedWriter.Reset(sink)
+	discardBuffered := false
+	defer func() {
+		if discardBuffered {
+			bufferedWriter.Reset(io.Discard)
+		} else {
+			bufferedWriter.Flush()
+		}
+		writePool.Put(bufferedWriter)
+	}()
+
+	if rangeReq == "" {
+		w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
+		writeFn, err := prepareWriteFn(0, totalSize)
+		if err != nil {
+			writePrepareWriteFnErr(w, err)
+			return fmt.Errorf("ProcessRangeRequest: %w", err)
+		}
+		if err = writeFn(bufferedWriter); err != nil {
+			glog.Errorf("ProcessRangeRequest: %v", err)
+			// Drop the unflushed tail: flushing it would finish a 200 whose
+			// Content-Length is already set, delivering corrupt bytes as a
+			// complete body.
+			discardBuffered = true
+			if sink.written > 0 {
+				panic(http.ErrAbortHandler)
+			}
+			w.Header().Del("Content-Length")
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return fmt.Errorf("ProcessRangeRequest: %w", err)
+		}
+		return nil
+	}
+
+	//the rest is dealing with partial content request
+	//mostly copy from src/pkg/net/http/fs.go
+	ranges, err := parseRange(rangeReq, totalSize)
+	if err != nil {
+		glog.Errorf("ProcessRangeRequest headers: %+v err: %v", w.Header(), err)
+		if err == errNoOverlap {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+		}
+		http.Error(w, err.Error(), http.StatusRequestedRangeNotSatisfiable)
+		return fmt.Errorf("ProcessRangeRequest header: %w", err)
+	}
+	if sumRangesSize(ranges) > totalSize {
+		// The total number of bytes in all the ranges
+		// is larger than the size of the file by
+		// itself, so this is probably an attack, or a
+		// dumb client.  Ignore the range request.
+		return nil
+	}
+	if len(ranges) == 0 {
+		return nil
+	}
+	if len(ranges) == 1 {
+		// RFC 2616, Section 14.16:
+		// "When an HTTP message includes the content of a single
+		// range (for example, a response to a request for a
+		// single range, or to a request for a set of ranges
+		// that overlap without any holes), this content is
+		// transmitted with a Content-Range header, and a
+		// Content-Length header showing the number of bytes
+		// actually transferred.
+		// ...
+		// A response to a request for a single range MUST NOT
+		// be sent using the multipart/byteranges media type."
+		ra := ranges[0]
+		w.Header().Set("Content-Length", strconv.FormatInt(ra.length, 10))
+		w.Header().Set("Content-Range", ra.contentRange(totalSize))
+
+		writeFn, err := prepareWriteFn(ra.start, ra.length)
+		if err != nil {
+			writePrepareWriteFnErr(w, err)
+			return fmt.Errorf("ProcessRangeRequest: %w", err)
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		err = writeFn(bufferedWriter)
+		if err != nil {
+			glog.Errorf("ProcessRangeRequest range[0]: %+v err: %v", w.Header(), err)
+			// WriteHeader was already called: drop the unflushed tail and
+			// abort so the client does not read corrupt bytes as a full body.
+			discardBuffered = true
+			panic(http.ErrAbortHandler)
+		}
+		return nil
+	}
+
+	// process multiple ranges
+	writeFnByRange := make(map[int](func(writer io.Writer) error))
+
+	for i, ra := range ranges {
+		if ra.start > totalSize {
+			http.Error(w, "Out of Range", http.StatusRequestedRangeNotSatisfiable)
+			return fmt.Errorf("out of range: %w", err)
+		}
+		writeFn, err := prepareWriteFn(ra.start, ra.length)
+		if err != nil {
+			writePrepareWriteFnErr(w, err)
+			return fmt.Errorf("ProcessRangeRequest range[%d]: %w", i, err)
+		}
+		writeFnByRange[i] = writeFn
+	}
+	sendSize := rangesMIMESize(ranges, mimeType, totalSize)
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	w.Header().Set("Content-Type", "multipart/byteranges; boundary="+mw.Boundary())
+	sendContent := pr
+	defer pr.Close() // cause writing goroutine to fail and exit if CopyN doesn't finish.
+	go func() {
+		for i, ra := range ranges {
+			part, e := mw.CreatePart(ra.mimeHeader(mimeType, totalSize))
+			if e != nil {
+				pw.CloseWithError(e)
+				return
+			}
+			writeFn := writeFnByRange[i]
+			if writeFn == nil {
+				pw.CloseWithError(e)
+				return
+			}
+			if e = writeFn(part); e != nil {
+				pw.CloseWithError(e)
+				return
+			}
+		}
+		mw.Close()
+		pw.Close()
+	}()
+	if w.Header().Get("Content-Encoding") == "" {
+		w.Header().Set("Content-Length", strconv.FormatInt(sendSize, 10))
+	}
+	w.WriteHeader(http.StatusPartialContent)
+	if _, err := io.CopyN(bufferedWriter, sendContent, sendSize); err != nil {
+		glog.Errorf("ProcessRangeRequest err: %v", err)
+		// WriteHeader was already called: drop the unflushed tail and abort.
+		discardBuffered = true
+		panic(http.ErrAbortHandler)
+	}
+	return nil
+}
+
+// CleanPathHandler serves a request whose path is not canonical ("//", "." or
+// ".." segments) at the cleaned path instead of letting http.ServeMux redirect
+// to it. ServeMux builds that redirect from the already percent-encoded path, so
+// the Location header is encoded twice (golang/go#79897): a client following it
+// re-sends "/负极全景" as "/%25E8%25B4%259F...", and the filer then stores a
+// directory literally named "%E8%B4%9F...". Cleaning here mirrors the path
+// ServeMux would have redirected to, so the decoded name reaches the handler.
+func CleanPathHandler(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		escaped := r.URL.EscapedPath()
+		if cleaned := cleanPath(escaped); cleaned != escaped {
+			if p, err := url.PathUnescape(cleaned); err == nil {
+				r2 := new(http.Request)
+				*r2 = *r
+				r2.URL = new(url.URL)
+				*r2.URL = *r.URL
+				r2.URL.Path, r2.URL.RawPath = p, cleaned
+				// PostHandler picks storage rules and the bucket from RequestURI, so
+				// keep it in step with the path the entry is written to.
+				r2.RequestURI = r2.URL.RequestURI()
+				r = r2
+			}
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// cleanPath is the canonical form http.ServeMux redirects to: path.Clean plus
+// the trailing slash, which the filer relies on to tell a directory from a file.
+func cleanPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	if p[0] != '/' {
+		p = "/" + p
+	}
+	np := path.Clean(p)
+	if p[len(p)-1] == '/' && np != "/" {
+		np += "/"
+	}
+	return np
+}
+
+func requestIDMiddleware(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		request_id.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx := metadata.NewOutgoingContext(r.Context(),
+				metadata.New(map[string]string{
+					request_id.AmzRequestIDHeader: request_id.Get(r.Context()),
+				}))
+			h(w, r.WithContext(ctx))
+		})).ServeHTTP(w, r)
+	}
+}

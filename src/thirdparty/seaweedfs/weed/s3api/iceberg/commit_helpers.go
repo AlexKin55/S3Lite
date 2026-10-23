@@ -1,0 +1,310 @@
+package iceberg
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/apache/iceberg-go/table"
+	"github.com/google/uuid"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
+)
+
+const requirementAssertCreate = "assert-create"
+
+// sleepBeforeCommitRetry backs off between commit attempts, jittered so that
+// writers that collided do not line up again on the next try.
+func sleepBeforeCommitRetry(attempt int) {
+	jitter := time.Duration(rand.Int64N(int64(25 * time.Millisecond)))
+	time.Sleep(time.Duration(50*attempt)*time.Millisecond + jitter)
+}
+
+// stageCommitMetadata writes the metadata file a commit will point the catalog
+// at, returning the name and location it landed on. The exclusive create keeps
+// one writer from overwriting another's file; when the name is already taken
+// the metadata goes to a unique one instead of failing, because the file there
+// may be an orphan left by an interrupted commit, and refusing would wedge the
+// table until an orphan sweep ran. The catalog pointer, not the file name,
+// decides which commit won. This mirrors how the maintenance worker stages its
+// own metadata.
+func (s *Server) stageCommitMetadata(ctx context.Context, metadataBucket, metadataPath, location, metadataFileName string, metadataBytes []byte) (string, string, error) {
+	err := s.saveMetadataFile(ctx, metadataBucket, metadataPath, metadataFileName, metadataBytes, true)
+	if errors.Is(err, filer_pb.ErrEntryAlreadyExists) {
+		// v{N}-{uuid}, a form both the catalog and the maintenance worker
+		// still read the version from.
+		metadataFileName = fmt.Sprintf("%s-%s.metadata.json", strings.TrimSuffix(metadataFileName, ".metadata.json"), uuid.NewString())
+		glog.V(1).Infof("Iceberg: metadata file already staged for %s, using %s", location, metadataFileName)
+		err = s.saveMetadataFile(ctx, metadataBucket, metadataPath, metadataFileName, metadataBytes, true)
+	}
+	if err != nil {
+		return "", "", err
+	}
+	return metadataFileName, fmt.Sprintf("%s/metadata/%s", strings.TrimSuffix(location, "/"), metadataFileName), nil
+}
+
+type icebergRequestError struct {
+	status  int
+	errType string
+	message string
+}
+
+type createOnCommitInput struct {
+	bucketARN         string
+	markerBucket      string
+	namespace         []string
+	tableName         string
+	identityName      string
+	location          string
+	tableUUID         uuid.UUID
+	baseMetadata      table.Metadata
+	baseMetadataLoc   string
+	baseMetadataVer   int
+	updates           table.Updates
+	statisticsUpdates []statisticsUpdate
+}
+
+func isS3TablesConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, s3tables.ErrVersionTokenMismatch) {
+		return true
+	}
+	var tableErr *s3tables.S3TablesError
+	return errors.As(err, &tableErr) && tableErr.Type == s3tables.ErrCodeConflict
+}
+
+func isS3TablesNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "not found") {
+		return true
+	}
+	var tableErr *s3tables.S3TablesError
+	return errors.As(err, &tableErr) &&
+		(tableErr.Type == s3tables.ErrCodeNoSuchTable || tableErr.Type == s3tables.ErrCodeNoSuchNamespace || strings.Contains(strings.ToLower(tableErr.Message), "not found"))
+}
+
+func hasAssertCreateRequirement(requirements table.Requirements) bool {
+	for _, requirement := range requirements {
+		if requirement.GetType() == requirementAssertCreate {
+			return true
+		}
+	}
+	return false
+}
+
+func isS3TablesAlreadyExists(err error) bool {
+	if err == nil {
+		return false
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "already exists") {
+		return true
+	}
+	var tableErr *s3tables.S3TablesError
+	return errors.As(err, &tableErr) &&
+		(tableErr.Type == s3tables.ErrCodeTableAlreadyExists || tableErr.Type == s3tables.ErrCodeNamespaceAlreadyExists || strings.Contains(strings.ToLower(tableErr.Message), "already exists"))
+}
+
+func (s *Server) finalizeCreateOnCommit(ctx context.Context, input createOnCommitInput) (*CommitTableResponse, *icebergRequestError) {
+	builder, err := table.MetadataBuilderFromBase(input.baseMetadata, input.baseMetadataLoc)
+	if err != nil {
+		return nil, &icebergRequestError{
+			status:  http.StatusInternalServerError,
+			errType: "InternalServerError",
+			message: "Failed to create metadata builder: " + err.Error(),
+		}
+	}
+	for _, update := range input.updates {
+		if err := update.Apply(builder); err != nil {
+			return nil, &icebergRequestError{
+				status:  http.StatusBadRequest,
+				errType: "BadRequestException",
+				message: "Failed to apply update: " + err.Error(),
+			}
+		}
+	}
+
+	newMetadata, err := builder.Build()
+	if err != nil {
+		return nil, &icebergRequestError{
+			status:  http.StatusBadRequest,
+			errType: "BadRequestException",
+			message: "Failed to build new metadata: " + err.Error(),
+		}
+	}
+
+	metadataVersion := input.baseMetadataVer + 1
+	if metadataVersion <= 0 {
+		metadataVersion = 1
+	}
+	metadataFileName := fmt.Sprintf("v%d.metadata.json", metadataVersion)
+	newMetadataLocation := fmt.Sprintf("%s/metadata/%s", strings.TrimSuffix(input.location, "/"), metadataFileName)
+
+	metadataBytes, err := json.Marshal(newMetadata)
+	if err != nil {
+		return nil, &icebergRequestError{
+			status:  http.StatusInternalServerError,
+			errType: "InternalServerError",
+			message: "Failed to serialize metadata: " + err.Error(),
+		}
+	}
+	metadataBytes, err = applyStatisticsUpdates(metadataBytes, input.statisticsUpdates)
+	if err != nil {
+		return nil, &icebergRequestError{
+			status:  http.StatusBadRequest,
+			errType: "BadRequestException",
+			message: "Failed to apply statistics updates: " + err.Error(),
+		}
+	}
+	metadataBytes = refreshDefaultNameMapping(metadataBytes, newMetadata)
+	// Same spec-compliance fixup we apply on create-table; ensures
+	// v{N}.metadata.json files written through this create-on-commit path are
+	// also readable by strict Iceberg clients reading directly from S3.
+	metadataBytes = ensureMetadataSpecCompliance(metadataBytes)
+	newMetadata, err = table.ParseMetadataBytes(metadataBytes)
+	if err != nil {
+		return nil, &icebergRequestError{
+			status:  http.StatusInternalServerError,
+			errType: "InternalServerError",
+			message: "Failed to parse committed metadata: " + err.Error(),
+		}
+	}
+
+	metadataBucket, metadataPath, err := parseS3Location(input.location)
+	if err != nil {
+		return nil, &icebergRequestError{
+			status:  http.StatusInternalServerError,
+			errType: "InternalServerError",
+			message: "Invalid table location: " + err.Error(),
+		}
+	}
+	if err := confineMetadataLocation(metadataBucket, metadataPath, input.markerBucket); err != nil {
+		return nil, &icebergRequestError{
+			status:  http.StatusBadRequest,
+			errType: "BadRequestException",
+			message: err.Error(),
+		}
+	}
+	if err := s.saveMetadataFile(ctx, metadataBucket, metadataPath, metadataFileName, metadataBytes, false); err != nil {
+		return nil, &icebergRequestError{
+			status:  http.StatusInternalServerError,
+			errType: "InternalServerError",
+			message: "Failed to save metadata file: " + err.Error(),
+		}
+	}
+
+	createReq := &s3tables.CreateTableRequest{
+		TableBucketARN: input.bucketARN,
+		Namespace:      input.namespace,
+		Name:           input.tableName,
+		Format:         "ICEBERG",
+		Metadata: &s3tables.TableMetadata{
+			Iceberg: &s3tables.IcebergMetadata{
+				TableUUID: input.tableUUID.String(),
+			},
+			FullMetadata: metadataBytes,
+		},
+		MetadataVersion:  metadataVersion,
+		MetadataLocation: newMetadataLocation,
+	}
+	createErr := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		mgrClient := s3tables.NewManagerClient(client)
+		return s.tablesManager.Execute(ctx, mgrClient, "CreateTable", createReq, nil, input.identityName)
+	})
+	if createErr != nil {
+		if cleanupErr := s.deleteMetadataFile(ctx, metadataBucket, metadataPath, metadataFileName); cleanupErr != nil {
+			glog.V(1).Infof("Iceberg: failed to cleanup metadata file %s after create-on-commit failure: %v", newMetadataLocation, cleanupErr)
+		}
+		if isS3TablesConflict(createErr) || isS3TablesAlreadyExists(createErr) {
+			return nil, &icebergRequestError{
+				status:  http.StatusConflict,
+				errType: "CommitFailedException",
+				message: "Table was created concurrently",
+			}
+		}
+		glog.Errorf("Iceberg: CommitTable CreateTable error: %v", createErr)
+		return nil, &icebergRequestError{
+			status:  http.StatusInternalServerError,
+			errType: "InternalServerError",
+			message: "Failed to commit table creation: " + createErr.Error(),
+		}
+	}
+
+	markerBucket := input.markerBucket
+	if markerBucket == "" {
+		markerBucket = metadataBucket
+	}
+	if markerErr := s.deleteStageCreateMarkers(ctx, markerBucket, input.namespace, input.tableName); markerErr != nil {
+		glog.V(1).Infof("Iceberg: failed to cleanup stage-create markers for %s.%s after finalize: %v", flattenNamespacePath(input.namespace), input.tableName, markerErr)
+	}
+
+	return &CommitTableResponse{
+		MetadataLocation: newMetadataLocation,
+		Metadata:         newMetadata,
+	}, nil
+}
+
+// authorizeCommit asks the S3 Tables layer, before anything is written, whether
+// the caller may update the table. Both commit paths stage the new metadata
+// file in the table's directory before UpdateTable authorizes the pointer
+// flip, so without this gate a caller who may only read the table could still
+// make the server write and delete files under it. UpdateTable decides again
+// when the pointer flips.
+func (s *Server) authorizeCommit(ctx context.Context, bucketARN string, namespace []string, tableName, identityName string) *icebergRequestError {
+	err := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		return s.tablesManager.AuthorizeUpdateTable(ctx, s3tables.NewManagerClient(client), &s3tables.UpdateTableRequest{
+			TableBucketARN: bucketARN,
+			Namespace:      namespace,
+			Name:           tableName,
+		}, identityName)
+	})
+	if err == nil {
+		return nil
+	}
+	var tableErr *s3tables.S3TablesError
+	if errors.As(err, &tableErr) {
+		switch tableErr.Type {
+		case s3tables.ErrCodeAccessDenied:
+			return &icebergRequestError{http.StatusForbidden, "ForbiddenException", fmt.Sprintf("Not authorized to commit to table %s", tableName)}
+		case s3tables.ErrCodeNoSuchTable, s3tables.ErrCodeNoSuchNamespace:
+			return &icebergRequestError{http.StatusNotFound, "NoSuchTableException", fmt.Sprintf("Table does not exist: %s", tableName)}
+		}
+	}
+	glog.V(1).Infof("Iceberg: commit authorization for %s failed: %v", tableName, err)
+	return &icebergRequestError{http.StatusInternalServerError, "InternalServerError", "Failed to authorize commit: " + err.Error()}
+}
+
+// authorizeViewCommit is authorizeCommit for a view, whose update path stages
+// its metadata file before UpdateView authorizes the pointer flip.
+func (s *Server) authorizeViewCommit(ctx context.Context, bucketARN string, namespace []string, viewName, identityName string) *icebergRequestError {
+	err := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		return s.tablesManager.AuthorizeUpdateView(ctx, s3tables.NewManagerClient(client), &s3tables.UpdateViewRequest{
+			TableBucketARN: bucketARN,
+			Namespace:      namespace,
+			Name:           viewName,
+		}, identityName)
+	})
+	if err == nil {
+		return nil
+	}
+	var tableErr *s3tables.S3TablesError
+	if errors.As(err, &tableErr) {
+		switch tableErr.Type {
+		case s3tables.ErrCodeAccessDenied:
+			return &icebergRequestError{http.StatusForbidden, "ForbiddenException", fmt.Sprintf("Not authorized to commit to view %s", viewName)}
+		case s3tables.ErrCodeNoSuchView, s3tables.ErrCodeNoSuchNamespace:
+			return &icebergRequestError{http.StatusNotFound, "NoSuchViewException", fmt.Sprintf("View does not exist: %s", viewName)}
+		}
+	}
+	glog.V(1).Infof("Iceberg: view commit authorization for %s failed: %v", viewName, err)
+	return &icebergRequestError{http.StatusInternalServerError, "InternalServerError", "Failed to authorize commit: " + err.Error()}
+}

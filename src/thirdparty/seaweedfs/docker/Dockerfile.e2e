@@ -1,0 +1,44 @@
+FROM ubuntu:22.04
+
+LABEL author="Chris Lu"
+
+# Note: This e2e test image intentionally runs as root for simplicity and compatibility.
+# Production images (Dockerfile.go_build) use proper user isolation with su-exec.
+# For testing purposes, running as root avoids permission complexities and dependency
+# on Alpine-specific tools like su-exec (not available in Ubuntu repos).
+
+# apt-install prefers Azure's mirror, which archive.ubuntu.com is slow enough from
+# GitHub-hosted runners to justify, and falls through to archive.ubuntu.com when
+# Azure is unreachable - which it periodically is, and Acquire::Retries against a
+# single mirror just retries a dead host. Images built FROM this one install
+# through it for the same reason.
+COPY apt-install /usr/local/bin/apt-install
+RUN chmod +x /usr/local/bin/apt-install && \
+    apt-install curl fio fuse ca-certificates && \
+    rm -rf /tmp/* /var/tmp/*
+
+RUN mkdir -p /etc/seaweedfs /data/filerldb2
+
+COPY ./weed /usr/bin/
+COPY ./filer.toml /etc/seaweedfs/filer.toml
+COPY ./entrypoint_e2e.sh /entrypoint.sh
+
+# volume server grpc port
+EXPOSE 18080
+# volume server http port
+EXPOSE 8080
+# filer server grpc port
+EXPOSE 18888
+# filer server http port
+EXPOSE 8888
+# master server shared grpc port
+EXPOSE 19333
+# master server shared http port
+EXPOSE 9333
+
+VOLUME /data
+WORKDIR /data
+
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

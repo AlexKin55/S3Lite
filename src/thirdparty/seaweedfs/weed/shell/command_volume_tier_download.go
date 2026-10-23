@@ -1,0 +1,215 @@
+package shell
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"io"
+	"strings"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+
+	"google.golang.org/grpc"
+
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+)
+
+func init() {
+	Commands = append(Commands, &commandVolumeTierDownload{})
+}
+
+type commandVolumeTierDownload struct {
+}
+
+func (c *commandVolumeTierDownload) Name() string {
+	return "volume.tier.download"
+}
+
+func (c *commandVolumeTierDownload) Help() string {
+	return `download the dat file of a volume from a remote tier
+
+	volume.tier.download [-collection=""]
+	volume.tier.download [-collection=""] -volumeId=<volume_id> [-concurrency=<n>]
+
+	The -collection parameter supports regular expressions for pattern matching:
+	  - Use exact match: volume.tier.download -collection="^mybucket$"
+	  - Match multiple buckets: volume.tier.download -collection="bucket.*"
+	  - Match all collections: volume.tier.download -collection=".*"
+
+	e.g.:
+	volume.tier.download -volumeId=7
+	volume.tier.download -volumeId=7 -concurrency=1
+
+	This command will download the dat file of a volume from a remote tier to a volume server in local cluster.
+
+`
+}
+
+func (c *commandVolumeTierDownload) HasTag(CommandTag) bool {
+	return false
+}
+
+func (c *commandVolumeTierDownload) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
+
+	tierCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
+	volumeId := tierCommand.Int("volumeId", 0, "the volume id")
+	collection := tierCommand.String("collection", "", "comma-separated collection names, wildcards, or regex patterns; empty matches the collection with no name")
+	concurrency := tierCommand.Int("concurrency", 0, "multipart download concurrency (0 = backend default)")
+	if err = tierCommand.Parse(args); err != nil {
+		return nil
+	}
+
+	if err = validateTierConcurrency(*concurrency); err != nil {
+		return err
+	}
+
+	if err = commandEnv.confirmIsLocked(args); err != nil {
+		return
+	}
+
+	vid := needle.VolumeId(*volumeId)
+
+	// collect topology information
+	topologyInfo, _, err := collectTopologyInfo(commandEnv, 0)
+	if err != nil {
+		return err
+	}
+
+	// volumeId is provided
+	if vid != 0 {
+		return doVolumeTierDownload(commandEnv, writer, topologyInfo, *collection, vid, *concurrency)
+	}
+
+	// apply to all volumes in the collection
+	// reusing collectVolumeIdsForEcEncode for now
+	volumeIds, err := collectRemoteVolumes(topologyInfo, *collection)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("tier download volumes: %v\n", volumeIds)
+	for _, vid := range volumeIds {
+		if err = doVolumeTierDownload(commandEnv, writer, topologyInfo, *collection, vid, *concurrency); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func collectRemoteVolumes(topoInfo *master_pb.TopologyInfo, collectionPattern string) (vids []needle.VolumeId, err error) {
+	// compile regex pattern for collection matching
+	collectionMatcher, err := compileCollectionPattern(collectionPattern)
+	if err != nil {
+		return nil, fmt.Errorf("invalid collection pattern '%s': %v", collectionPattern, err)
+	}
+
+	vidMap := make(map[uint32]bool)
+	eachDataNode(topoInfo, func(dc DataCenterId, rack RackId, dn *master_pb.DataNodeInfo) {
+		for _, diskInfo := range dn.DiskInfos {
+			for _, v := range diskInfo.VolumeInfos {
+				if collectionMatcher.Matches(v.Collection) && v.RemoteStorageName != "" {
+					vidMap[v.Id] = true
+				}
+			}
+		}
+	})
+
+	for vid := range vidMap {
+		vids = append(vids, needle.VolumeId(vid))
+	}
+
+	return
+}
+
+func doVolumeTierDownload(commandEnv *CommandEnv, writer io.Writer, topoInfo *master_pb.TopologyInfo, collectionPattern string, vid needle.VolumeId, concurrency int) (err error) {
+	// find volume location
+	locations, found := commandEnv.MasterClient.GetLocationsClone(uint32(vid))
+	if !found {
+		return fmt.Errorf("volume %d not found", vid)
+	}
+
+	// The volume server verifies the request's collection against the volume's
+	// own, so the pattern must resolve to the actual collection here.
+	collection, found, err := findVolumeCollection(topoInfo, vid, collectionPattern)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("volume %d not found in collections matching %q", vid, collectionPattern)
+	}
+
+	// All replicas point at the same remote object; only the final download may delete
+	// it. Every earlier replica keeps it so the survivors are not left dangling.
+	// TODO parallelize this
+	for i, loc := range locations {
+		keepRemote := i < len(locations)-1
+		// copy the .dat file from remote tier to local
+		err = downloadDatFromRemoteTier(commandEnv.option.GrpcDialOption, writer, needle.VolumeId(vid), collection, loc.ServerAddress(), keepRemote, concurrency)
+		if err != nil {
+			// A replica already made local by a prior interrupted run is not a
+			// failure; skip it so the remaining remote replicas still download.
+			if strings.Contains(err.Error(), "already on local disk") {
+				fmt.Fprintf(writer, "volume %d on %s is already on local disk, skipping\n", vid, loc.Url)
+				continue
+			}
+			return fmt.Errorf("download dat file for volume %d to %s: %v", vid, loc.Url, err)
+		}
+	}
+
+	return nil
+}
+
+func downloadDatFromRemoteTier(grpcDialOption grpc.DialOption, writer io.Writer, volumeId needle.VolumeId, collection string, targetVolumeServer pb.ServerAddress, keepRemote bool, concurrency int) error {
+
+	err := operation.WithVolumeServerClient(true, targetVolumeServer, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
+		stream, downloadErr := volumeServerClient.VolumeTierMoveDatFromRemote(context.Background(), &volume_server_pb.VolumeTierMoveDatFromRemoteRequest{
+			VolumeId:          uint32(volumeId),
+			Collection:        collection,
+			KeepRemoteDatFile: keepRemote,
+			Concurrency:       int32(concurrency),
+		})
+
+		var lastProcessed int64
+		for {
+			resp, recvErr := stream.Recv()
+			if recvErr != nil {
+				if recvErr == io.EOF {
+					break
+				} else {
+					return recvErr
+				}
+			}
+
+			processingSpeed := float64(resp.Processed-lastProcessed) / 1024.0 / 1024.0
+
+			fmt.Fprintf(writer, "downloaded %.2f%%, %d bytes, %.2fMB/s\n", resp.ProcessedPercentage, resp.Processed, processingSpeed)
+
+			lastProcessed = resp.Processed
+		}
+		if downloadErr != nil {
+			return downloadErr
+		}
+
+		_, unmountErr := volumeServerClient.VolumeUnmount(context.Background(), &volume_server_pb.VolumeUnmountRequest{
+			VolumeId: uint32(volumeId),
+		})
+		if unmountErr != nil {
+			return unmountErr
+		}
+
+		_, mountErr := volumeServerClient.VolumeMount(context.Background(), &volume_server_pb.VolumeMountRequest{
+			VolumeId: uint32(volumeId),
+		})
+		if mountErr != nil {
+			return mountErr
+		}
+
+		return nil
+	})
+
+	return err
+
+}

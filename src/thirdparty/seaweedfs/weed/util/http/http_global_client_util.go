@@ -1,0 +1,839 @@
+package http
+
+import (
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/mem"
+	"github.com/seaweedfs/seaweedfs/weed/util/request_id"
+
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	util_http_client "github.com/seaweedfs/seaweedfs/weed/util/http/client"
+)
+
+var ErrNotFound = fmt.Errorf("not found")
+var ErrTooManyRequests = fmt.Errorf("too many requests")
+
+type jwtSigningReadConfig struct {
+	key     security.SigningKey
+	expires int
+}
+
+var (
+	jwtSigningReadConfigPtr atomic.Pointer[jwtSigningReadConfig]
+	loadJwtConfigOnce       sync.Once
+)
+
+func AppendQueryParameter(rawURL, key, value string) string {
+	encoded := url.Values{key: []string{value}}.Encode()
+	fragment := ""
+	if fragmentIndex := strings.Index(rawURL, "#"); fragmentIndex >= 0 {
+		fragment = rawURL[fragmentIndex:]
+		rawURL = rawURL[:fragmentIndex]
+	}
+
+	var result string
+	switch {
+	case strings.Contains(rawURL, "?"):
+		if strings.HasSuffix(rawURL, "?") || strings.HasSuffix(rawURL, "&") {
+			result = rawURL + encoded
+		} else {
+			result = rawURL + "&" + encoded
+		}
+	default:
+		result = rawURL + "?" + encoded
+	}
+	return result + fragment
+}
+
+func loadJwtConfig() {
+	v := util.GetViper()
+	jwtSigningReadConfigPtr.Store(&jwtSigningReadConfig{
+		key:     security.SigningKey(v.GetString("jwt.signing.read.key")),
+		expires: v.GetInt("jwt.signing.read.expires_after_seconds"),
+	})
+}
+
+// ReloadJwtSigningReadConfig re-reads the volume read-signing key from the
+// already-reloaded security config, so operators can rotate it via SIGHUP
+// without restarting the process.
+func ReloadJwtSigningReadConfig() {
+	loadJwtConfig()
+}
+
+func Post(url string, values url.Values) ([]byte, error) {
+	r, err := GetGlobalHttpClient().PostForm(url, values)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Body.Close()
+	b, err := io.ReadAll(r.Body)
+	if r.StatusCode >= 400 {
+		if err != nil {
+			return nil, fmt.Errorf("%s: %d - %s", url, r.StatusCode, string(b))
+		} else {
+			return nil, fmt.Errorf("%s: %s", url, r.Status)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// github.com/seaweedfs/seaweedfs/unmaintained/repeated_vacuum/repeated_vacuum.go
+// may need increasing http.Client.Timeout
+func Get(url string) ([]byte, bool, error) {
+	return GetAuthenticated(context.Background(), url, "")
+}
+
+func GetAuthenticated(ctx context.Context, url, jwt string) ([]byte, bool, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, true, err
+	}
+	maybeAddAuth(request, jwt)
+	request.Header.Add("Accept-Encoding", "gzip")
+
+	response, err := GetGlobalHttpClient().Do(request)
+	if err != nil {
+		if ctx.Err() == nil {
+			recordUnreachable(request.URL.Host)
+		}
+		return nil, true, err
+	}
+	recordReachable(request.URL.Host)
+	defer CloseResponse(response)
+
+	if response.StatusCode >= 400 {
+		retryable := response.StatusCode >= 500
+		return nil, retryable, StatusError(url, response)
+	}
+
+	var reader io.ReadCloser
+	switch response.Header.Get("Content-Encoding") {
+	case "gzip":
+		reader, err = gzip.NewReader(response.Body)
+		if err != nil {
+			return nil, true, err
+		}
+		defer reader.Close()
+	default:
+		reader = response.Body
+	}
+
+	b, err := io.ReadAll(reader)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, false, ctxErr
+		}
+		return nil, false, err
+	}
+	return b, false, nil
+}
+
+func Head(url string) (http.Header, error) {
+	r, err := GetGlobalHttpClient().Head(url)
+	if err != nil {
+		return nil, err
+	}
+	defer CloseResponse(r)
+	if r.StatusCode >= 400 {
+		return nil, fmt.Errorf("%s: %s", url, r.Status)
+	}
+	return r.Header, nil
+}
+
+func maybeAddAuth(req *http.Request, jwt string) {
+	if jwt != "" {
+		req.Header.Set("Authorization", security.BearerPrefix+string(jwt))
+	}
+}
+
+func Delete(url string, jwt string) error {
+	req, err := http.NewRequest(http.MethodDelete, url, nil)
+	if err != nil {
+		return err
+	}
+	maybeAddAuth(req, jwt)
+	resp, e := GetGlobalHttpClient().Do(req)
+	if e != nil {
+		return e
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	switch resp.StatusCode {
+	case http.StatusNotFound, http.StatusNoContent, http.StatusAccepted, http.StatusOK:
+		return nil
+	}
+	m := make(map[string]interface{})
+	if e := json.Unmarshal(body, &m); e == nil {
+		if s, ok := m["error"].(string); ok {
+			return errors.New(s)
+		}
+	}
+	return errors.New(string(body))
+}
+
+func DeleteProxied(url string, jwt string) (body []byte, httpStatus int, err error) {
+	req, err := http.NewRequest(http.MethodDelete, url, nil)
+	if err != nil {
+		return
+	}
+	maybeAddAuth(req, jwt)
+	resp, err := GetGlobalHttpClient().Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	body, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+	httpStatus = resp.StatusCode
+	return
+}
+
+func GetBufferStream(url string, values url.Values, allocatedBytes []byte, eachBuffer func([]byte)) error {
+	r, err := GetGlobalHttpClient().PostForm(url, values)
+	if err != nil {
+		return err
+	}
+	defer CloseResponse(r)
+	if r.StatusCode != 200 {
+		return fmt.Errorf("%s: %s", url, r.Status)
+	}
+	for {
+		n, err := r.Body.Read(allocatedBytes)
+		if n > 0 {
+			eachBuffer(allocatedBytes[:n])
+		}
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func GetUrlStream(url string, values url.Values, readFn func(io.Reader) error) error {
+	r, err := GetGlobalHttpClient().PostForm(url, values)
+	if err != nil {
+		return err
+	}
+	defer CloseResponse(r)
+	if r.StatusCode != 200 {
+		return fmt.Errorf("%s: %s", url, r.Status)
+	}
+	return readFn(r.Body)
+}
+
+func DownloadFile(fileUrl string, jwt string, offset ...int64) (filename string, header http.Header, resp *http.Response, e error) {
+	return DownloadFileWithClient(GetGlobalHttpClient(), fileUrl, jwt, offset...)
+}
+
+// DownloadFileWithClient is like DownloadFile but uses the provided HTTP client
+// instead of the global one. This is used by filer.sync to download from
+// remote clusters that use different TLS certificates.
+func DownloadFileWithClient(client *util_http_client.HTTPClient, fileUrl string, jwt string, offset ...int64) (filename string, header http.Header, resp *http.Response, e error) {
+	if client == nil {
+		return "", nil, nil, fmt.Errorf("nil HTTP client in DownloadFileWithClient")
+	}
+	req, err := http.NewRequest(http.MethodGet, fileUrl, nil)
+	if err != nil {
+		return "", nil, nil, err
+	}
+
+	maybeAddAuth(req, jwt)
+
+	var rangeOffset int64
+	if len(offset) > 0 {
+		rangeOffset = offset[0]
+	}
+	if rangeOffset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", rangeOffset))
+	}
+
+	response, err := client.Do(req)
+	if err != nil {
+		return "", nil, nil, err
+	}
+
+	if rangeOffset > 0 {
+		expected := fmt.Sprintf("bytes %d-", rangeOffset)
+		if response.StatusCode != http.StatusPartialContent ||
+			!strings.HasPrefix(response.Header.Get("Content-Range"), expected) {
+			CloseResponse(response)
+			return "", nil, nil, fmt.Errorf("range request %q to %s returned %s with Content-Range %q",
+				req.Header.Get("Range"), fileUrl, response.Status, response.Header.Get("Content-Range"))
+		}
+	}
+
+	header = response.Header
+	contentDisposition := response.Header["Content-Disposition"]
+	if len(contentDisposition) > 0 {
+		idx := strings.Index(contentDisposition[0], "filename=")
+		if idx != -1 {
+			filename = contentDisposition[0][idx+len("filename="):]
+			filename = strings.Trim(filename, "\"")
+		}
+	}
+	resp = response
+	return
+}
+
+func Do(req *http.Request) (resp *http.Response, err error) {
+	return GetGlobalHttpClient().Do(req)
+}
+
+func NormalizeUrl(url string) (string, error) {
+	return GetGlobalHttpClient().NormalizeHttpScheme(url)
+}
+
+func ReadUrl(ctx context.Context, fileUrl string, cipherKey []byte, isContentCompressed bool, isFullChunk bool, offset int64, size int, buf []byte) (int64, error) {
+
+	if cipherKey != nil {
+		var n int
+		_, err := readEncryptedUrl(ctx, fileUrl, "", cipherKey, isContentCompressed, isFullChunk, offset, size, func(data []byte) {
+			n = copy(buf, data)
+		})
+		return int64(n), err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, fileUrl, nil)
+	if err != nil {
+		return 0, err
+	}
+	if !isFullChunk {
+		req.Header.Add("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+int64(size)-1))
+	} else {
+		req.Header.Set("Accept-Encoding", "gzip")
+	}
+
+	r, err := GetGlobalHttpClient().Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer CloseResponse(r)
+
+	if r.StatusCode >= 400 {
+		return 0, StatusError(fileUrl, r)
+	}
+
+	var reader io.ReadCloser
+	contentEncoding := r.Header.Get("Content-Encoding")
+	switch contentEncoding {
+	case "gzip":
+		reader, err = gzip.NewReader(r.Body)
+		if err != nil {
+			return 0, err
+		}
+		defer reader.Close()
+	default:
+		reader = r.Body
+	}
+
+	var (
+		i, m int
+		n    int64
+	)
+
+	// refers to https://github.com/golang/go/blob/master/src/bytes/buffer.go#L199
+	// commit id c170b14c2c1cfb2fd853a37add92a82fd6eb4318
+	for {
+		m, err = reader.Read(buf[i:])
+		i += m
+		n += int64(m)
+		if err == io.EOF {
+			return n, nil
+		}
+		if err != nil {
+			return n, err
+		}
+		if n == int64(len(buf)) {
+			break
+		}
+	}
+	// drains the response body to avoid memory leak
+	data, _ := io.ReadAll(reader)
+	if len(data) != 0 {
+		glog.V(1).InfofCtx(ctx, "%s reader has remaining %d bytes", contentEncoding, len(data))
+	}
+	return n, err
+}
+
+func ReadUrlAsStream(ctx context.Context, fileUrl, jwt string, cipherKey []byte, isContentGzipped bool, isFullChunk bool, offset int64, size int, fn func(data []byte)) (retryable bool, err error) {
+	if cipherKey != nil {
+		return readEncryptedUrl(ctx, fileUrl, jwt, cipherKey, isContentGzipped, isFullChunk, offset, size, fn)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileUrl, nil)
+	if err != nil {
+		return false, err
+	}
+	maybeAddAuth(req, jwt)
+
+	if isFullChunk {
+		req.Header.Add("Accept-Encoding", "gzip")
+	} else {
+		req.Header.Add("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+int64(size)-1))
+	}
+	request_id.InjectToRequest(ctx, req)
+
+	r, err := GetGlobalHttpClient().Do(req)
+	if err != nil {
+		if ctx.Err() == nil {
+			recordUnreachable(req.URL.Host)
+		}
+		return true, err
+	}
+	recordReachable(req.URL.Host)
+	defer CloseResponse(r)
+	if r.StatusCode >= 400 {
+		if r.StatusCode == http.StatusNotFound {
+			return true, fmt.Errorf("%s: %s: %w", fileUrl, r.Status, ErrNotFound)
+		}
+		if r.StatusCode == http.StatusTooManyRequests {
+			return false, fmt.Errorf("%s: %s: %w", fileUrl, r.Status, ErrTooManyRequests)
+		}
+		retryable = r.StatusCode >= 499
+		return retryable, StatusError(fileUrl, r)
+	}
+
+	var reader io.ReadCloser
+	contentEncoding := r.Header.Get("Content-Encoding")
+	switch contentEncoding {
+	case "gzip":
+		reader, err = gzip.NewReader(r.Body)
+		if err != nil {
+			return true, err
+		}
+		defer reader.Close()
+	default:
+		reader = r.Body
+	}
+
+	var (
+		m int
+	)
+	buf := mem.Allocate(256 * 1024)
+	defer mem.Free(buf)
+
+	for {
+		// Check for context cancellation before each read
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		default:
+		}
+
+		m, err = reader.Read(buf)
+		if m > 0 {
+			fn(buf[:m])
+		}
+		if err == io.EOF {
+			return false, nil
+		}
+		if err != nil {
+			return true, err
+		}
+	}
+
+}
+
+func readEncryptedUrl(ctx context.Context, fileUrl, jwt string, cipherKey []byte, isContentCompressed bool, isFullChunk bool, offset int64, size int, fn func(data []byte)) (bool, error) {
+	encryptedData, retryable, err := GetAuthenticated(ctx, fileUrl, jwt)
+	if err != nil {
+		return retryable, fmt.Errorf("fetch %s: %v", fileUrl, err)
+	}
+	decryptedData, err := util.Decrypt(encryptedData, util.CipherKey(cipherKey))
+	if err != nil {
+		return false, fmt.Errorf("decrypt %s: %v", fileUrl, err)
+	}
+	if isContentCompressed {
+		decryptedData, err = util.DecompressData(decryptedData)
+		if err != nil {
+			glog.V(0).InfofCtx(ctx, "unzip decrypt %s: %v", fileUrl, err)
+		}
+	}
+	if len(decryptedData) < int(offset)+size {
+		return false, fmt.Errorf("read decrypted %s size %d [%d, %d)", fileUrl, len(decryptedData), offset, int(offset)+size)
+	}
+	if isFullChunk {
+		fn(decryptedData)
+	} else {
+		sliceEnd := int(offset) + size
+		fn(decryptedData[int(offset):sliceEnd])
+	}
+	return false, nil
+}
+
+func ReadUrlAsReaderCloser(fileUrl string, jwt string, rangeHeader string) (*http.Response, io.ReadCloser, error) {
+
+	req, err := http.NewRequest(http.MethodGet, fileUrl, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	if rangeHeader != "" {
+		req.Header.Add("Range", rangeHeader)
+	} else {
+		req.Header.Add("Accept-Encoding", "gzip")
+	}
+
+	maybeAddAuth(req, jwt)
+
+	r, err := GetGlobalHttpClient().Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	if r.StatusCode >= 400 {
+		err = StatusError(fileUrl, r)
+		CloseResponse(r)
+		return nil, nil, err
+	}
+
+	var reader io.ReadCloser
+	contentEncoding := r.Header.Get("Content-Encoding")
+	switch contentEncoding {
+	case "gzip":
+		reader, err = gzip.NewReader(r.Body)
+		if err != nil {
+			return nil, nil, err
+		}
+	default:
+		reader = r.Body
+	}
+
+	return r, reader, nil
+}
+
+// StatusError adds the message a server writes into the body of a failed
+// request, such as a volume server CRC mismatch, to the status line.
+func StatusError(fileUrl string, r *http.Response) error {
+	var reader io.Reader = r.Body
+	if r.Header.Get("Content-Encoding") == "gzip" {
+		if gz, err := gzip.NewReader(r.Body); err == nil {
+			reader = gz
+		}
+	}
+	body, _ := io.ReadAll(io.LimitReader(reader, 1024))
+	msg := strings.TrimSpace(string(body))
+	var m struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(body, &m) == nil && m.Error != "" {
+		msg = m.Error
+	}
+	if msg == "" {
+		return fmt.Errorf("%s: %s", fileUrl, r.Status)
+	}
+	return fmt.Errorf("%s: %s: %s", fileUrl, r.Status, msg)
+}
+
+func CloseResponse(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	reader := &CountingReader{reader: resp.Body}
+	io.Copy(io.Discard, reader)
+	resp.Body.Close()
+	if reader.BytesRead > 0 {
+		glog.V(1).Infof("response leftover %d bytes", reader.BytesRead)
+	}
+}
+
+func CloseRequest(req *http.Request) {
+	reader := &CountingReader{reader: req.Body}
+	io.Copy(io.Discard, reader)
+	req.Body.Close()
+	if reader.BytesRead > 0 {
+		glog.V(1).Infof("request leftover %d bytes", reader.BytesRead)
+	}
+}
+
+type CountingReader struct {
+	reader    io.Reader
+	BytesRead int
+}
+
+func (r *CountingReader) Read(p []byte) (n int, err error) {
+	n, err = r.reader.Read(p)
+	r.BytesRead += n
+	return n, err
+}
+
+// refreshedUrls asks for a fresh location list and reports whether it is worth
+// retrying on: a list that comes back empty, or identical to the one that just
+// failed everywhere, says the locations were never the problem.
+func refreshedUrls(ctx context.Context, refreshUrls RefreshUrlsFunc, current []string, fileId string) ([]string, bool) {
+	if refreshUrls == nil {
+		return nil, false
+	}
+	fresh := refreshUrls()
+	if len(fresh) == 0 || SameUrls(current, fresh) {
+		return nil, false
+	}
+	glog.V(0).InfofCtx(ctx, "chunk %s failed on every known location, retrying on %d fresh ones", fileId, len(fresh))
+	return fresh, true
+}
+
+// SameUrls reports whether two location lists hold the same URLs, regardless of
+// order: lookups shuffle the locations they return, so comparing positionally
+// would read a reshuffle of the very same replicas as a fresh set.
+func SameUrls(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, url := range a {
+		counts[url]++
+	}
+	for _, url := range b {
+		if counts[url] == 0 {
+			return false
+		}
+		counts[url]--
+	}
+	return true
+}
+
+// RefreshUrlsFunc supplies a fresh location list for a chunk. The retry loops
+// call it at most once: after every location in the list failed, to retry on
+// the fresh list at once, or after a later location answered for one that
+// failed, so the next read starts from what the cluster knows now instead of
+// trying the same dead replica again. Returning nil or the same list leaves
+// the caller on the original locations.
+type RefreshUrlsFunc func() []string
+
+// RetriedFetchChunkData reads a chunk, trying every location before backing off
+// and trying them again. refreshUrls may be nil; when it is not, a pass in which
+// every location failed is treated as a stale list rather than a slow cluster,
+// and the fresh list is tried immediately instead of after the next backoff.
+// A pass that failed on one location and succeeded on another refreshes the
+// list for the reads that follow.
+func RetriedFetchChunkData(ctx context.Context, buffer []byte, urlStrings []string, cipherKey []byte, isGzipped bool, isFullChunk bool, offset int64, fileId string, refreshUrls RefreshUrlsFunc) (n int, err error) {
+
+	var jwt security.EncodedJwt
+	if len(urlStrings) > 0 && IsProxyChunkUrl(urlStrings[0]) {
+		jwt = security.EncodedJwt(JwtForFilerServer(false))
+	} else {
+		loadJwtConfigOnce.Do(loadJwtConfig)
+		if cfg := jwtSigningReadConfigPtr.Load(); cfg != nil && len(cfg.key) > 0 {
+			jwt = security.GenJwtForVolumeServer(cfg.key, cfg.expires, fileId)
+		}
+	}
+
+	// For unencrypted, non-gzipped full chunks, use direct buffer read
+	// This avoids the 64KB intermediate buffer and callback overhead
+	if cipherKey == nil && !isGzipped && isFullChunk {
+		return retriedFetchChunkDataDirect(ctx, buffer, urlStrings, string(jwt), fileId, refreshUrls)
+	}
+
+	var shouldRetry bool
+
+	for waitTime := time.Second; waitTime < util.RetryWaitTime; waitTime += waitTime / 2 {
+		// Check for context cancellation before starting retry loop
+		select {
+		case <-ctx.Done():
+			return n, ctx.Err()
+		default:
+		}
+
+		var failed bool
+		for _, urlString := range ReachableFirst(urlStrings) {
+			// Check for context cancellation before each volume server request
+			select {
+			case <-ctx.Done():
+				return n, ctx.Err()
+			default:
+			}
+
+			n = 0
+			if strings.Contains(urlString, "%") {
+				urlString = url.PathEscape(urlString)
+			}
+			shouldRetry, err = ReadUrlAsStream(ctx, AppendQueryParameter(urlString, "readDeleted", "true"), string(jwt), cipherKey, isGzipped, isFullChunk, offset, len(buffer), func(data []byte) {
+				// Check for context cancellation during data processing
+				select {
+				case <-ctx.Done():
+					// Stop processing data when context is cancelled
+					return
+				default:
+				}
+
+				if n < len(buffer) {
+					x := copy(buffer[n:], data)
+					n += x
+				}
+			})
+			if !shouldRetry {
+				break
+			}
+			if err != nil {
+				failed = true
+				glog.V(0).InfofCtx(ctx, "read %s failed, err: %v", urlString, err)
+			} else {
+				break
+			}
+		}
+		if err == nil && failed && refreshUrls != nil {
+			refreshUrls()
+		}
+		if err != nil && shouldRetry {
+			if fresh, ok := refreshedUrls(ctx, refreshUrls, urlStrings, fileId); ok {
+				urlStrings, refreshUrls = fresh, nil
+				continue
+			}
+			refreshUrls = nil
+			glog.V(0).InfofCtx(ctx, "retry reading in %v", waitTime)
+			// Sleep with proper context cancellation and timer cleanup
+			timer := time.NewTimer(waitTime)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return n, ctx.Err()
+			case <-timer.C:
+				// Continue with retry
+			}
+		} else {
+			break
+		}
+	}
+
+	return n, err
+
+}
+
+// retriedFetchChunkDataDirect reads chunk data directly into the buffer without
+// intermediate buffering. This reduces memory copies and improves throughput
+// for large chunk reads.
+func retriedFetchChunkDataDirect(ctx context.Context, buffer []byte, urlStrings []string, jwt, fileId string, refreshUrls RefreshUrlsFunc) (n int, err error) {
+	var shouldRetry bool
+
+	for waitTime := time.Second; waitTime < util.RetryWaitTime; waitTime += waitTime / 2 {
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		default:
+		}
+
+		var failed bool
+		for _, urlString := range ReachableFirst(urlStrings) {
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			default:
+			}
+
+			n, shouldRetry, err = readUrlDirectToBuffer(ctx, AppendQueryParameter(urlString, "readDeleted", "true"), jwt, buffer)
+			if err == nil {
+				if failed && refreshUrls != nil {
+					refreshUrls()
+				}
+				return n, nil
+			}
+			if !shouldRetry {
+				break
+			}
+			failed = true
+			glog.V(0).InfofCtx(ctx, "read %s failed, err: %v", urlString, err)
+		}
+
+		if err != nil && shouldRetry {
+			if fresh, ok := refreshedUrls(ctx, refreshUrls, urlStrings, fileId); ok {
+				urlStrings, refreshUrls = fresh, nil
+				continue
+			}
+			refreshUrls = nil
+			glog.V(0).InfofCtx(ctx, "retry reading in %v", waitTime)
+			timer := time.NewTimer(waitTime)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return 0, ctx.Err()
+			case <-timer.C:
+			}
+		} else {
+			break
+		}
+	}
+
+	return n, err
+}
+
+// readUrlDirectToBuffer reads HTTP response directly into the provided buffer,
+// avoiding intermediate buffer allocations and copies.
+func readUrlDirectToBuffer(ctx context.Context, fileUrl, jwt string, buffer []byte) (n int, retryable bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileUrl, nil)
+	if err != nil {
+		return 0, false, err
+	}
+	maybeAddAuth(req, jwt)
+	request_id.InjectToRequest(ctx, req)
+
+	r, err := GetGlobalHttpClient().Do(req)
+	if err != nil {
+		if ctx.Err() == nil {
+			recordUnreachable(req.URL.Host)
+		}
+		return 0, true, err
+	}
+	recordReachable(req.URL.Host)
+	defer CloseResponse(r)
+
+	if r.StatusCode >= 400 {
+		if r.StatusCode == http.StatusNotFound {
+			return 0, true, fmt.Errorf("%s: %s: %w", fileUrl, r.Status, ErrNotFound)
+		}
+		if r.StatusCode == http.StatusTooManyRequests {
+			return 0, false, fmt.Errorf("%s: %s: %w", fileUrl, r.Status, ErrTooManyRequests)
+		}
+		retryable = r.StatusCode >= 499
+		return 0, retryable, StatusError(fileUrl, r)
+	}
+
+	// Read directly into the buffer without intermediate copying
+	// This is significantly faster for large chunks (16MB+)
+	var totalRead int
+	for totalRead < len(buffer) {
+		select {
+		case <-ctx.Done():
+			return totalRead, false, ctx.Err()
+		default:
+		}
+
+		m, readErr := r.Body.Read(buffer[totalRead:])
+		totalRead += m
+		if readErr != nil {
+			if readErr == io.EOF {
+				// Return io.ErrUnexpectedEOF if we haven't filled the buffer
+				// This prevents silent data corruption from truncated responses
+				if totalRead < len(buffer) {
+					return totalRead, true, io.ErrUnexpectedEOF
+				}
+				return totalRead, false, nil
+			}
+			return totalRead, true, readErr
+		}
+	}
+
+	return totalRead, false, nil
+}

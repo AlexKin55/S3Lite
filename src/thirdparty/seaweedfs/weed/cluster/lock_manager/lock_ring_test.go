@@ -1,0 +1,137 @@
+package lock_manager
+
+import (
+	"testing"
+	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestLockRing_SetSnapshot(t *testing.T) {
+	r := NewLockRing(100 * time.Millisecond)
+
+	// Set 5 servers
+	r.SetSnapshot([]pb.ServerAddress{
+		"localhost:8080", "localhost:8081", "localhost:8082",
+		"localhost:8083", "localhost:8084",
+	}, 1)
+
+	servers := r.GetSnapshot()
+	assert.Equal(t, 5, len(servers))
+
+	// Replace with 2 servers
+	r.SetSnapshot([]pb.ServerAddress{"localhost:8081", "localhost:8083"}, 2)
+
+	r.WaitForCleanup()
+	servers = r.GetSnapshot()
+	assert.Equal(t, 2, len(servers))
+	assert.Contains(t, servers, pb.ServerAddress("localhost:8081"))
+	assert.Contains(t, servers, pb.ServerAddress("localhost:8083"))
+
+	// Verify compaction
+	time.Sleep(110 * time.Millisecond)
+	r.WaitForCleanup()
+	assert.LessOrEqual(t, r.GetSnapshotCount(), 2)
+}
+
+func TestLockRing_SnapshotCompaction(t *testing.T) {
+	r := NewLockRing(100 * time.Millisecond)
+
+	r.SetSnapshot([]pb.ServerAddress{"localhost:8080", "localhost:8081"}, 1)
+	assert.Equal(t, 1, r.GetSnapshotCount())
+
+	r.SetSnapshot([]pb.ServerAddress{"localhost:8080", "localhost:8081", "localhost:8082"}, 2)
+	assert.Equal(t, 2, r.GetSnapshotCount())
+
+	// Wait for compaction
+	time.Sleep(110 * time.Millisecond)
+	r.WaitForCleanup()
+
+	r.SetSnapshot([]pb.ServerAddress{"localhost:8080", "localhost:8081", "localhost:8082", "localhost:8083"}, 3)
+	assert.LessOrEqual(t, r.GetSnapshotCount(), 3)
+	servers := r.GetSnapshot()
+	assert.Equal(t, 4, len(servers))
+
+	time.Sleep(110 * time.Millisecond)
+	r.WaitForCleanup()
+	assert.LessOrEqual(t, r.GetSnapshotCount(), 2, "Snapshots should be compacted")
+
+	r.SetSnapshot([]pb.ServerAddress{
+		"localhost:8080", "localhost:8081", "localhost:8082",
+		"localhost:8083", "localhost:8084",
+	}, 4)
+	servers = r.GetSnapshot()
+	assert.Equal(t, 5, len(servers))
+}
+
+func TestLockRing_VersionRejectsStale(t *testing.T) {
+	r := NewLockRing(100 * time.Millisecond)
+
+	// Apply version 3
+	ok := r.SetSnapshot([]pb.ServerAddress{"a:1", "b:2", "c:3"}, 3)
+	assert.True(t, ok)
+	assert.Equal(t, int64(3), r.Version())
+	assert.Equal(t, 3, len(r.GetSnapshot()))
+
+	// Stale version 2 — should be rejected
+	ok = r.SetSnapshot([]pb.ServerAddress{"x:1"}, 2)
+	assert.False(t, ok)
+	assert.Equal(t, int64(3), r.Version())
+	assert.Equal(t, 3, len(r.GetSnapshot()), "stale update should not change the ring")
+
+	// Same version 3 — accepted (SetSnapshot accepts version >= current, state-changing)
+	ok = r.SetSnapshot([]pb.ServerAddress{"a:1", "b:2"}, 3)
+	assert.True(t, ok)
+	assert.Equal(t, 2, len(r.GetSnapshot()))
+
+	// Newer version 5 — should be accepted
+	ok = r.SetSnapshot([]pb.ServerAddress{"d:1", "e:2", "f:3", "g:4"}, 5)
+	assert.True(t, ok)
+	assert.Equal(t, int64(5), r.Version())
+	assert.Equal(t, 4, len(r.GetSnapshot()))
+
+	// Version 0 always accepted (bootstrap)
+	ok = r.SetSnapshot([]pb.ServerAddress{"z:1"}, 0)
+	assert.True(t, ok)
+	assert.Equal(t, 1, len(r.GetSnapshot()))
+}
+
+func TestLockRing_SetSnapshotUnchangedOnlyBumpsVersion(t *testing.T) {
+	r := NewLockRing(100 * time.Millisecond)
+	callbacks := 0
+	r.SetTakeSnapshotCallback(func(snapshot []pb.ServerAddress) { callbacks++ })
+
+	assert.True(t, r.SetSnapshot([]pb.ServerAddress{"a:1", "b:2"}, 100))
+	assert.Equal(t, 1, callbacks)
+
+	// A periodic rebroadcast with the same members refreshes the version
+	// without a new snapshot or another topology-change callback.
+	assert.True(t, r.SetSnapshot([]pb.ServerAddress{"b:2", "a:1"}, 200))
+	assert.Equal(t, int64(200), r.Version())
+	assert.Equal(t, 1, r.GetSnapshotCount())
+	assert.Equal(t, 1, callbacks, "unchanged ring must not fire the topology callback")
+
+	assert.True(t, r.SetSnapshot([]pb.ServerAddress{"a:1", "b:2", "c:3"}, 300))
+	assert.Equal(t, 2, callbacks)
+}
+
+func TestLockRing_Reset(t *testing.T) {
+	r := NewLockRing(100 * time.Millisecond)
+
+	// A high version accepted from a former leader must not reject the new
+	// leader's view once the client has moved masters.
+	ok := r.SetSnapshot([]pb.ServerAddress{"a:1", "b:2"}, 100)
+	assert.True(t, ok)
+
+	r.Reset()
+	assert.Equal(t, int64(0), r.Version())
+	// The operational ring survives the reset: writes keep routing to the
+	// last known owner until the new leader's snapshot arrives.
+	assert.Equal(t, 2, len(r.GetSnapshot()))
+	assert.NotEqual(t, "", string(r.GetPrimary("key")))
+
+	ok = r.SetSnapshot([]pb.ServerAddress{"c:1"}, 50)
+	assert.True(t, ok, "lower version from a different master must apply after reset")
+	assert.Equal(t, 1, len(r.GetSnapshot()))
+}

@@ -1,0 +1,249 @@
+# Put this file to one of the location, with descending priority
+#    ./security.toml
+#    $HOME/.seaweedfs/security.toml
+#    /etc/seaweedfs/security.toml
+# this file is read by master, volume server, filer, and worker
+
+# Any value below can also be supplied as an environment variable instead of
+# living in this file: prefix the key with WEED_, upper-case it, and replace
+# "." with "_". This is the recommended way to inject the secrets in here from
+# a Kubernetes Secret (env valueFrom.secretKeyRef) rather than a ConfigMap.
+# The JWT signing keys map to:
+#   WEED_JWT_SIGNING_KEY, WEED_JWT_SIGNING_READ_KEY              (master <-> volume)
+#   WEED_JWT_FILER_SIGNING_KEY, WEED_JWT_FILER_SIGNING_READ_KEY  (s3/clients <-> filer)
+# A set env var wins over the file, so the file can stay empty (or absent).
+
+# comma separated origins allowed to make requests to the filer and s3 gateway.
+# enter in this format: https://domain.com, or http://localhost:port
+[cors.allowed_origins]
+values = "*"
+
+# this jwt signing key is read by master and volume server, and it is used for write operations:
+# - the Master server generates the JWT, which can be used to write a certain file on a volume server
+# - the Volume server validates the JWT on writing
+# the jwt defaults to expire after 10 seconds.
+[jwt.signing]
+key = ""
+expires_after_seconds = 10           # seconds
+
+# by default, if the signing key above is set, the Volume UI over HTTP is disabled.
+# by setting ui.access to true, you can re-enable the Volume UI. Despite
+# some information leakage (as the UI is not authenticated), this should not
+# pose a security risk.
+[access]
+ui = false
+
+# by default the filer UI is enabled. This can be a security risk if the filer is exposed to the public
+# and the JWT for reads is not set. If you don't want the public to have access to the objects in your
+# storage, and you haven't set the JWT for reads it is wise to disable access to directory metadata.
+# This disables access to the Filer UI, and will no longer return directory metadata in GET requests.
+[filer.expose_directory_metadata]
+enabled = true
+
+# this jwt signing key is read by master and volume server, and it is used for read operations:
+# - the Master server generates the JWT, which can be used to read a certain file on a volume server
+# - the Volume server validates the JWT on reading
+# NOTE: jwt for read is only supported with master+volume setup. Filer does not support this mode.
+[jwt.signing.read]
+key = ""
+expires_after_seconds = 10           # seconds
+
+
+# If this JWT key is configured, Filer only accepts writes over HTTP if they are signed with this JWT:
+# - f.e. the S3 API Shim generates the JWT
+# - the Filer server validates the JWT on writing
+# NOTE: This key is ALSO used as a fallback signing key for S3 STS if s3.iam.config does not specify a signingKey.
+# NOTE: This key also gates the filer IAM gRPC service (CreateUser, PutPolicy,
+#       CreateAccessKey, ...). When set, every IAM RPC must carry a Bearer
+#       token signed with this key in its "authorization" gRPC metadata; mint
+#       such a token with security.GenJwtForFilerAdmin. When empty, the IAM
+#       gRPC service runs unauthenticated, like the rest of the filer's gRPC
+#       surface — set the key on both filer and admin if the gRPC port is
+#       reachable beyond a trusted network.
+# the jwt defaults to expire after 10 seconds.
+[jwt.filer_signing]
+key = ""
+expires_after_seconds = 10           # seconds
+
+# If this JWT key is configured, Filer only accepts reads over HTTP if they are signed with this JWT:
+# - f.e. the S3 API Shim generates the JWT
+# - the Filer server validates the JWT on reading
+# the jwt defaults to expire after 10 seconds.
+[jwt.filer_signing.read]
+key = ""
+expires_after_seconds = 10           # seconds
+
+# gRPC mTLS configuration
+# All gRPC TLS authentications are mutual (mTLS)
+# The values for ca, cert, and key are paths to the certificate/key files
+# The host name is not checked, so the certificate files can be shared
+# Each [grpc.<component>] section also accepts optional client_cert/client_key,
+# presented when that component dials other servers. Set them when your CA
+# issues separate serverAuth-only and clientAuth-only certificates; when unset,
+# the component reuses cert/key for both directions.
+# If client and server certificates come from different issuing CAs, put both
+# CA certificates in the ca PEM file.
+[grpc]
+ca = ""
+# Set wildcard domain for enable TLS authentication by common names
+allowed_wildcard_domain = "" # .mycompany.com
+
+# Volume server gRPC options (server-side)
+# Enables mTLS for incoming gRPC connections to volume server
+[grpc.volume]
+cert = ""
+key = ""
+client_cert = ""
+client_key = ""
+allowed_commonNames = ""    # comma-separated SSL certificate common names
+
+# Master server gRPC options (server-side)
+# Enables mTLS for incoming gRPC connections to master server
+[grpc.master]
+cert = ""
+key = ""
+client_cert = ""
+client_key = ""
+allowed_commonNames = ""    # comma-separated SSL certificate common names
+
+# Filer server gRPC options (server-side)
+# Enables mTLS for incoming gRPC connections to filer server
+[grpc.filer]
+cert = ""
+key = ""
+client_cert = ""
+client_key = ""
+allowed_commonNames = ""    # comma-separated SSL certificate common names
+
+# S3 server gRPC options (server-side)
+# Enables mTLS for incoming gRPC connections to S3 server
+[grpc.s3]
+cert = ""
+key = ""
+client_cert = ""
+client_key = ""
+allowed_commonNames = ""    # comma-separated SSL certificate common names
+
+[grpc.msg_broker]
+cert = ""
+key = ""
+client_cert = ""
+client_key = ""
+allowed_commonNames = ""    # comma-separated SSL certificate common names
+
+[grpc.msg_agent]
+cert = ""
+key = ""
+client_cert = ""
+client_key = ""
+allowed_commonNames = ""    # comma-separated SSL certificate common names
+
+[grpc.admin]
+cert = ""
+key = ""
+client_cert = ""
+client_key = ""
+allowed_commonNames = ""    # comma-separated SSL certificate common names
+
+[grpc.worker]
+cert = ""
+key = ""
+client_cert = ""
+client_key = ""
+allowed_commonNames = ""    # comma-separated SSL certificate common names
+
+[grpc.mq]
+cert = ""
+key = ""
+client_cert = ""
+client_key = ""
+allowed_commonNames = ""    # comma-separated SSL certificate common names
+
+# gRPC client configuration for outgoing gRPC connections
+# Used by clients (S3, mount, backup, benchmark, filer.copy, filer.replicate, upload, etc.)
+# when connecting to any gRPC server (master, volume, filer)
+[grpc.client]
+cert = ""
+key = ""
+
+# HTTPS client configuration for outgoing HTTP connections
+# Used by S3, mount, filer.copy, backup, and other clients when communicating with master/volume/filer
+# Set enabled=true to use HTTPS instead of HTTP for data operations (separate from gRPC)
+# If [https.filer] or [https.volume] are enabled on servers, clients must have [https.client] enabled=true
+[https.client]
+enabled = false  # Set to true to enable HTTPS for all outgoing HTTP client connections
+cert = ""        # Client certificate for mTLS (optional if server doesn't require client cert)
+key = ""         # Client key for mTLS (optional if server doesn't require client cert)
+ca = ""          # CA certificate to verify server certificates (required when enabled=true)
+insecure_skip_verify = false  # Skip TLS certificate verification (NOT recommended for production)
+
+# Volume server HTTPS options (server-side)
+# Enables HTTPS for incoming HTTP connections to volume server
+[https.volume]
+cert = ""
+key = ""
+ca = ""
+
+# Master server HTTPS options (server-side)
+# Enables HTTPS for incoming HTTP connections to master server (web UI, HTTP API)
+[https.master]
+cert = ""
+key = ""
+ca = ""
+
+# Filer server HTTPS options (server-side)
+# Enables HTTPS for incoming HTTP connections to filer server (web UI, HTTP API)
+[https.filer]
+cert = ""
+key = ""
+ca = ""
+# disable_tls_verify_client_cert = true|false (default: false)
+
+# Admin server HTTPS options (server-side)
+# Enables HTTPS for incoming HTTP connections to admin server
+[https.admin]
+cert = ""
+key = ""
+ca = ""
+
+# Admin server authentication
+# If password is set, users must login to access the admin interface
+# These can be overridden by environment variables with WEED_ prefix:
+#   WEED_ADMIN_USER, WEED_ADMIN_PASSWORD
+#   WEED_ADMIN_READONLY_USER, WEED_ADMIN_READONLY_PASSWORD
+[admin]
+user = ""
+password = ""
+
+[admin.readonly]
+user = ""
+password = ""
+
+# SSE-S3 server-side encryption key management
+# These settings configure the Key Encryption Key (KEK) for S3 SSE-S3 encryption.
+# Set exactly one of kek or key. If neither is set, SSE-S3 is disabled.
+# Can also be set via env vars: WEED_S3_SSE_KEK, WEED_S3_SSE_KEY
+[s3.sse]
+# hex-encoded 256-bit key, same format as the legacy /etc/s3/sse_kek filer file.
+# Use this to migrate from a filer-stored KEK: copy the value from /etc/s3/sse_kek.
+# Generate a new one with: openssl rand -hex 32
+kek = ""
+# any secret string; a 256-bit key is derived automatically via HKDF-SHA256.
+# Cannot be used while /etc/s3/sse_kek exists on the filer — delete it first.
+key = ""
+
+# Trusted reverse proxies allowed to set forwarding headers on behalf of the
+# real client: X-Forwarded-For / X-Real-Ip for aws:SourceIp condition
+# evaluation in S3 bucket and IAM policies, and X-Forwarded-Prefix for SigV4
+# signature verification of prefix-stripped paths. When the direct TCP peer is
+# in this list, these headers are honored; otherwise they are ignored. A
+# trusted proxy must overwrite or strip client-supplied values of these
+# headers, since honoring them means trusting them. Leave empty to always use
+# the direct peer, which is the safe default.
+# Can also be set via env var: WEED_S3_TRUSTED_PROXIES_WHITE_LIST
+[s3.trusted_proxies]
+white_list = "" # comma separated; bare IPs or CIDRs, e.g. "10.10.10.0/24"
+
+# white list. It's checking request ip address.
+[guard]
+white_list = ""

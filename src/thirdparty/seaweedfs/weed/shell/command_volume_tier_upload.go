@@ -1,0 +1,269 @@
+package shell
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"io"
+	"math"
+	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+
+	"google.golang.org/grpc"
+
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+
+	"github.com/seaweedfs/seaweedfs/weed/wdclient"
+)
+
+// maxTierConcurrency caps per-request multipart transfer concurrency.
+const maxTierConcurrency = 1024
+
+// validateTierConcurrency rejects values that would wrap when narrowed to the
+// int32 proto field or exhaust volume-server resources. 0 means backend default.
+func validateTierConcurrency(n int) error {
+	if n < 0 || n > math.MaxInt32 {
+		return fmt.Errorf("concurrency must be between 0 and %d, got %d", math.MaxInt32, n)
+	}
+	if n > maxTierConcurrency {
+		return fmt.Errorf("concurrency must be at most %d, got %d", maxTierConcurrency, n)
+	}
+	return nil
+}
+
+func init() {
+	Commands = append(Commands, &commandVolumeTierUpload{})
+}
+
+type commandVolumeTierUpload struct {
+}
+
+func (c *commandVolumeTierUpload) Name() string {
+	return "volume.tier.upload"
+}
+
+func (c *commandVolumeTierUpload) Help() string {
+	return `upload the dat file of a volume to a remote tier
+
+	volume.tier.upload [-collection=""] [-fullPercent=95] [-quietFor=1h]
+	volume.tier.upload [-collection=""] -volumeId=<volume_id> -dest=<storage_backend> [-keepLocalDatFile] [-concurrency=<n>]
+
+	e.g.:
+	volume.tier.upload -volumeId=7 -dest=s3
+	volume.tier.upload -volumeId=7 -dest=s3.default
+	volume.tier.upload -volumeId=7 -dest=s3.telegram -concurrency=1
+
+	The <storage_backend> is defined in master.toml.
+	For example, "s3.default" in [storage.backend.s3.default]
+
+	This command will move the dat file of a volume to a remote tier.
+
+	SeaweedFS enables scalable and fast local access to lots of files, 
+	and the cloud storage is slower by cost efficient. How to combine them together?
+
+	Usually the data follows 80/20 rule: only 20% of data is frequently accessed.
+	We can offload the old volumes to the cloud.
+
+	With this, SeaweedFS can be both fast and scalable, and infinite storage space.
+	Just add more local SeaweedFS volume servers to increase the throughput.
+
+	The index file is still local, and the same O(1) disk read is applied to the remote file.
+
+	Each replica keeps its own local index pointing at the same remote object,
+	so the volume keeps its replica count for reads after tiering.
+
+`
+}
+
+func (c *commandVolumeTierUpload) HasTag(CommandTag) bool {
+	return false
+}
+
+func (c *commandVolumeTierUpload) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
+
+	tierCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
+	volumeId := tierCommand.Int("volumeId", 0, "the volume id")
+	collection := tierCommand.String("collection", "", "comma-separated collection names, wildcards, or regex patterns; empty matches the collection with no name")
+	fullPercentage := tierCommand.Float64("fullPercent", 95, "the volume reaches the percentage of max volume size")
+	quietPeriod := tierCommand.Duration("quietFor", 24*time.Hour, "select volumes without no writes for this period")
+	dest := tierCommand.String("dest", "", "the target tier name")
+	keepLocalDatFile := tierCommand.Bool("keepLocalDatFile", false, "whether keep local dat file")
+	disk := tierCommand.String("disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag")
+	concurrency := tierCommand.Int("concurrency", 0, "multipart upload concurrency (0 = backend default)")
+	if err = tierCommand.Parse(args); err != nil {
+		return nil
+	}
+
+	if err = validateTierConcurrency(*concurrency); err != nil {
+		return err
+	}
+
+	if err = commandEnv.confirmIsLocked(args); err != nil {
+		return
+	}
+
+	vid := needle.VolumeId(*volumeId)
+
+	// volumeId is provided
+	if vid != 0 {
+		return doVolumeTierUpload(commandEnv, writer, *collection, vid, *dest, *keepLocalDatFile, *concurrency)
+	}
+
+	var diskType *types.DiskType
+	if disk != nil {
+		_diskType := types.ToDiskType(*disk)
+		diskType = &_diskType
+	}
+
+	// apply to all volumes in the collection
+	// reusing collectVolumeIdsForEcEncode for now
+	volumeIds, _, err := collectVolumeIdsForEcEncode(commandEnv, *collection, diskType, *fullPercentage, *quietPeriod, false)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("tier upload volumes: %v\n", volumeIds)
+	for _, vid := range volumeIds {
+		if err = doVolumeTierUpload(commandEnv, writer, *collection, vid, *dest, *keepLocalDatFile, *concurrency); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func doVolumeTierUpload(commandEnv *CommandEnv, writer io.Writer, collectionPattern string, vid needle.VolumeId, dest string, keepLocalDatFile bool, concurrency int) (err error) {
+	// find volume location
+	topoInfo, _, err := collectTopologyInfo(commandEnv, 0)
+	if err != nil {
+		return fmt.Errorf("collect topology info: %v", err)
+	}
+
+	// The volume server verifies the request's collection against the volume's
+	// own, so the pattern must resolve to the actual collection here.
+	collection, found, err := findVolumeCollection(topoInfo, vid, collectionPattern)
+	if err != nil {
+		return err
+	}
+	if !found {
+		if collectionPattern == "" {
+			return fmt.Errorf("volume %d not found", vid)
+		}
+		return fmt.Errorf("volume %d not found in collections matching %s", vid, collectionPattern)
+	}
+
+	existingLocations := collectVolumeTierUploadLocations(topoInfo, vid, collection, writer)
+
+	if len(existingLocations) == 0 {
+		return fmt.Errorf("volume %d has no replicas in collection %s", vid, collection)
+	}
+
+	_, err = markVolumeReplicasWritable(context.Background(), commandEnv.option.GrpcDialOption, vid, existingLocations, false, false)
+	if err != nil {
+		return fmt.Errorf("mark volume %d as readonly on %s: %v", vid, existingLocations[0].Url, err)
+	}
+
+	// copy the .dat file to remote tier
+	err = uploadDatToRemoteTier(commandEnv.option.GrpcDialOption, writer, vid, collection, existingLocations[0].ServerAddress(), dest, keepLocalDatFile, concurrency)
+	if err != nil {
+		return fmt.Errorf("copy dat file for volume %d on %s to %s: %v", vid, existingLocations[0].Url, dest, err)
+	}
+
+	if keepLocalDatFile {
+		return nil
+	}
+	// Re-copy the uploaded replica's .idx/.vif onto the other replicas instead
+	// of deleting them: the remote object key lives only in the .vif, so losing
+	// the single server holding it would orphan the volume.
+	for i, location := range existingLocations {
+		if i == 0 {
+			continue
+		}
+		fmt.Fprintf(writer, "replicate remote volume %d metadata from %s to %s\n", vid, existingLocations[0].Url, location.Url)
+		err = replicateVolumeToServer(context.Background(), commandEnv.option.GrpcDialOption, writer, vid, existingLocations[0].ServerAddress(), location.ServerAddress(), "", 0)
+		if err != nil {
+			return fmt.Errorf("replicate volume %d from %s to %s: %v", vid, existingLocations[0].Url, location.Url, err)
+		}
+	}
+
+	return nil
+}
+
+// collectVolumeTierUploadLocations lists the replica locations of a volume,
+// putting an already-tiered replica first so a rerun after a partial failure
+// reuses its remote object instead of uploading a second copy.
+func collectVolumeTierUploadLocations(topoInfo *master_pb.TopologyInfo, vid needle.VolumeId, collection string, writer io.Writer) []wdclient.Location {
+	var tiered, local []wdclient.Location
+	eachDataNode(topoInfo, func(dc DataCenterId, rack RackId, dn *master_pb.DataNodeInfo) {
+		for _, disk := range dn.DiskInfos {
+			for _, vi := range disk.VolumeInfos {
+				if needle.VolumeId(vi.Id) == vid && vi.Collection == collection {
+					fmt.Fprintf(writer, "find volume %d from Url:%s, GrpcPort:%d, DC:%s\n", vid, dn.Id, dn.GrpcPort, string(dc))
+					loc := wdclient.Location{
+						Url:        dn.Id,
+						PublicUrl:  dn.Id,
+						GrpcPort:   int(dn.GrpcPort),
+						DataCenter: string(dc),
+					}
+					if vi.RemoteStorageName != "" {
+						tiered = append(tiered, loc)
+					} else {
+						local = append(local, loc)
+					}
+				}
+			}
+		}
+	})
+	return append(tiered, local...)
+}
+
+func uploadDatToRemoteTier(grpcDialOption grpc.DialOption, writer io.Writer, volumeId needle.VolumeId, collection string, sourceVolumeServer pb.ServerAddress, dest string, keepLocalDatFile bool, concurrency int) error {
+
+	err := operation.WithVolumeServerClient(true, sourceVolumeServer, grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
+		stream, copyErr := volumeServerClient.VolumeTierMoveDatToRemote(context.Background(), &volume_server_pb.VolumeTierMoveDatToRemoteRequest{
+			VolumeId:               uint32(volumeId),
+			Collection:             collection,
+			DestinationBackendName: dest,
+			KeepLocalDatFile:       keepLocalDatFile,
+			Concurrency:            int32(concurrency),
+		})
+
+		if stream == nil {
+			if copyErr == nil {
+				// when the volume is already uploaded, VolumeTierMoveDatToRemote will return nil stream and nil error
+				// so we should directly return in this caseAdd commentMore actions
+				fmt.Fprintf(writer, "volume %v already uploaded", volumeId)
+				return nil
+			} else {
+				return copyErr
+			}
+		}
+		var lastProcessed int64
+		for {
+			resp, recvErr := stream.Recv()
+			if recvErr != nil {
+				if recvErr == io.EOF {
+					break
+				} else {
+					return recvErr
+				}
+			}
+
+			processingSpeed := float64(resp.Processed-lastProcessed) / 1024.0 / 1024.0
+
+			fmt.Fprintf(writer, "copied %.2f%%, %d bytes, %.2fMB/s\n", resp.ProcessedPercentage, resp.Processed, processingSpeed)
+
+			lastProcessed = resp.Processed
+		}
+
+		return copyErr
+	})
+
+	return err
+
+}

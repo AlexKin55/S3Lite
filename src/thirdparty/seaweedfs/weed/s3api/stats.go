@@ -1,0 +1,72 @@
+package s3api
+
+import (
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
+)
+
+func track(f http.HandlerFunc, action string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		inFlightGauge := stats_collect.S3InFlightRequestsGauge.WithLabelValues(action)
+		inFlightGauge.Inc()
+		defer inFlightGauge.Dec()
+
+		bucket, _ := s3_constants.GetBucketAndObject(r)
+		w.Header().Set("Server", "SeaweedFS "+version.VERSION)
+		recorder := stats_collect.NewStatusResponseWriter(w)
+		// Attach an audit-tracking flag to the request so handlers that call
+		// PostLog directly mark it; we emit a fallback entry afterward for
+		// handlers (e.g. successful GET/HEAD object) that don't.
+		r = s3err.EnsureAuditTracking(r)
+		// Attach a mutable identity holder before authentication so the fallback
+		// entry can report the requester even though auth records it on a
+		// request copy this middleware never sees.
+		r = s3_constants.EnsureIdentityHolder(r)
+		start := time.Now()
+		f(recorder, r)
+		elapsed := time.Since(start)
+		if glog.V(2) {
+			requester := s3_constants.GetIdentityNameFromContext(r)
+			if requester == "" {
+				requester = "-"
+			}
+			// %q keeps requester- and key-supplied bytes (e.g. newlines) on one line
+			glog.Infof("%q %s %q %d %s", requester, r.Method, r.URL.Path, recorder.Status, elapsed)
+		}
+		if recorder.Status == http.StatusForbidden {
+			bucket = ""
+		}
+		stats_collect.S3RequestHistogram.WithLabelValues(action, bucket).Observe(elapsed.Seconds())
+		stats_collect.S3RequestCounter.WithLabelValues(action, strconv.Itoa(recorder.Status), bucket).Inc()
+		stats_collect.RecordBucketActiveTime(bucket)
+		if !s3err.AuditAlreadyLogged(r) {
+			s3err.PostLog(r, recorder.Status, s3err.ErrNone)
+		}
+	}
+}
+
+func TimeToFirstByte(action string, start time.Time, r *http.Request) {
+	bucket, _ := s3_constants.GetBucketAndObject(r)
+	stats_collect.S3TimeToFirstByteHistogram.WithLabelValues(action, bucket).Observe(float64(time.Since(start).Milliseconds()))
+	stats_collect.RecordBucketActiveTime(bucket)
+}
+
+func BucketTrafficReceived(bytesReceived int64, r *http.Request) {
+	bucket, _ := s3_constants.GetBucketAndObject(r)
+	stats_collect.RecordBucketActiveTime(bucket)
+	stats_collect.S3BucketTrafficReceivedBytesCounter.WithLabelValues(bucket).Add(float64(bytesReceived))
+}
+
+func BucketTrafficSent(bytesTransferred int64, r *http.Request) {
+	bucket, _ := s3_constants.GetBucketAndObject(r)
+	stats_collect.RecordBucketActiveTime(bucket)
+	stats_collect.S3BucketTrafficSentBytesCounter.WithLabelValues(bucket).Add(float64(bytesTransferred))
+}

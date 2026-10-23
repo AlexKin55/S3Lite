@@ -1,0 +1,306 @@
+package shell
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"math/rand/v2"
+	"os"
+	"path"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/cluster"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/grace"
+
+	"github.com/peterh/liner"
+	flag "github.com/seaweedfs/seaweedfs/weed/util/fla9"
+	"golang.org/x/term"
+)
+
+var historyPath = path.Join(os.TempDir(), "weed-shell")
+
+// Piped stdin returns the last command failure; an interactive session shows
+// the error to the operator and keeps going.
+func RunShell(options ShellOptions) error {
+	slices.SortFunc(Commands, func(a, b command) int {
+		return strings.Compare(a.Name(), b.Name())
+	})
+
+	if !options.Debug {
+		flag.Set("alsologtostderr", "false")
+		flag.Set("logtostderr", "false")
+	}
+
+	interactive := liner.TerminalSupported() && term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
+
+	var line *liner.State
+	if interactive {
+		line = liner.NewLiner()
+		defer line.Close()
+		grace.OnInterrupt(func() {
+			line.Close()
+		})
+
+		line.SetCtrlCAborts(true)
+		line.SetTabCompletionStyle(liner.TabPrints)
+
+		setCompletionHandler(line)
+		loadHistory(line)
+
+		defer saveHistory(line)
+	}
+
+	commandEnv := NewCommandEnv(&options)
+
+	connectTimeout := options.ConnectTimeout
+	if connectTimeout <= 0 {
+		connectTimeout = 30 * time.Second
+	}
+	ctx := context.Background()
+	connectCtx, cancel := context.WithTimeout(ctx, connectTimeout)
+	defer cancel()
+	reconnectCtx, cancelReconnect := context.WithCancel(ctx)
+	defer cancelReconnect()
+	go commandEnv.MasterClient.KeepConnectedToMaster(reconnectCtx)
+	if commandEnv.MasterClient.GetMaster(connectCtx) == "" {
+		err := fmt.Errorf("cannot connect to master %s within %s", *options.Masters, connectTimeout)
+		fmt.Fprintln(os.Stderr, err)
+		return err
+	}
+
+	if commandEnv.option.FilerAddress == "" {
+		var filers []pb.ServerAddress
+		discoverCtx, cancelDiscover := context.WithTimeout(ctx, connectTimeout)
+		defer cancelDiscover()
+		listErr := commandEnv.MasterClient.WithClient(discoverCtx, false, func(client master_pb.SeaweedClient) error {
+			resp, err := client.ListClusterNodes(discoverCtx, &master_pb.ListClusterNodesRequest{
+				ClientType: cluster.FilerType,
+				FilerGroup: *options.FilerGroup,
+			})
+			if err != nil {
+				return err
+			}
+
+			for _, clusterNode := range resp.ClusterNodes {
+				filers = append(filers, pb.ServerAddress(clusterNode.Address))
+			}
+			return nil
+		})
+		if len(filers) > 0 {
+			commandEnv.option.FilerAddress = filers[rand.IntN(len(filers))]
+		} else if listErr != nil {
+			fmt.Fprintf(os.Stderr, "cannot list filers from master %s: %v\n", *options.Masters, listErr)
+		}
+		if options.Debug {
+			if len(filers) > 0 {
+				fmt.Fprintf(os.Stderr, "master: %s filers: %v\n", *options.Masters, filers)
+			} else {
+				fmt.Fprintf(os.Stderr, "master: %s\n", *options.Masters)
+			}
+		}
+	}
+
+	if interactive {
+		for {
+			cmd, err := line.Prompt("> ")
+			if err != nil {
+				if err != io.EOF {
+					fmt.Fprintf(os.Stderr, "%v\n", err)
+				}
+				return nil
+			}
+
+			if strings.TrimSpace(cmd) != "" {
+				line.AppendHistory(cmd)
+			}
+
+			for _, c := range util.StringSplit(cmd, ";") {
+				if exit, _ := processEachCmd(c, commandEnv); exit {
+					return nil
+				}
+			}
+		}
+	} else {
+		var lastErr error
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			cmd := scanner.Text()
+			for _, c := range util.StringSplit(cmd, ";") {
+				exit, err := processEachCmd(c, commandEnv)
+				if err != nil {
+					lastErr = err
+				}
+				if exit {
+					return lastErr
+				}
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "error reading stdin: %v\n", err)
+			lastErr = err
+		}
+		return lastErr
+	}
+}
+
+func processEachCmd(cmd string, commandEnv *CommandEnv) (exit bool, cmdErr error) {
+	cmds := splitCommandLine(cmd)
+
+	if len(cmds) == 0 {
+		return false, nil
+	} else {
+
+		args := cmds[1:]
+
+		cmd := cmds[0]
+		if cmd == "help" || cmd == "?" {
+			printHelp(cmds)
+		} else if cmd == "exit" || cmd == "quit" {
+			return true, nil
+		} else {
+			foundCommand := false
+			for _, c := range Commands {
+				if c.Name() == cmd || c.Name() == "fs."+cmd {
+					// noLock says "this invocation changes nothing", which is a
+					// property of the invocation and not of the session. A
+					// command that set it for a dry run would otherwise leave
+					// every later command in the session unlocked, so a real
+					// mutation right after a simulation would skip its lock.
+					commandEnv.SetNoLock(false)
+					if err := c.Do(args, commandEnv, os.Stdout); err != nil {
+						fmt.Fprintf(os.Stderr, "error: %v\n", err)
+						cmdErr = err
+					}
+					foundCommand = true
+				}
+			}
+			if !foundCommand {
+				fmt.Fprintf(os.Stderr, "unknown command: %v\n", cmd)
+				cmdErr = fmt.Errorf("unknown command: %v", cmd)
+			}
+		}
+
+	}
+	return false, cmdErr
+}
+
+func splitCommandLine(line string) []string {
+	tokens, _ := parseShellInput(line, true)
+	return tokens
+}
+
+func parseShellInput(line string, split bool) (args []string, unbalanced bool) {
+	var current strings.Builder
+	inDoubleQuotes := false
+	inSingleQuotes := false
+	escaped := false
+
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+
+		if escaped {
+			current.WriteByte(c)
+			escaped = false
+			continue
+		}
+
+		if c == '\\' && !inSingleQuotes {
+			escaped = true
+			continue
+		}
+
+		if c == '"' && !inSingleQuotes {
+			inDoubleQuotes = !inDoubleQuotes
+			continue
+		}
+
+		if c == '\'' && !inDoubleQuotes {
+			inSingleQuotes = !inSingleQuotes
+			continue
+		}
+
+		if split && (c == ' ' || c == '\t' || c == '\n' || c == '\r') && !inDoubleQuotes && !inSingleQuotes {
+			if current.Len() > 0 {
+				args = append(args, current.String())
+				current.Reset()
+			}
+			continue
+		}
+
+		current.WriteByte(c)
+	}
+
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
+
+	return args, inDoubleQuotes || inSingleQuotes || escaped
+}
+
+func printGenericHelp() {
+	msg :=
+		`Type:	"help <command>" for help on <command>. Most commands support "<command> -h" also for options. 
+`
+	fmt.Print(msg)
+
+	for _, c := range Commands {
+		if c.HasTag(Hidden) {
+			continue
+		}
+		helpTexts := strings.SplitN(c.Help(), "\n", 2)
+		fmt.Printf("  %-30s\t# %s \n", c.Name(), helpTexts[0])
+	}
+}
+
+func printHelp(cmds []string) {
+	args := cmds[1:]
+	if len(args) == 0 {
+		printGenericHelp()
+	} else if len(args) > 1 {
+		fmt.Println()
+	} else {
+		cmd := strings.ToLower(args[0])
+
+		for _, c := range Commands {
+			if strings.ToLower(c.Name()) == cmd {
+				fmt.Printf("  %s\t# %s\n", c.Name(), c.Help())
+				fmt.Printf("use \"%s -h\" for more details\n", c.Name())
+			}
+		}
+	}
+}
+
+func setCompletionHandler(line *liner.State) {
+	line.SetCompleter(func(line string) (c []string) {
+		for _, i := range Commands {
+			if strings.HasPrefix(i.Name(), strings.ToLower(line)) {
+				c = append(c, i.Name())
+			}
+		}
+		return
+	})
+}
+
+func loadHistory(line *liner.State) {
+	if f, err := os.Open(historyPath); err == nil {
+		line.ReadHistory(f)
+		f.Close()
+	}
+}
+
+func saveHistory(line *liner.State) {
+	if f, err := os.Create(historyPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating history file: %v\n", err)
+	} else {
+		if _, err = line.WriteHistory(f); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing history file: %v\n", err)
+		}
+		f.Close()
+	}
+}

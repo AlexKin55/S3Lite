@@ -1,0 +1,126 @@
+package super_block
+
+import (
+	"fmt"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+)
+
+type ReplicaPlacement struct {
+	SameRackCount       int `json:"node,omitempty"`
+	DiffRackCount       int `json:"rack,omitempty"`
+	DiffDataCenterCount int `json:"dc,omitempty"`
+}
+
+func NewReplicaPlacementFromString(t string) (*ReplicaPlacement, error) {
+	rp := &ReplicaPlacement{}
+	switch len(t) {
+	case 0:
+		t = "000"
+	case 1:
+		t = "00" + t
+	case 2:
+		t = "0" + t
+	}
+	for i, c := range t {
+		count := int(c - '0')
+		if count < 0 {
+			return rp, fmt.Errorf("unknown replication type: %s", t)
+		}
+		switch i {
+		case 0:
+			rp.DiffDataCenterCount = count
+		case 1:
+			rp.DiffRackCount = count
+		case 2:
+			rp.SameRackCount = count
+		}
+	}
+	value := rp.DiffDataCenterCount*100 + rp.DiffRackCount*10 + rp.SameRackCount
+	if value > 255 {
+		return rp, fmt.Errorf("unexpected replication type: %s", t)
+	}
+	return rp, nil
+}
+
+// replicaPlacementsByByte is one 6KB pointer-free array covering every encoding
+// a byte can hold. The master decodes one per volume in every volume server
+// heartbeat and keeps it for the volume's lifetime, so handing out a shared
+// element keeps that path off fmt and off the heap entirely.
+//
+// Elements are immutable. Callers must not write through the returned pointer.
+var replicaPlacementsByByte [256]ReplicaPlacement
+
+func init() {
+	for b := range replicaPlacementsByByte {
+		replicaPlacementsByByte[b] = ReplicaPlacement{
+			DiffDataCenterCount: b / 100,
+			DiffRackCount:       b / 10 % 10,
+			SameRackCount:       b % 10,
+		}
+	}
+}
+
+func NewReplicaPlacementFromByte(b byte) (*ReplicaPlacement, error) {
+	return &replicaPlacementsByByte[b], nil
+}
+
+func (rp *ReplicaPlacement) HasReplication() bool {
+	return rp.DiffDataCenterCount != 0 || rp.DiffRackCount != 0 || rp.SameRackCount != 0
+}
+
+func (a *ReplicaPlacement) Equals(b *ReplicaPlacement) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return (a.SameRackCount == b.SameRackCount &&
+		a.DiffRackCount == b.DiffRackCount &&
+		a.DiffDataCenterCount == b.DiffDataCenterCount)
+}
+
+func (rp *ReplicaPlacement) Byte() byte {
+	if rp == nil {
+		return 0
+	}
+	ret := rp.DiffDataCenterCount*100 + rp.DiffRackCount*10 + rp.SameRackCount
+	return byte(ret)
+}
+
+func (rp *ReplicaPlacement) String() string {
+	if rp == nil {
+		return ""
+	}
+	b := make([]byte, 3)
+	b[0] = byte(rp.DiffDataCenterCount + '0')
+	b[1] = byte(rp.DiffRackCount + '0')
+	b[2] = byte(rp.SameRackCount + '0')
+	return string(b)
+}
+
+func (rp *ReplicaPlacement) GetCopyCount() int {
+	return rp.DiffDataCenterCount + rp.DiffRackCount + rp.SameRackCount + 1
+}
+
+// ResolveReplicaPlacement picks the EC shard replica placement constraint: an
+// explicit spec wins; otherwise the cluster default (typically the master's
+// configured default replication). A missing, invalid, or zero-replication value
+// yields nil, meaning even spread / no constraint. Shared by EC encode, repair,
+// and balance so the three resolve replica placement identically.
+func ResolveReplicaPlacement(explicitSpec, clusterDefault string) *ReplicaPlacement {
+	spec := explicitSpec
+	if spec == "" {
+		spec = clusterDefault
+	}
+	if spec == "" {
+		return nil
+	}
+	rp, err := NewReplicaPlacementFromString(spec)
+	if err != nil {
+		glog.Warningf("ignoring invalid replica placement %q: %v", spec, err)
+		return nil
+	}
+	if !rp.HasReplication() {
+		return nil
+	}
+	return rp
+}

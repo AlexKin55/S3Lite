@@ -1,0 +1,141 @@
+package topology
+
+import (
+	"slices"
+	"strings"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
+)
+
+type TopologyInfo struct {
+	Max         int64              `json:"Max"`
+	Free        int64              `json:"Free"`
+	DataCenters []DataCenterInfo   `json:"DataCenters"`
+	Layouts     []VolumeLayoutInfo `json:"Layouts"`
+}
+
+type VolumeLayoutCollection struct {
+	Collection   string
+	VolumeLayout *VolumeLayout
+}
+
+func (t *Topology) ToInfo() (info TopologyInfo) {
+	info.Max = t.diskUsages.GetMaxVolumeCount()
+	info.Free = t.diskUsages.FreeSpace()
+	var dcs []DataCenterInfo
+	for _, c := range t.Children() {
+		dc := c.(*DataCenter)
+		dcs = append(dcs, dc.ToInfo())
+	}
+
+	slices.SortFunc(dcs, func(a, b DataCenterInfo) int {
+		return strings.Compare(string(a.Id), string(b.Id))
+	})
+
+	info.DataCenters = dcs
+	var layouts []VolumeLayoutInfo
+	for _, col := range t.collectionMap.Items() {
+		c := col.(*Collection)
+		for _, layout := range c.storageType2VolumeLayout.Items() {
+			if layout != nil {
+				tmp := layout.(*VolumeLayout).ToInfo()
+				tmp.Collection = c.Name
+				layouts = append(layouts, tmp)
+			}
+		}
+	}
+	info.Layouts = layouts
+	return
+}
+
+func (t *Topology) ListVolumeLayoutCollections() (volumeLayouts []*VolumeLayoutCollection) {
+	for _, col := range t.collectionMap.Items() {
+		for _, volumeLayout := range col.(*Collection).storageType2VolumeLayout.Items() {
+			volumeLayouts = append(volumeLayouts,
+				&VolumeLayoutCollection{col.(*Collection).Name, volumeLayout.(*VolumeLayout)},
+			)
+		}
+	}
+	return volumeLayouts
+}
+
+func (t *Topology) ToVolumeMap() interface{} {
+	m := make(map[string]interface{})
+	m["Max"] = t.diskUsages.GetMaxVolumeCount()
+	m["Free"] = t.diskUsages.FreeSpace()
+	dcs := make(map[NodeId]interface{})
+	for _, c := range t.Children() {
+		dc := c.(*DataCenter)
+		racks := make(map[NodeId]interface{})
+		for _, r := range dc.Children() {
+			rack := r.(*Rack)
+			dataNodes := make(map[NodeId]interface{})
+			for _, d := range rack.Children() {
+				dn := d.(*DataNode)
+				dnVolumes := dn.GetVolumes()
+				volumes := make([]interface{}, 0, len(dnVolumes))
+				for _, v := range dnVolumes {
+					volumes = append(volumes, v)
+				}
+				dataNodes[d.Id()] = volumes
+			}
+			racks[r.Id()] = dataNodes
+		}
+		dcs[dc.Id()] = racks
+	}
+	m["DataCenters"] = dcs
+	return m
+}
+
+// ToVolumeLocations snapshots every data node's volume set into a list of
+// per-node VolumeLocation messages. NewVids carries every volume; RemoteVids
+// repeats the remote-tier subset so clients can route reads to a local
+// replica first when one exists on any node. EC shards are flattened into
+// NewEcVids so each vid is reported once even when its shards live on
+// multiple disks of the same node.
+func (t *Topology) ToVolumeLocations() (volumeLocations []*master_pb.VolumeLocation) {
+	for _, c := range t.Children() {
+		dc := c.(*DataCenter)
+		for _, r := range dc.Children() {
+			rack := r.(*Rack)
+			for _, d := range rack.Children() {
+				dn := d.(*DataNode)
+				volumeLocation := &master_pb.VolumeLocation{
+					Url:        dn.Url(),
+					PublicUrl:  dn.PublicUrl,
+					DataCenter: dn.GetDataCenterId(),
+					GrpcPort:   uint32(dn.GrpcPort),
+				}
+
+				volumeLocation.NewVids, volumeLocation.RemoteVids, volumeLocation.ReadOnlyVids, volumeLocation.ReadOnlyCanDeleteVids = dn.AppendVolumeIds(nil, nil, nil, nil)
+
+				// A single EC volume's shards can live on multiple disks of
+				// one DataNode, so GetEcShards returns per-(vid,disk) entries.
+				// Dedupe so the snapshot carries each vid once.
+				seenEcVids := make(map[uint32]struct{})
+				for _, s := range dn.GetEcShards() {
+					vid := uint32(s.VolumeId)
+					if _, ok := seenEcVids[vid]; ok {
+						continue
+					}
+					seenEcVids[vid] = struct{}{}
+					volumeLocation.NewEcVids = append(volumeLocation.NewEcVids, vid)
+				}
+				volumeLocations = append(volumeLocations, volumeLocation)
+			}
+		}
+	}
+	return
+}
+
+func (t *Topology) ToTopologyInfo(filter VolumeFilter) *master_pb.TopologyInfo {
+	m := &master_pb.TopologyInfo{
+		Id:        string(t.Id()),
+		DiskInfos: t.diskUsages.ToDiskInfo(),
+	}
+	for _, c := range t.Children() {
+		dc := c.(*DataCenter)
+		m.DataCenterInfos = append(m.DataCenterInfos, dc.ToDataCenterInfo(filter))
+	}
+	return m
+}

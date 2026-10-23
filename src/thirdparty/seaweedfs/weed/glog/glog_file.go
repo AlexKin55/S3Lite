@@ -1,0 +1,215 @@
+// Go support for leveled logs, analogous to https://code.google.com/p/google-glog/
+//
+// Copyright 2013 Google Inc. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// File I/O for logs.
+
+package glog
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"os/user"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	flag "github.com/seaweedfs/seaweedfs/weed/util/fla9"
+)
+
+// MaxSize is the maximum size of a log file in bytes.
+// It is initialized from the --log_max_size_mb flag when the first log file is created.
+var MaxSize uint64 = 1024 * 1024 * 1800
+
+// MaxFileCount is the maximum number of log files retained per severity level.
+// It is initialized from the --log_max_files flag when the first log file is created.
+var MaxFileCount = 5
+
+// logDirs lists the candidate directories for new log files.
+var logDirs []string
+
+// If non-empty, overrides the choice of directory in which to write logs.
+// See createLogDirs for the full list of possible destinations.
+var logDir = flag.String("logdir", "", "If non-empty, write log files in this directory")
+
+// logMaxSizeMB controls the maximum size of each log file in megabytes.
+// When a log file reaches this size it is closed and a new file is created.
+// Defaults to 1800 MB. Set to 0 to use the compiled-in default.
+var logMaxSizeMB = flag.Uint64("log_max_size_mb", 1800, "Maximum size in megabytes of each log file before it is rotated (0 = use default of 1800 MB)")
+
+// logMaxFiles controls how many log files are kept per severity level.
+// Older files are deleted when the limit is exceeded.
+// Defaults to 5.
+var logMaxFiles = flag.Int("log_max_files", 5, "Maximum number of log files to keep per severity level before older ones are deleted (0 = use default of 5)")
+
+// logRotateHours controls time-based log rotation.
+// When non-zero, each log file is rotated after the given number of hours
+// regardless of its size. This prevents log files from accumulating in
+// long-running deployments even when log volume is low.
+// The default is 168 hours (7 days). Set to 0 to disable time-based rotation.
+var logRotateHours = flag.Int("log_rotate_hours", 168, "Rotate log files after this many hours (default: 168 = 7 days, 0 = disabled)")
+
+// logJSON enables JSON-formatted log output (one JSON object per line).
+// Useful for integration with ELK, Loki, Datadog, and other log aggregation systems.
+var logJSON = flag.Bool("log_json", false, "Output logs in JSON format instead of glog text format")
+
+// logCompress enables gzip compression of rotated log files.
+// Compressed files get a .gz suffix. Compression runs in the background.
+var logCompress = flag.Bool("log_compress", false, "Gzip-compress rotated log files to save disk space")
+
+func createLogDirs() {
+	// Apply flag values now that flags have been parsed.
+	if *logMaxSizeMB > 0 {
+		MaxSize = *logMaxSizeMB * 1024 * 1024
+	}
+	if *logMaxFiles > 0 {
+		MaxFileCount = *logMaxFiles
+	}
+
+	if *logCompress {
+		SetCompressRotated(true)
+	}
+
+	if *logDir != "" {
+		logDirs = append(logDirs, *logDir)
+	} else {
+		logDirs = append(logDirs, os.TempDir())
+	}
+}
+
+// LogRotateHours returns the configured time-based rotation interval.
+// This is used by syncBuffer to decide when to rotate open log files.
+func LogRotateHours() int {
+	return *logRotateHours
+}
+
+var (
+	pid      = os.Getpid()
+	program  = filepath.Base(os.Args[0])
+	host     = "unknownhost"
+	userName = "unknownuser"
+)
+
+func init() {
+	h, err := os.Hostname()
+	if err == nil {
+		host = shortHostname(h)
+	}
+
+	current, err := user.Current()
+	if err == nil {
+		userName = current.Username
+	}
+
+	// Sanitize userName since it may contain filepath separators on Windows.
+	userName = strings.Replace(userName, `\`, "_", -1)
+}
+
+// shortHostname returns its argument, truncating at the first period.
+// For instance, given "www.google.com" it returns "www".
+func shortHostname(hostname string) string {
+	if i := strings.Index(hostname, "."); i >= 0 {
+		return hostname[:i]
+	}
+	return hostname
+}
+
+// logName returns a new log file name containing tag, with start time t, and
+// the name for the symlink for tag.
+func logName(tag string, t time.Time) (name, link string) {
+	name = fmt.Sprintf("%s.%s.%s.log.%s.%04d%02d%02d-%02d%02d%02d.%d",
+		program,
+		host,
+		userName,
+		tag,
+		t.Year(),
+		t.Month(),
+		t.Day(),
+		t.Hour(),
+		t.Minute(),
+		t.Second(),
+		pid)
+	return name, program + "." + tag
+}
+
+func prefix(tag string) string {
+	return fmt.Sprintf("%s.%s.%s.log.%s.",
+		program,
+		host,
+		userName,
+		tag,
+	)
+}
+
+var onceLogDirs sync.Once
+
+// create creates a new log file and returns the file and its filename, which
+// contains tag ("INFO", "FATAL", etc.) and t.  If the file is created
+// successfully, create also attempts to update the symlink for that tag, ignoring
+// errors.
+func create(tag string, t time.Time) (f *os.File, filename string, err error) {
+	onceLogDirs.Do(createLogDirs)
+	if len(logDirs) == 0 {
+		return nil, "", errors.New("log: no log dirs")
+	}
+	name, link := logName(tag, t)
+	logPrefix := prefix(tag)
+	var lastErr error
+	for _, dir := range logDirs {
+
+		// remove old logs (including .gz compressed rotated files)
+		// Deduplicate .log/.log.gz pairs so concurrent compression
+		// doesn't cause double-counting against MaxFileCount.
+		entries, _ := os.ReadDir(dir)
+		previousLogs := make(map[string][]string) // bare name -> actual file names
+		for _, entry := range entries {
+			name := entry.Name()
+			bare := strings.TrimSuffix(name, ".gz")
+			if strings.HasPrefix(bare, logPrefix) {
+				previousLogs[bare] = append(previousLogs[bare], name)
+			}
+		}
+		if len(previousLogs) >= MaxFileCount {
+			var keys []string
+			for bare := range previousLogs {
+				keys = append(keys, bare)
+			}
+			sort.Strings(keys)
+			for i, bare := range keys {
+				if i > len(keys)-MaxFileCount {
+					break
+				}
+				for _, name := range previousLogs[bare] {
+					os.Remove(filepath.Join(dir, name))
+				}
+			}
+		}
+
+		// create new log file
+		fname := filepath.Join(dir, name)
+		f, err := os.Create(fname)
+		if err == nil {
+			symlink := filepath.Join(dir, link)
+			os.Remove(symlink)        // ignore err
+			os.Symlink(name, symlink) // ignore err
+			return f, fname, nil
+		}
+		lastErr = err
+	}
+	return nil, "", fmt.Errorf("log: cannot create log: %w", lastErr)
+}

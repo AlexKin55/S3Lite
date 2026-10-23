@@ -1,0 +1,123 @@
+package s3api
+
+import (
+	"net/http"
+	"net/url"
+	"strings"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+)
+
+// ParseS3Metadata extracts S3-specific metadata from HTTP request headers
+// This includes: storage class, tags, user metadata, SSE headers, and ACL headers
+// Used by S3 API handlers to prepare metadata before saving to filer
+// Returns an S3 error code if tag parsing fails
+func ParseS3Metadata(r *http.Request, existing map[string][]byte, isReplace bool) (metadata map[string][]byte, errCode s3err.ErrorCode) {
+	metadata = make(map[string][]byte)
+
+	// Copy existing metadata unless replacing
+	if !isReplace {
+		for k, v := range existing {
+			metadata[k] = v
+		}
+	}
+
+	// Storage class
+	if sc := r.Header.Get(s3_constants.AmzStorageClass); sc != "" {
+		metadata[s3_constants.AmzStorageClass] = []byte(sc)
+	}
+
+	// Content-Encoding (standard HTTP header used by S3)
+	if ce := storedContentEncoding(r.Header.Values("Content-Encoding")); ce != "" {
+		metadata["Content-Encoding"] = []byte(ce)
+	}
+
+	// Other Standard HTTP headers defined in https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateMultipartUpload.html
+	standardHeaders := []string{
+		"Cache-Control",
+		"Content-Disposition",
+		"Content-Language",
+		"Expires",
+	}
+	for _, header := range standardHeaders {
+		if value := r.Header.Get(header); value != "" {
+			metadata[header] = []byte(value)
+		}
+	}
+
+	// Do NOT persist Response-Content-Disposition: it is a GET-only
+	// presigned-download override and must not be stored as upload metadata.
+
+	// Object tagging
+	if tags := r.Header.Get(s3_constants.AmzObjectTagging); tags != "" {
+		// Use url.ParseQuery for robust parsing and automatic URL decoding
+		parsedTags, err := url.ParseQuery(tags)
+		if err != nil {
+			// Return proper S3 error instead of silently dropping tags
+			glog.Warningf("Invalid S3 tag format in header '%s': %v", tags, err)
+			return nil, s3err.ErrInvalidTag
+		}
+
+		// Validate: S3 spec does not allow duplicate tag keys
+		for key, values := range parsedTags {
+			if len(values) > 1 {
+				glog.Warningf("Duplicate tag key '%s' in header '%s'", key, tags)
+				return nil, s3err.ErrInvalidTag
+			}
+			// Tag value can be an empty string but not nil
+			value := ""
+			if len(values) > 0 {
+				value = values[0]
+			}
+			metadata[s3_constants.AmzObjectTagging+"-"+key] = []byte(value)
+		}
+	}
+
+	// User-defined metadata (x-amz-meta-* headers)
+	for header, values := range r.Header {
+		if strings.HasPrefix(header, s3_constants.AmzUserMetaPrefix) {
+			// Go's HTTP server canonicalizes headers (e.g., x-amz-meta-foo → X-Amz-Meta-Foo)
+			// Per HTTP and S3 spec: multiple header values are concatenated with commas
+			// This ensures no metadata is lost when clients send duplicate header names
+			metadata[header] = []byte(strings.Join(values, ","))
+		}
+	}
+
+	// SSE-C headers
+	if algorithm := r.Header.Get(s3_constants.AmzServerSideEncryptionCustomerAlgorithm); algorithm != "" {
+		metadata[s3_constants.AmzServerSideEncryptionCustomerAlgorithm] = []byte(algorithm)
+	}
+	if keyMD5 := r.Header.Get(s3_constants.AmzServerSideEncryptionCustomerKeyMD5); keyMD5 != "" {
+		// Store as-is; SSE-C MD5 is base64 and case-sensitive
+		metadata[s3_constants.AmzServerSideEncryptionCustomerKeyMD5] = []byte(keyMD5)
+	}
+
+	return metadata, s3err.ErrNone
+}
+
+// storedContentEncoding returns the Content-Encoding to keep with an object,
+// from the values of the request's Content-Encoding fields, which it combines
+// as one list. aws-chunked names the SigV4 streaming framing of the request
+// body, which is decoded on upload, so S3 does not store it: "gzip,
+// aws-chunked" is kept as "gzip", and "aws-chunked" alone as no
+// Content-Encoding at all.
+func storedContentEncoding(values []string) string {
+	value := strings.Join(values, ", ")
+	var kept []string
+	chunked := false
+	for _, encoding := range strings.Split(value, ",") {
+		encoding = strings.TrimSpace(encoding)
+		switch {
+		case strings.EqualFold(encoding, "aws-chunked"):
+			chunked = true
+		case encoding != "":
+			kept = append(kept, encoding)
+		}
+	}
+	if !chunked {
+		return value
+	}
+	return strings.Join(kept, ", ")
+}

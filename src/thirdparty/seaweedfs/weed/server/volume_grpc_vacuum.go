@@ -1,0 +1,175 @@
+package weed_server
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+
+	"runtime"
+
+	"github.com/prometheus/procfs"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"google.golang.org/grpc/status"
+)
+
+var numCPU = runtime.NumCPU()
+
+func (vs *VolumeServer) VacuumVolumeCheck(ctx context.Context, req *volume_server_pb.VacuumVolumeCheckRequest) (*volume_server_pb.VacuumVolumeCheckResponse, error) {
+
+	resp := &volume_server_pb.VacuumVolumeCheckResponse{}
+
+	garbageRatio, diskSpaceLow, err := vs.store.CheckCompactVolume(needle.VolumeId(req.VolumeId))
+
+	resp.GarbageRatio = garbageRatio
+	resp.DiskSpaceLow = diskSpaceLow
+
+	if err != nil {
+		glog.V(3).Infof("check volume %d: %v", req.VolumeId, err)
+		return resp, volumeStatusError(err)
+	}
+
+	return resp, nil
+
+}
+
+func (vs *VolumeServer) VacuumVolumeCompact(req *volume_server_pb.VacuumVolumeCompactRequest, stream volume_server_pb.VolumeServer_VacuumVolumeCompactServer) error {
+	if err := vs.checkGrpcAdminAuth(stream.Context()); err != nil {
+		return err
+	}
+	if err := vs.CheckMaintenanceMode(); err != nil {
+		return err
+	}
+
+	start := time.Now()
+	defer func(start time.Time) {
+		stats.VolumeServerVacuumingHistogram.WithLabelValues("compact").Observe(time.Since(start).Seconds())
+	}(start)
+
+	resp := &volume_server_pb.VacuumVolumeCompactResponse{}
+	reportInterval := int64(1024 * 1024 * 128)
+	nextReportTarget := reportInterval
+	fs, fsErr := procfs.NewDefaultFS()
+	var sendErr error
+	err := vs.store.CompactVolume(needle.VolumeId(req.VolumeId), req.Preallocate, vs.compactionBytePerSecond, func(processed int64) bool {
+		if stream.Context().Err() != nil {
+			return false
+		}
+		if processed > nextReportTarget {
+			resp.ProcessedBytes = processed
+			if fsErr == nil && numCPU > 0 {
+				if fsLa, err := fs.LoadAvg(); err == nil {
+					resp.LoadAvg_1M = float32(fsLa.Load1 / float64(numCPU))
+				}
+			}
+			if sendErr = stream.Send(resp); sendErr != nil {
+				return false
+			}
+			nextReportTarget = processed + reportInterval
+		}
+		return true
+	})
+
+	stats.VolumeServerVacuumingCompactCounter.WithLabelValues(strconv.FormatBool(err == nil && sendErr == nil)).Inc()
+	if err != nil {
+		glog.Errorf("failed compact volume %d: %v", req.VolumeId, err)
+		return volumeStatusError(fmt.Errorf("compact volume %d: %w", req.VolumeId, err))
+	}
+	if sendErr != nil {
+		glog.Errorf("failed compact volume %d report progress: %v", req.VolumeId, sendErr)
+		return sendErr
+	}
+
+	glog.V(1).Infof("compact volume %d", req.VolumeId)
+	return nil
+
+}
+
+func (vs *VolumeServer) VacuumVolumeCommit(ctx context.Context, req *volume_server_pb.VacuumVolumeCommitRequest) (*volume_server_pb.VacuumVolumeCommitResponse, error) {
+	if err := vs.checkGrpcAdminAuth(ctx); err != nil {
+		return nil, err
+	}
+	if err := vs.CheckMaintenanceMode(); err != nil {
+		return nil, err
+	}
+
+	release, err := vs.acquireVacuumCommitSlot(ctx)
+	if err != nil {
+		glog.Warningf("commit volume %d not started: %v", req.VolumeId, err)
+		return nil, status.FromContextError(err).Err()
+	}
+	defer release()
+	if err := vs.CheckMaintenanceMode(); err != nil {
+		return nil, err
+	}
+
+	start := time.Now()
+	defer func(start time.Time) {
+		stats.VolumeServerVacuumingHistogram.WithLabelValues("commit").Observe(time.Since(start).Seconds())
+	}(start)
+
+	resp := &volume_server_pb.VacuumVolumeCommitResponse{}
+
+	readOnly, volumeSize, err := vs.store.CommitCompactVolume(needle.VolumeId(req.VolumeId))
+
+	stats.VolumeServerVacuumingCommitCounter.WithLabelValues(strconv.FormatBool(err == nil)).Inc()
+	resp.IsReadOnly = readOnly
+	resp.VolumeSize = uint64(volumeSize)
+	if err != nil {
+		glog.Errorf("failed commit volume %d: %v", req.VolumeId, err)
+		return resp, volumeStatusError(fmt.Errorf("commit compact volume %d: %w", req.VolumeId, err))
+	}
+	glog.V(1).Infof("commit volume %d", req.VolumeId)
+	return resp, nil
+
+}
+
+// acquireVacuumCommitSlot waits for a commit slot holding no volume lock; the
+// wait counts against the caller's deadline.
+func (vs *VolumeServer) acquireVacuumCommitSlot(ctx context.Context) (release func(), err error) {
+	if vs.vacuumCommitSlots == nil {
+		return func() {}, nil
+	}
+	vs.vacuumCommitsWaiting.Add(1)
+	select {
+	case vs.vacuumCommitSlots <- struct{}{}:
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+	vs.vacuumCommitsWaiting.Add(-1)
+	if err != nil {
+		return nil, err
+	}
+	release = func() { <-vs.vacuumCommitSlots }
+	// select picks randomly when the slot and the deadline are ready together.
+	if err := ctx.Err(); err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
+}
+
+func (vs *VolumeServer) VacuumVolumeCleanup(ctx context.Context, req *volume_server_pb.VacuumVolumeCleanupRequest) (*volume_server_pb.VacuumVolumeCleanupResponse, error) {
+	if err := vs.checkGrpcAdminAuth(ctx); err != nil {
+		return nil, err
+	}
+	if err := vs.CheckMaintenanceMode(); err != nil {
+		return nil, err
+	}
+
+	resp := &volume_server_pb.VacuumVolumeCleanupResponse{}
+	err := vs.store.CommitCleanupVolume(needle.VolumeId(req.VolumeId))
+
+	if err != nil {
+		glog.Errorf("failed cleanup volume %d: %v", req.VolumeId, err)
+		return resp, volumeStatusError(fmt.Errorf("cleanup volume %d: %w", req.VolumeId, err))
+	}
+	glog.V(1).Infof("cleanup volume %d", req.VolumeId)
+
+	return resp, nil
+
+}

@@ -1,0 +1,194 @@
+package weed_server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/topology"
+	"github.com/seaweedfs/seaweedfs/weed/util/buffer_pool"
+)
+
+func (vs *VolumeServer) PostHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if e := r.ParseForm(); e != nil {
+		glog.V(0).InfolnCtx(ctx, "form parse error:", e)
+		writeJsonError(w, r, http.StatusBadRequest, e)
+		return
+	}
+
+	vid, fid, _, _, _ := parseURLPath(r.URL.Path)
+	volumeId, ve := needle.NewVolumeId(vid)
+	if ve != nil {
+		glog.V(0).InfolnCtx(ctx, "NewVolumeId error:", ve)
+		stats.VolumeServerFileWriteFailures.Inc()
+		writeJsonError(w, r, http.StatusBadRequest, ve)
+		return
+	}
+
+	if !vs.maybeCheckJwtAuthorization(r, vid, fid, true) {
+		writeJsonError(w, r, http.StatusUnauthorized, errors.New("wrong jwt"))
+		return
+	}
+
+	bytesBuffer := buffer_pool.SyncPoolGetBuffer()
+	defer buffer_pool.SyncPoolPutBuffer(bytesBuffer)
+
+	reqNeedle, originalSize, contentMd5, ne := needle.CreateNeedleFromRequest(r, vs.FixJpgOrientation, vs.fileSizeLimitBytes, bytesBuffer)
+	if ne != nil {
+		stats.VolumeServerFileWriteFailures.Inc()
+		writeJsonError(w, r, http.StatusBadRequest, ne)
+		return
+	}
+
+	ret := operation.UploadResult{}
+	// use context.WithoutCancel to avoid context cancellation when the client connection is closed
+	isUnchanged, writeError := topology.ReplicatedWrite(context.WithoutCancel(ctx), vs.GetMaster, vs.grpcDialOption, vs.store, volumeId, reqNeedle, r, contentMd5)
+	if writeError != nil {
+		stats.VolumeServerFileWriteFailures.Inc()
+		writeJsonError(w, r, http.StatusInternalServerError, writeError)
+		return
+	}
+
+	// http 204 status code does not allow body
+	if writeError == nil && isUnchanged {
+		SetEtag(w, reqNeedle.Etag())
+		w.Header().Set("Content-MD5", contentMd5)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	httpStatus := http.StatusCreated
+	if reqNeedle.HasName() {
+		ret.Name = string(reqNeedle.Name)
+	}
+	ret.Size = uint32(originalSize)
+	ret.ETag = reqNeedle.Etag()
+	ret.Mime = string(reqNeedle.Mime)
+	ret.ContentMd5 = contentMd5
+	SetEtag(w, ret.ETag)
+	w.Header().Set("Content-MD5", contentMd5)
+	writeJsonQuiet(w, r, httpStatus, ret)
+}
+
+func (vs *VolumeServer) DeleteHandler(w http.ResponseWriter, r *http.Request) {
+	n := new(needle.Needle)
+	vid, fid, _, _, _ := parseURLPath(r.URL.Path)
+	volumeId, _ := needle.NewVolumeId(vid)
+	if err := n.ParsePath(fid); err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+
+	if !vs.maybeCheckJwtAuthorization(r, vid, fid, true) {
+		writeJsonError(w, r, http.StatusUnauthorized, errors.New("wrong jwt"))
+		return
+	}
+
+	// glog.V(2).Infof("volume %s deleting %s", vid, n)
+
+	cookie := n.Cookie
+
+	ecVolume, hasEcVolume := vs.store.FindEcVolume(volumeId)
+
+	if hasEcVolume {
+		count, err := vs.store.DeleteEcShardNeedle(ecVolume, n, cookie)
+		if errors.Is(err, storage.ErrorDeleted) {
+			// Already gone. The non-EC path below answers 404 from its
+			// ReadVolumeNeedle pre-check rather than counting a write failure,
+			// and callers fold that 404 into success.
+			m := make(map[string]uint32)
+			m["size"] = 0
+			writeJsonQuiet(w, r, http.StatusNotFound, m)
+			return
+		}
+		writeDeleteResult(err, count, w, r)
+		return
+	}
+
+	_, ok := vs.store.ReadVolumeNeedle(volumeId, n, deleteReadOption(), nil)
+	if ok != nil {
+		m := make(map[string]uint32)
+		m["size"] = 0
+		writeJsonQuiet(w, r, http.StatusNotFound, m)
+		return
+	}
+
+	if n.Cookie != cookie {
+		glog.V(0).Infoln("delete", r.URL.Path, "with unmaching cookie from ", r.RemoteAddr, "agent", r.UserAgent())
+		writeJsonError(w, r, http.StatusBadRequest, errors.New("File Random Cookie does not match."))
+		return
+	}
+
+	count := int64(n.Size)
+
+	if n.IsChunkedManifest() {
+		chunkManifest, e := operation.LoadChunkManifest(n.Data, n.IsCompressed())
+		if e != nil {
+			stats.VolumeServerFileWriteFailures.Inc()
+			writeJsonError(w, r, http.StatusInternalServerError, fmt.Errorf("Load chunks manifest error: %v", e))
+			return
+		}
+		// make sure all chunks had deleted before delete manifest
+		if e := chunkManifest.DeleteChunks(vs.GetMaster, false, vs.grpcDialOption); e != nil {
+			stats.VolumeServerFileWriteFailures.Inc()
+			writeJsonError(w, r, http.StatusInternalServerError, fmt.Errorf("Delete chunks error: %v", e))
+			return
+		}
+		count = chunkManifest.Size
+	}
+
+	n.LastModified = uint64(time.Now().Unix())
+	if len(r.FormValue("ts")) > 0 {
+		modifiedTime, err := strconv.ParseInt(r.FormValue("ts"), 10, 64)
+		if err == nil {
+			n.LastModified = uint64(modifiedTime)
+		}
+	}
+
+	_, err := topology.ReplicatedDelete(vs.GetMaster, vs.grpcDialOption, vs.store, volumeId, n, r)
+
+	writeDeleteResult(err, count, w, r)
+
+}
+
+// deleteReadOption returns the read option used by deletes: read only the
+// needle's header and trailer.
+//
+// A delete needs to know that the needle exists, what its cookie is, and
+// whether it is a chunk manifest. None of that requires the payload. If the
+// needle turns out to be a chunk manifest, the read loads its data as well,
+// because the delete needs the manifest to delete the chunks.
+func deleteReadOption() *storage.ReadOption {
+	return &storage.ReadOption{AttemptMetaOnly: true, MustMetaOnly: true}
+}
+
+func writeDeleteResult(err error, count int64, w http.ResponseWriter, r *http.Request) {
+	if err == nil {
+		m := make(map[string]int64)
+		m["size"] = count
+		writeJsonQuiet(w, r, http.StatusAccepted, m)
+	} else {
+		stats.VolumeServerFileWriteFailures.Inc()
+		writeJsonError(w, r, http.StatusInternalServerError, fmt.Errorf("Deletion Failed: %w", err))
+	}
+}
+
+func SetEtag(w http.ResponseWriter, etag string) {
+	if etag != "" {
+		if strings.HasPrefix(etag, "\"") {
+			w.Header().Set("ETag", etag)
+		} else {
+			w.Header().Set("ETag", "\""+etag+"\"")
+		}
+	}
+}

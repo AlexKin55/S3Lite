@@ -1,0 +1,593 @@
+package s3api
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/iam/integration"
+	"github.com/seaweedfs/seaweedfs/weed/iam/providers"
+	"github.com/seaweedfs/seaweedfs/weed/iam/sts"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/policy_engine"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+)
+
+// IAMIntegration defines the interface for IAM integration
+type IAMIntegration interface {
+	AuthenticateJWT(ctx context.Context, r *http.Request) (*IAMIdentity, s3err.ErrorCode)
+	AuthorizeAction(ctx context.Context, identity *IAMIdentity, action Action, bucket string, objectKey string, r *http.Request) s3err.ErrorCode
+	ValidateSessionToken(ctx context.Context, token string) (*sts.SessionInfo, error)
+	ValidateTrustPolicyForPrincipal(ctx context.Context, roleArn, principalArn string) error
+	DefaultAllow() bool
+}
+
+// IAMManagerProvider exposes the IAMManager backing an IAM integration.
+type IAMManagerProvider interface {
+	GetIAMManager() *integration.IAMManager
+}
+
+// S3IAMIntegration provides IAM integration for S3 API
+type S3IAMIntegration struct {
+	iamManager     *integration.IAMManager
+	stsService     *sts.STSService
+	filerAddress   string
+	enabled        bool
+	trustedProxies atomic.Pointer[policy_engine.TrustedProxies]
+}
+
+// NewS3IAMIntegration creates a new S3 IAM integration
+func NewS3IAMIntegration(iamManager *integration.IAMManager, filerAddress string) *S3IAMIntegration {
+	var stsService *sts.STSService
+	if iamManager != nil {
+		stsService = iamManager.GetSTSService()
+	}
+
+	return &S3IAMIntegration{
+		iamManager:   iamManager,
+		stsService:   stsService,
+		filerAddress: filerAddress,
+		enabled:      iamManager != nil,
+	}
+}
+
+// GetIAMManager returns the IAMManager backing this integration.
+func (s3iam *S3IAMIntegration) GetIAMManager() *integration.IAMManager {
+	return s3iam.iamManager
+}
+
+// SetTrustedProxies configures the allowlist used to decide whether
+// forwarded headers are honored when extracting aws:SourceIp.
+func (s3iam *S3IAMIntegration) SetTrustedProxies(tp *policy_engine.TrustedProxies) {
+	s3iam.trustedProxies.Store(tp)
+}
+
+// AuthenticateJWT authenticates JWT tokens using our STS service
+func (s3iam *S3IAMIntegration) AuthenticateJWT(ctx context.Context, r *http.Request) (*IAMIdentity, s3err.ErrorCode) {
+
+	if !s3iam.enabled {
+		return nil, s3err.ErrNotImplemented
+	}
+
+	// Extract bearer token from Authorization header
+	authHeader := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authHeader, security.BearerPrefix) {
+		return nil, s3err.ErrAccessDenied
+	}
+
+	sessionToken := strings.TrimPrefix(authHeader, security.BearerPrefix)
+	if sessionToken == "" {
+		return nil, s3err.ErrAccessDenied
+	}
+
+	// Basic token format validation - reject obviously invalid tokens
+	if sessionToken == "invalid-token" || len(sessionToken) < 10 {
+		glog.V(3).Info("Session token format is invalid")
+		return nil, s3err.ErrAccessDenied
+	}
+
+	// SECURITY NOTE: ParseJWTToken parses without cryptographic verification
+	// This is SAFE because we only use the unverified claims to route to the correct
+	// verification method. All code paths below perform full cryptographic verification:
+	// - OIDC tokens: validated via validateExternalOIDCToken (line 98)
+	// - STS tokens: validated via ValidateSessionToken (line 156)
+	// The unverified issuer claim is only used for routing, never for authorization.
+	tokenClaims, err := ParseUnverifiedJWTToken(sessionToken)
+	if err != nil {
+		glog.V(3).Infof("Failed to parse JWT token: %v", err)
+		return nil, s3err.ErrAccessDenied
+	}
+
+	// Determine token type by issuer claim (more robust than checking role claim)
+	// We use the unverified claims ONLY for routing to the correct verification method.
+	// We DO NOT use these claims for building the identity.
+	issuer, issuerOk := tokenClaims["iss"].(string)
+	if !issuerOk {
+		glog.V(3).Infof("Token missing issuer claim - invalid JWT")
+		return nil, s3err.ErrAccessDenied
+	}
+
+	// Check if this is an STS-issued token by examining the issuer
+	if !s3iam.isSTSIssuer(issuer) {
+
+		// Not an STS session token, try to validate as OIDC token with timeout
+		// Create a context with a reasonable timeout to prevent hanging
+		ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+
+		identity, err := s3iam.validateExternalOIDCToken(ctx, sessionToken)
+
+		if err != nil {
+			return nil, s3err.ErrAccessDenied
+		}
+
+		// A token without a subject has no issuer-scoped principal; letting it
+		// through would make the client-supplied claims below stand in for one.
+		if identity.UserID == "" {
+			return nil, s3err.ErrAccessDenied
+		}
+
+		// Extract role from OIDC identity
+		if identity.RoleArn == "" {
+			return nil, s3err.ErrAccessDenied
+		}
+
+		// Same trust-policy gate as AssumeRoleWithWebIdentity: the role mapping
+		// alone must not grant a role that STS would refuse for this token.
+		if err := s3iam.iamManager.ValidateTrustPolicyForWebIdentity(ctx, identity.RoleArn, sessionToken, nil); err != nil {
+			glog.V(3).Infof("OIDC bearer token rejected by trust policy of role %s: %v", identity.RoleArn, err)
+			return nil, s3err.ErrAccessDenied
+		}
+
+		// Create claims map and populate with standard claims and attributes
+		claims := make(map[string]interface{}, len(identity.Attributes)+5)
+
+		// Add all attributes from the identity to the claims
+		// This makes attributes like "preferred_username" available for policy substitution
+		for k, v := range identity.Attributes {
+			claims[k] = v
+		}
+
+		// Add standard OIDC fields to claims so they are available as variables
+		// This ensures ${jwt:email}, ${jwt:name}, etc. work as documented in the wiki
+		if identity.Email != "" {
+			claims["email"] = identity.Email
+		}
+		if identity.DisplayName != "" {
+			claims["name"] = identity.DisplayName
+		}
+		if len(identity.Groups) > 0 {
+			claims["groups"] = identity.Groups
+		}
+
+		// Set critical claims explicitly, overwriting any from attributes to ensure correctness.
+		claims["sub"] = identity.UserID
+		claims["role"] = identity.RoleArn
+		claims["iss"] = identity.Issuer
+
+		// The bare sub collides across issuers; aws:userid carries the same
+		// (sub, iss) hash STS sessions already expose, so downstream ownership
+		// keys stay namespaced per identity provider. A claim the token itself
+		// supplies is always scrubbed, never adopted.
+		if parentUser := sts.ComputeParentUser(identity.UserID, identity.Issuer); parentUser != "" {
+			claims["aws:userid"] = parentUser
+		} else {
+			delete(claims, "aws:userid")
+		}
+		if issuers := s3iam.trustedOIDCIssuers(ctx); len(issuers) > 0 {
+			claims["seaweed:oidc-issuers"] = strings.Join(issuers, " ")
+		} else {
+			delete(claims, "seaweed:oidc-issuers")
+		}
+
+		// Use real email address if available
+		emailAddress := identity.UserID + "@oidc.local"
+		if identity.Email != "" {
+			emailAddress = identity.Email
+		}
+
+		displayName := identity.UserID
+		if identity.DisplayName != "" {
+			displayName = identity.DisplayName
+		}
+
+		// Return IAM identity for OIDC token
+		return &IAMIdentity{
+			Name:         identity.UserID,
+			Principal:    identity.RoleArn,
+			SessionToken: sessionToken,
+			Account: &Account{
+				DisplayName:  displayName,
+				EmailAddress: emailAddress,
+				Id:           identity.UserID,
+			},
+			Claims:        claims,
+			IdentityClaim: sts.ResolveIdentityClaim(claims),
+		}, s3err.ErrNone
+	}
+
+	// STS session tokens authenticate SigV4 requests via proof of possession
+	// (signature with the derived secret). As bearer tokens they would turn
+	// every presigned URL, which carries the token in X-Amz-Security-Token,
+	// into a standalone credential.
+	glog.V(3).Infof("Rejected STS session token presented as bearer token")
+	return nil, s3err.ErrAccessDenied
+}
+
+// ValidateSessionToken checks the validity of an STS session token
+func (s3iam *S3IAMIntegration) ValidateSessionToken(ctx context.Context, token string) (*sts.SessionInfo, error) {
+	if s3iam.stsService == nil {
+		return nil, fmt.Errorf("STS service not available")
+	}
+	return s3iam.stsService.ValidateSessionToken(ctx, token)
+}
+
+// AuthorizeAction authorizes actions using our policy engine
+func (s3iam *S3IAMIntegration) AuthorizeAction(ctx context.Context, identity *IAMIdentity, action Action, bucket string, objectKey string, r *http.Request) s3err.ErrorCode {
+	if !s3iam.enabled {
+		return s3err.ErrNone // Fallback to existing authorization
+	}
+
+	if identity == nil || identity.Principal == "" {
+		return s3err.ErrAccessDenied
+	}
+
+	// Extract request context for policy conditions
+	requestContext := s3iam.extractRequestContext(r)
+
+	// For list operations, populate the s3:prefix condition key and ensure the
+	// resource ARN stays at bucket level (matching AWS ListBucket semantics).
+	// See https://github.com/seaweedfs/seaweedfs/issues/8969
+	resourceObjectKey := objectKey
+	if isBucketListingRequest(r, action) {
+		listPrefix := r.URL.Query().Get("prefix")
+		if listPrefix != "" {
+			requestContext["s3:prefix"] = listPrefix
+		} else if objectKey != "" && objectKey != "/" {
+			requestContext["s3:prefix"] = objectKey
+		} else {
+			requestContext["s3:prefix"] = ""
+		}
+		resourceObjectKey = ""
+	}
+
+	// Build resource ARN for the S3 operation
+	resourceArn := buildS3ResourceArn(bucket, resourceObjectKey)
+
+	// Add identity claims to request context for policy variables
+	// Only add claim keys if they don't already exist (to avoid overwriting request-derived context)
+	if identity.Claims != nil {
+		for k, v := range identity.Claims {
+			// Only add the claim if this key doesn't already exist in request context
+			if _, exists := requestContext[k]; !exists {
+				requestContext[k] = v
+			}
+
+			// If the claim doesn't have a namespace prefix (e.g. "email"), add "jwt:" prefix
+			// This allows ${jwt:email} or ${jwt:preferred_username} to work
+			// Only add namespaced version if it doesn't already exist
+			if !strings.Contains(k, ":") {
+				jwtKey := "jwt:" + k
+				if _, exists := requestContext[jwtKey]; !exists {
+					requestContext[jwtKey] = v
+				}
+			}
+		}
+	}
+
+	// Determine the specific S3 action based on the HTTP request details. The
+	// prefix promoted into objectKey is not part of the URL; resolve against
+	// the bucket-level object so ?versions and ?uploads keep their own action.
+	specificAction := ResolveS3Action(r, string(action), bucket, resourceObjectKey)
+
+	// Create action request
+	actionRequest := &integration.ActionRequest{
+		Principal: identity.Principal,
+		Action:    specificAction,
+		Resource:  resourceArn,
+		// Static SigV4 IAM users do not carry a session token. IAMManager
+		// evaluates their attached policies directly and only validates STS/OIDC
+		// session state when a token is actually present.
+		SessionToken:   identity.SessionToken,
+		RequestContext: requestContext,
+		PolicyNames:    identity.PolicyNames,
+	}
+
+	// Check if action is allowed using our policy engine
+	allowed, err := s3iam.iamManager.IsActionAllowed(ctx, actionRequest)
+	if err != nil {
+		return s3err.ErrAccessDenied
+	}
+
+	if !allowed {
+		return s3err.ErrAccessDenied
+	}
+
+	return s3err.ErrNone
+}
+
+// ValidateTrustPolicyForPrincipal delegates to IAMManager to validate trust policy
+func (s3iam *S3IAMIntegration) ValidateTrustPolicyForPrincipal(ctx context.Context, roleArn, principalArn string) error {
+	if s3iam.iamManager == nil {
+		return fmt.Errorf("IAM manager not available")
+	}
+	return s3iam.iamManager.ValidateTrustPolicyForPrincipal(ctx, roleArn, principalArn)
+}
+
+// DefaultAllow returns whether access is allowed by default when no policy is found
+func (s3iam *S3IAMIntegration) DefaultAllow() bool {
+	if s3iam.iamManager == nil {
+		return true // Default to true if IAM is not enabled
+	}
+	return s3iam.iamManager.DefaultAllow()
+}
+
+// IAMIdentity represents an authenticated identity with session information
+type IAMIdentity struct {
+	Name          string
+	Principal     string
+	SessionToken  string
+	Account       *Account
+	PolicyNames   []string
+	Claims        map[string]interface{}
+	IdentityClaim string // Authoritative OIDC identity claim for audit logging; empty for non-federated sessions
+}
+
+// IsAdmin checks if the identity has admin privileges
+func (identity *IAMIdentity) IsAdmin() bool {
+	// In our IAM system, admin status is determined by policies, not identity
+	// This is handled by the policy engine during authorization
+	return false
+}
+
+// Mock session structures for validation
+type MockSessionInfo struct {
+	AssumedRoleUser MockAssumedRoleUser
+}
+
+type MockAssumedRoleUser struct {
+	AssumedRoleId string
+	Arn           string
+}
+
+// Helper functions
+
+// buildS3ResourceArn builds an S3 resource ARN from bucket and object
+func buildS3ResourceArn(bucket string, objectKey string) string {
+	// If bucket is already an ARN, return it as-is
+	if strings.HasPrefix(bucket, "arn:") {
+		return bucket
+	}
+
+	if bucket == "" {
+		return "arn:aws:s3:::*"
+	}
+
+	if objectKey == "" || objectKey == "/" {
+		return "arn:aws:s3:::" + bucket
+	}
+
+	// Remove leading slash from object key if present
+	objectKey = strings.TrimPrefix(objectKey, "/")
+
+	return "arn:aws:s3:::" + bucket + "/" + objectKey
+}
+
+// extractRequestContext extracts request context for policy conditions
+func (s3iam *S3IAMIntegration) extractRequestContext(r *http.Request) map[string]interface{} {
+	context := make(map[string]interface{})
+
+	sourceIP := s3iam.extractSourceIP(r)
+	if sourceIP != "" {
+		context["aws:SourceIp"] = sourceIP
+	}
+
+	if userAgent := r.Header.Get("User-Agent"); userAgent != "" {
+		context["userAgent"] = userAgent
+	}
+
+	context["requestTime"] = r.Context().Value("requestTime")
+
+	if referer := r.Header.Get("Referer"); referer != "" {
+		context["referer"] = referer
+	}
+
+	return context
+}
+
+// extractSourceIP returns the client IP for aws:SourceIp condition
+// evaluation, honoring forwarded headers only when the direct TCP peer is in
+// the configured trusted-proxy allowlist (see SetTrustedProxies).
+func (s3iam *S3IAMIntegration) extractSourceIP(r *http.Request) string {
+	return s3iam.trustedProxies.Load().ExtractSourceIP(r)
+}
+
+// ParseUnverifiedJWTToken parses a JWT token and returns its claims WITHOUT cryptographic verification
+//
+// SECURITY WARNING: This function does NOT validate the token signature!
+// It should ONLY be used for:
+// 1. Routing tokens to the appropriate verification method (e.g., checking issuer to determine STS vs OIDC)
+// 2. Extracting claims for logging/debugging AFTER the token has been cryptographically verified
+//
+// NEVER use the returned claims for authorization decisions without first calling a proper
+// verification function like ValidateSessionToken() or validateExternalOIDCToken().
+func ParseUnverifiedJWTToken(tokenString string) (jwt.MapClaims, error) {
+	// Parse token without verification to get claims
+	// This token IS NOT VERIFIED at this stage.
+	// It is only used to peek at claims (like issuer) to determine which verification key/strategy to use.
+	token, _, err := new(jwt.Parser).ParseUnverified(tokenString, jwt.MapClaims{})
+	if err != nil {
+		return nil, err
+	}
+
+	if claims, ok := token.Claims.(jwt.MapClaims); ok {
+		return claims, nil
+	}
+
+	return nil, fmt.Errorf("invalid token claims")
+}
+
+// SetIAMIntegration adds advanced IAM integration to the S3ApiServer
+func (s3a *S3ApiServer) SetIAMIntegration(iamManager *integration.IAMManager) {
+	if s3a.iam != nil {
+		s3a.iam.iamIntegration = NewS3IAMIntegration(iamManager, "localhost:8888")
+		glog.V(1).Infof("IAM integration successfully set on S3ApiServer")
+	} else {
+		glog.Errorf("Cannot set IAM integration: s3a.iam is nil")
+	}
+}
+
+// OIDCIdentity represents an identity validated through OIDC
+type OIDCIdentity struct {
+	UserID      string
+	RoleArn     string
+	Provider    string
+	Issuer      string
+	Email       string
+	DisplayName string
+	Groups      []string
+	Attributes  map[string]string
+}
+
+// validateExternalOIDCToken validates an external OIDC token using the STS service's secure issuer-based lookup
+// This method delegates to the STS service's validateWebIdentityToken for better security and efficiency
+func (s3iam *S3IAMIntegration) validateExternalOIDCToken(ctx context.Context, token string) (*OIDCIdentity, error) {
+
+	if s3iam.iamManager == nil {
+		return nil, fmt.Errorf("IAM manager not available")
+	}
+
+	// Get STS service for secure token validation
+	stsService := s3iam.iamManager.GetSTSService()
+	if stsService == nil {
+		return nil, fmt.Errorf("STS service not available")
+	}
+
+	// Use the STS service's secure validateWebIdentityToken method
+	// This method uses issuer-based lookup to select the correct provider, which is more secure and efficient
+	externalIdentity, provider, err := stsService.ValidateWebIdentityToken(ctx, token)
+	if err != nil {
+		return nil, fmt.Errorf("token validation failed: %w", err)
+	}
+
+	if externalIdentity == nil {
+		return nil, fmt.Errorf("authentication succeeded but no identity returned")
+	}
+
+	// Extract role from external identity attributes
+	rolesAttr, exists := externalIdentity.Attributes["roles"]
+	if !exists || rolesAttr == "" {
+		glog.V(3).Infof("No roles found in external identity")
+		return nil, fmt.Errorf("no roles found in external identity")
+	}
+
+	// Parse roles (stored as comma-separated string)
+	rolesStr := strings.TrimSpace(rolesAttr)
+	roles := strings.Split(rolesStr, ",")
+
+	// Clean up role names
+	var cleanRoles []string
+	for _, role := range roles {
+		cleanRole := strings.TrimSpace(role)
+		if cleanRole != "" {
+			cleanRoles = append(cleanRoles, cleanRole)
+		}
+	}
+
+	if len(cleanRoles) == 0 {
+		glog.V(3).Infof("Empty roles list after parsing")
+		return nil, fmt.Errorf("no valid roles found in token")
+	}
+
+	// Determine the primary role using intelligent selection
+	roleArn := s3iam.selectPrimaryRole(cleanRoles, externalIdentity)
+
+	return &OIDCIdentity{
+		UserID:      externalIdentity.UserID,
+		RoleArn:     roleArn,
+		Provider:    fmt.Sprintf("%T", provider), // Use provider type as identifier
+		Issuer:      externalIdentity.Issuer,
+		Email:       externalIdentity.Email,
+		DisplayName: externalIdentity.DisplayName,
+		Groups:      externalIdentity.Groups,
+		Attributes:  externalIdentity.Attributes,
+	}, nil
+}
+
+// trustedOIDCIssuers returns the issuer URLs of the OIDC providers the
+// deployment is configured to trust. It is what a legacy (pre-scoping) bare
+// subject can be re-anchored to: exactly one issuer makes the mapping
+// unambiguous; anything else leaves it unknown, which callers must treat as
+// fail-closed rather than guessing from the caller's issuer.
+//
+// The list is only safe while complete. Without a provider store the
+// registered providers are the whole set — there is nowhere an issuer could
+// hide. With a store, a failed listing leaves the real set unknown, and
+// passing the registered subset off as complete could collapse a
+// multi-issuer deployment to a single issuer: the one shape a bare subject
+// re-anchors under, so a caller from that issuer could claim a stored
+// subject that belongs to a provider hidden behind the error. Fail closed.
+func (s3iam *S3IAMIntegration) trustedOIDCIssuers(ctx context.Context) []string {
+	if s3iam.iamManager == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var issuers []string
+	// Configured identity providers registered with STS cover deployments
+	// whose OIDC setup lives in config rather than the provider store.
+	if stsService := s3iam.iamManager.GetSTSService(); stsService != nil {
+		for _, p := range stsService.GetProviders() {
+			if issuer, ok := p.(interface{ GetIssuer() string }); ok {
+				if iss := issuer.GetIssuer(); iss != "" && !seen[iss] {
+					seen[iss] = true
+					issuers = append(issuers, iss)
+				}
+			}
+		}
+	}
+	if s3iam.iamManager.GetOIDCProviderStore() == nil {
+		return issuers
+	}
+	records, err := s3iam.iamManager.ListOIDCProviders(ctx)
+	if err != nil {
+		glog.V(2).Infof("trustedOIDCIssuers: %v", err)
+		return nil
+	}
+	for _, rec := range records {
+		if rec.URL != "" && !seen[rec.URL] {
+			seen[rec.URL] = true
+			issuers = append(issuers, rec.URL)
+		}
+	}
+	return issuers
+}
+
+// selectPrimaryRole simply picks the first role from the list
+// The OIDC provider should return roles in priority order (most important first)
+func (s3iam *S3IAMIntegration) selectPrimaryRole(roles []string, externalIdentity *providers.ExternalIdentity) string {
+	if len(roles) == 0 {
+		return ""
+	}
+
+	// Just pick the first one - keep it simple
+	selectedRole := roles[0]
+	return selectedRole
+}
+
+// isSTSIssuer determines if an issuer belongs to the STS service
+// Uses exact match against configured STS issuer for security and correctness
+func (s3iam *S3IAMIntegration) isSTSIssuer(issuer string) bool {
+	if s3iam.stsService == nil || s3iam.stsService.Config == nil {
+		return false
+	}
+
+	// Directly compare with the configured STS issuer for exact match
+	// This prevents false positives from external OIDC providers that might
+	// contain STS-related keywords in their issuer URLs
+	return issuer == s3iam.stsService.Config.Issuer
+}

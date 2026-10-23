@@ -1,0 +1,82 @@
+package needle
+
+import (
+	"testing"
+
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+)
+
+func TestParseFileIdFromString(t *testing.T) {
+	fidStr1 := "100,12345678"
+	_, err := ParseFileIdFromString(fidStr1)
+	if err == nil {
+		t.Errorf("%s : KeyHash is too short", fidStr1)
+	}
+
+	fidStr1 = "100, 12345678"
+	_, err = ParseFileIdFromString(fidStr1)
+	if err == nil {
+		t.Errorf("%s : needleId invalid syntax", fidStr1)
+	}
+
+	fidStr1 = "100,123456789"
+	_, err = ParseFileIdFromString(fidStr1)
+	if err != nil {
+		t.Errorf("%s : should be OK", fidStr1)
+	}
+
+	var fileId *FileId
+	fidStr1 = "100,123456789012345678901234"
+	fileId, err = ParseFileIdFromString(fidStr1)
+	if err != nil {
+		t.Errorf("%s : should be OK", fidStr1)
+	}
+	if !(fileId.VolumeId == VolumeId(100) &&
+		fileId.Key == types.NeedleId(0x1234567890123456) &&
+		fileId.Cookie == types.Cookie(types.Uint32ToCookie(uint32(0x78901234)))) {
+		t.Errorf("src : %s, dest : %v", fidStr1, fileId)
+	}
+
+	fidStr1 = "100,abcd0000abcd"
+	fileId, err = ParseFileIdFromString(fidStr1)
+	if err != nil {
+		t.Errorf("%s : should be OK", fidStr1)
+	}
+	if !(fileId.VolumeId == VolumeId(100) &&
+		fileId.Key == types.NeedleId(0xabcd) &&
+		fileId.Cookie == types.Cookie(types.Uint32ToCookie(uint32(0xabcd)))) {
+		t.Errorf("src : %s, dest : %v", fidStr1, fileId)
+	}
+
+	fidStr1 = "100,1234567890123456789012345"
+	_, err = ParseFileIdFromString(fidStr1)
+	if err == nil {
+		t.Errorf("%s : needleId is too long", fidStr1)
+	}
+}
+
+func TestNeedleIdFileId(t *testing.T) {
+	tests := []struct {
+		key      types.NeedleId
+		volumeId uint32
+		want     string
+	}{
+		{types.NeedleId(1), 3, "3,0100000000"},
+		{types.NeedleId(0x123), 3, "3,012300000000"},
+		{types.NeedleId(0x1234), 7, "7,123400000000"},
+	}
+	for _, tt := range tests {
+		fid := tt.key.FileId(tt.volumeId)
+		if fid != tt.want {
+			t.Errorf("NeedleId(%d).FileId(%d) = %s, want %s", tt.key, tt.volumeId, fid, tt.want)
+		}
+		fileId, err := ParseFileIdFromString(fid)
+		if err != nil {
+			t.Errorf("%s : should be OK: %v", fid, err)
+			continue
+		}
+		if fileId.VolumeId != VolumeId(tt.volumeId) || fileId.Key != tt.key || fileId.Cookie != 0 {
+			t.Errorf("src : %s, dest : %v", fid, fileId)
+		}
+	}
+}
