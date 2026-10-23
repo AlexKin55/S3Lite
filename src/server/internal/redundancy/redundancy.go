@@ -19,6 +19,17 @@ type Volume struct {
 // Total returns k+m.
 func (v *Volume) Total() int { return v.DataShards + v.ParityShards }
 
+// VolumeKey identifies an EC volume in the placement history.
+type VolumeKey struct {
+	Collection string
+	VolumeID   uint32
+}
+
+// Key returns the history key of the volume.
+func (v *Volume) Key() VolumeKey {
+	return VolumeKey{Collection: v.Collection, VolumeID: v.VolumeID}
+}
+
 // clone returns a deep copy of the volume's placement (safe to mutate).
 func (v *Volume) clone() *Volume {
 	cp := &Volume{

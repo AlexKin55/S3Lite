@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,8 +34,13 @@ type server struct {
 	lastTopoEC  atomic.Int64 // number of EC volumes in the last snapshot
 	// Placement history: merged per-volume shard layout (see redundancy.Merge).
 	// Keeps nodes that dropped out of the master topology known to the advice
-	// engine so "which PCs to power back on" can name them.
-	placementHist atomic.Value // []*redundancy.Volume
+	// engine so "which PCs to power back on" can name them. Entries that stop
+	// being confirmed by fresh snapshots are aged out, so a re-used volume id
+	// (e.g. after a master restart) is not reported as a phantom EC volume.
+	histMu      sync.Mutex
+	histVolumes []*redundancy.Volume
+	histMiss    map[redundancy.VolumeKey]int
+	histMaxMiss int // evict after this many unconfirmed polls
 }
 
 // VolumeTemplate is the static part of the volume config sent to agents.
@@ -81,7 +87,9 @@ func main() {
 		},
 	}
 	srv.lastReports.Store([]*redundancy.Report{})
-	srv.placementHist.Store([]*redundancy.Volume{})
+	srv.histVolumes = []*redundancy.Volume{}
+	srv.histMiss = make(map[redundancy.VolumeKey]int)
+	srv.histMaxMiss = 10 // ~10 polls before a phantom volume is forgotten
 	srv.lastUpdate.Store(time.Time{})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -132,14 +140,37 @@ func (s *server) evaluate(ctx context.Context) {
 	// Merge the fresh snapshot into the placement history: shard layouts of
 	// volumes whose nodes vanished from the topology survive, so offline nodes
 	// (and the shards they hold) stay visible to the classifier and set cover.
-	volumes := redundancy.Merge(s.placementHist.Load().([]*redundancy.Volume), fresh)
-	s.placementHist.Store(volumes)
-	reports := redundancy.Evaluate(volumes, func(addr string) bool { return online[addr] })
+	// Volumes that stop appearing in fresh snapshots age out (histMaxMiss),
+	// which prevents phantom EC reports for re-used volume ids.
+	s.histMu.Lock()
+	history := append([]*redundancy.Volume(nil), s.histVolumes...)
+	merged := redundancy.Merge(history, fresh)
+	inFresh := make(map[redundancy.VolumeKey]bool, len(fresh))
+	for _, v := range fresh {
+		inFresh[v.Key()] = true
+	}
+	for _, v := range merged {
+		k := v.Key()
+		if inFresh[k] {
+			s.histMiss[k] = 0
+		} else {
+			s.histMiss[k]++
+		}
+	}
+	kept := merged[:0]
+	for _, v := range merged {
+		if s.histMiss[v.Key()] <= s.histMaxMiss {
+			kept = append(kept, v)
+		}
+	}
+	s.histVolumes = kept
+	s.histMu.Unlock()
+	reports := redundancy.Evaluate(kept, func(addr string) bool { return online[addr] })
 
 	prev := s.lastReports.Load().([]*redundancy.Report)
 	s.lastReports.Store(reports)
 	s.lastUpdate.Store(time.Now())
-	s.lastTopoEC.Store(int64(len(volumes)))
+	s.lastTopoEC.Store(int64(len(kept)))
 
 	// Notify on AT_RISK transitions and on changed recommendation sets.
 	for i := range reports {
