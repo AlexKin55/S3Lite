@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "purge" ]; then
+  # Remove the service account on purge only if the agent package that shares
+  # the account is not installed.
+  if command -v dpkg >/dev/null 2>&1 && ! dpkg -l s3lite-agent >/dev/null 2>&1; then
+    if command -v userdel >/dev/null 2>&1; then
+      userdel --system s3lite >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -rf /etc/s3lite
+  rm -f /etc/s3lite/server.env
+fi
+
+exit 0

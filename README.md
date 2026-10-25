@@ -50,6 +50,23 @@ bin/server -listen=:8099 \
 Agents connect with `-server=https://<control-ip>:8099 -insecure`
 (remove `-insecure` once the CA is trusted on the nodes).
 
+### Installing from deb/rpm packages
+
+Build native installable packages for the agent and the control plane
+(no fpm — plain `dpkg-deb`/`rpmbuild`, details in
+[`deploy/packaging/README.md`](deploy/packaging/README.md)):
+
+```bash
+./deploy/packaging/build_packages.sh        # deb + rpm for agent and server
+# artifacts: deploy/packaging/dist/packages/
+```
+
+- **`s3lite-agent`** bundles the `weed` binary; set the control plane address
+  in `/etc/s3lite/agent.env`, then `systemctl start s3lite-agent`.
+- **`s3lite-server`**: configure `/etc/s3lite/server.env` and start the service.
+- Both packages create the `s3lite` system user, install a systemd unit and
+  enable (but do not auto-start) the service.
+
 ### Installing the agent as a service
 
 - Linux (systemd): `sudo ./deploy/systemd/install_agent.sh <CONTROL_PLANE_ADDR> [PORT]`

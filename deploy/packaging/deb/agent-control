@@ -1,0 +1,14 @@
+Package: s3lite-agent
+Version: @@VERSION@@
+Section: net
+Priority: optional
+Architecture: @@ARCH@@
+Maintainer: S3Lite <dev@s3lite.dev>
+Description: S3Lite storage node agent
+ The S3Lite node agent runs on every PC that contributes storage to the
+ S3Lite cluster. It registers the node with the control plane, starts and
+ supervises a local SeaweedFS volume server (the weed binary is bundled)
+ and reports health/disk metrics to the control plane.
+ .
+ Set the control plane address in /etc/s3lite/agent.env, then start the
+ service: systemctl start s3lite-agent
