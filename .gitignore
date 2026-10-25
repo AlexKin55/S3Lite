@@ -11,3 +11,10 @@ filerldb2/
 
 # Local documents/plans (kept out of the repository)
 plans/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# deb/rpm packaging artifacts
+deploy/packaging/dist/
