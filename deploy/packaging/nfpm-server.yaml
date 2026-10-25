@@ -1,0 +1,38 @@
+# nfpm configuration for the S3Lite control plane server package.
+# Built by deploy/packaging/build_packages.sh (nfpm >= 2.x).
+# @@PKG_VERSION@@/@@PKG_RELEASE@@/@@PKG_ARCH@@ are substituted by the build script.
+name: s3lite-server
+arch: "@@PKG_ARCH@@"
+platform: linux
+version: "@@PKG_VERSION@@"
+release: "@@PKG_RELEASE@@"
+section: net
+priority: optional
+maintainer: S3Lite <dev@s3lite.dev>
+description: |
+  Central control plane of the S3Lite distributed S3 storage: node registry,
+  health monitoring, volume classification (OK/DEGRADED/AT_RISK), redundancy
+  evaluation and notifications, plus a browser dashboard and Prometheus
+  /metrics endpoint.
+
+  Configure /etc/s3lite/server.env, then start the service:
+  systemctl start s3lite-server
+vendor: S3Lite
+homepage: https://example.invalid/s3lite
+license: Apache-2.0
+
+contents:
+  - src: ../../bin/server
+    dst: /usr/bin/s3lite-server
+  - src: systemd/s3lite-server.service
+    dst: /usr/lib/systemd/system/s3lite-server.service
+  - src: env/s3lite-server.env
+    dst: /etc/s3lite/server.env
+    type: config|noreplace
+  - src: ../../README.md
+    dst: /usr/share/doc/s3lite-server/README.md
+
+scripts:
+  postinstall: scripts/postinstall.sh
+  preremove: scripts/preremove.sh
+  postremove: scripts/postremove.sh

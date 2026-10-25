@@ -1,0 +1,40 @@
+# nfpm configuration for the S3Lite node agent package.
+# Built by deploy/packaging/build_packages.sh (nfpm >= 2.x).
+# @@PKG_VERSION@@/@@PKG_RELEASE@@/@@PKG_ARCH@@ are substituted by the build script.
+name: s3lite-agent
+arch: "@@PKG_ARCH@@"
+platform: linux
+version: "@@PKG_VERSION@@"
+release: "@@PKG_RELEASE@@"
+section: net
+priority: optional
+maintainer: S3Lite <dev@s3lite.dev>
+description: |
+  The S3Lite node agent runs on every PC that contributes storage to the
+  S3Lite cluster. It registers the node with the control plane, starts and
+  supervises a local SeaweedFS volume server (the weed binary is bundled)
+  and reports health/disk metrics to the control plane.
+
+  Set the control plane address in /etc/s3lite/agent.env, then start the
+  service: systemctl start s3lite-agent
+vendor: S3Lite
+homepage: https://example.invalid/s3lite
+license: Apache-2.0
+
+contents:
+  - src: ../../bin/agent
+    dst: /usr/bin/s3lite-agent
+  - src: ../../bin/weed
+    dst: /usr/bin/weed
+  - src: systemd/s3lite-agent.service
+    dst: /usr/lib/systemd/system/s3lite-agent.service
+  - src: env/s3lite-agent.env
+    dst: /etc/s3lite/agent.env
+    type: config|noreplace
+  - src: ../../README.md
+    dst: /usr/share/doc/s3lite-agent/README.md
+
+scripts:
+  postinstall: scripts/postinstall.sh
+  preremove: scripts/preremove.sh
+  postremove: scripts/postremove.sh
