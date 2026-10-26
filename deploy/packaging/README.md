@@ -115,6 +115,31 @@ sudo apt remove s3lite-agent; sudo apt purge s3lite-agent   # purge deletes /var
 sudo dnf remove s3lite-agent
 ```
 
+## Release workflow (OBS)
+
+S3Lite uses a **release branch** model — OBS
+([build.opensuse.org](https://build.opensuse.org)) pulls the sources from the
+`release` branch instead of tags:
+
+1. Development happens on `main`. Versions of the components live in
+   `src/server/VERSION` and `src/agent/VERSION` — the single source of truth,
+   so the server and the agent can version independently.
+2. To cut a release, make a **slice** of `main` into `release`:
+
+   ```bash
+   git checkout release
+   git merge main
+   git push origin release
+   ```
+
+3. OBS `tar_scm` service checks out `revision=release`; each package reads its
+   version from the `VERSION` file inside the archive:
+   - `s3lite-server` → [`src/server/VERSION`](../../src/server/VERSION)
+   - `s3lite-agent` → [`src/agent/VERSION`](../../src/agent/VERSION)
+
+Bumping a component version means committing the new value on `main` and
+slicing it into `release` — OBS picks up the new state on its next build.
+
 ## Notes
 
 - The agent package bundles `weed` (the same build that ships test clusters
