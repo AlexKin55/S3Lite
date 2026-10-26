@@ -120,14 +120,3 @@ python3 src/tests/integration.py          # all cases A–E
 python3 src/tests/integration.py -c A,B  # selected cases
 python3 src/tests/integration_webhook.py # webhook delivery check (TODO-3)
 ```
-
-## Status
-
-- [x] Stage 1: test cluster (master + volume x10 + filer + s3), stock EC 10+4 verified
-- [x] Stage 2: custom EC k+m patch, EC 6+4 verified (4 nodes offline → reads still work)
-- [x] Stage 3: Go node agent (registration, volume supervision, heartbeat, auto-restart on crash)
-- [x] Stage 4: control plane core (registry, health, redundancy OK/DEGRADED/AT_RISK, notifications, metrics)
-- [x] Stage 5: integration tests (12/12 PASS: DEGRADED, AT_RISK, return, rebuild scenarios)
-- [ ] Stage 6: production readiness
-
-Details: [plans/action-plan.md](plans/action-plan.md), [plans/distributed-storage-plan.md](plans/distributed-storage-plan.md).
