@@ -4,10 +4,12 @@
     packages).
 
     Downloads the whole S3Lite repository from the git "release" branch and
-    packs it into s3lite.tar.gz. The archive contains every component
-    (src/server, src/agent, src/thirdparty/seaweedfs) plus the VERSION files
-    (src/server/VERSION, src/agent/VERSION) that carry the per-component
-    package versions.
+    packs it into s3lite-<revision>.tar.gz. No versionformat by design: the
+    archive name reflects the git revision, while the real package versions
+    come from the VERSION files inside the archive. The archive contains
+    every component (src/server, src/agent, src/thirdparty/seaweedfs) plus
+    the VERSION files (src/server/VERSION, src/agent/VERSION) that carry the
+    per-component package versions.
 
     NOTE: currently builds from "main" while the OBS packages are being
     debugged. Switch to "release" (and slice main -> release) once the

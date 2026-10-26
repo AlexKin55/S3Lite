@@ -4,8 +4,10 @@
 # S3Lite node agent, built by OBS from the git "release" branch.
 #
 # Source handling:
-#   _service (tar_scm) downloads the release branch and produces s3lite.tar.gz
-#   -> Source0 below. The archive unpacks into the s3lite/ directory.
+#   _service (tar_scm) downloads the S3Lite repo and produces
+#   s3lite-<revision>.tar.gz (no versionformat by design — the archive name
+#   reflects the git revision). The spec has no Source0; %prep unpacks the
+#   matching archive via a glob and the VERSION file pins the real version.
 #
 # Versioning:
 #   The single source of truth for the package version is
@@ -19,7 +21,6 @@ Summary:        S3Lite distributed S3 storage - node agent
 License:        Apache-2.0
 Group:          System/Daemons
 URL:            https://github.com/AlexKin55/S3Lite
-Source0:        s3lite.tar.gz
 BuildRequires:  golang >= 1.27
 Requires(pre):  shadow
 Requires(post): systemd
@@ -39,7 +40,16 @@ service:
     systemctl start s3lite-agent
 
 %prep
-%setup -q -n s3lite
+# The OBS source services may deliver the archive as s3lite-<version>.tar.gz
+# or keep the "_service:<service>:" prefix (server-side service run), so
+# unpack the matching archive instead of relying on an exact Source0 name.
+rm -rf s3lite-src
+mkdir s3lite-src
+tar --strip-components=1 -xzf %{_sourcedir}/*s3lite*.tar.gz -C s3lite-src
+cd s3lite-src
+# Vendored Go deps ship as a compressed bundle (the artifact the official
+# obs-service-go_modules produces); extract it back into the module.
+tar xzf deploy/obs/vendor/seaweedfs.tar.gz -C src/thirdparty/seaweedfs
 # The VERSION file on the release branch is the version source of truth.
 test "$(cat src/agent/VERSION)" = "%{version}" || {
   echo "ERROR: src/agent/VERSION ($(cat src/agent/VERSION)) does not match spec Version (%{version})" >&2
@@ -47,13 +57,20 @@ test "$(cat src/agent/VERSION)" = "%{version}" || {
 }
 
 %build
+# rpmbuild re-establishes the build dir before each scriptlet,
+# so re-enter the unpacked archive explicitly.
+cd s3lite-src
 export GO111MODULE=on
 export GOPATH="%{_builddir}/gopath"
 export GOCACHE="%{_builddir}/gocache"
+# Dependencies are vendored; never touch the network — fail loudly instead.
+export GOFLAGS=-mod=vendor
+export GOPROXY=off
 (cd src/agent && go build -trimpath -ldflags "-s -w" -o s3lite-agent ./cmd/agent)
 (cd src/thirdparty/seaweedfs/weed && go build -trimpath -ldflags "-s -w" -o weed .)
 
 %install
+cd s3lite-src
 mkdir -p %{buildroot}%{_bindir}
 mkdir -p %{buildroot}%{_unitdir}
 mkdir -p %{buildroot}%{_sysconfdir}/s3lite

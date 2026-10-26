@@ -4,8 +4,10 @@
 # S3Lite control plane server, built by OBS from the git "release" branch.
 #
 # Source handling:
-#   _service (tar_scm) downloads the release branch and produces s3lite.tar.gz
-#   -> Source0 below. The archive unpacks into the s3lite/ directory.
+#   _service (tar_scm) downloads the S3Lite repo and produces
+#   s3lite-<revision>.tar.gz (no versionformat by design — the archive name
+#   reflects the git revision). The spec has no Source0; %prep unpacks the
+#   matching archive via a glob and the VERSION file pins the real version.
 #
 # Versioning:
 #   The single source of truth for the package version is
@@ -19,7 +21,6 @@ Summary:        S3Lite distributed S3 storage - control plane server
 License:        Apache-2.0
 Group:          System/Daemons
 URL:            https://github.com/AlexKin55/S3Lite
-Source0:        s3lite.tar.gz
 BuildRequires:  golang >= 1.27
 Requires(pre):  shadow
 Requires(post): systemd
@@ -38,7 +39,16 @@ Configure /etc/s3lite/server.env, then start the service:
     systemctl start s3lite-server
 
 %prep
-%setup -q -n s3lite
+# The OBS source services may deliver the archive as s3lite-<version>.tar.gz
+# or keep the "_service:<service>:" prefix (server-side service run), so
+# unpack the matching archive instead of relying on an exact Source0 name.
+rm -rf s3lite-src
+mkdir s3lite-src
+tar --strip-components=1 -xzf %{_sourcedir}/*s3lite*.tar.gz -C s3lite-src
+cd s3lite-src
+# Vendored Go deps ship as a compressed bundle (the artifact the official
+# obs-service-go_modules produces); extract it back into the module.
+tar xzf deploy/obs/vendor/server.tar.gz -C src/server
 # The VERSION file on the release branch is the version source of truth.
 test "$(cat src/server/VERSION)" = "%{version}" || {
   echo "ERROR: src/server/VERSION ($(cat src/server/VERSION)) does not match spec Version (%{version})" >&2
@@ -46,12 +56,19 @@ test "$(cat src/server/VERSION)" = "%{version}" || {
 }
 
 %build
+# rpmbuild re-establishes the build dir before each scriptlet,
+# so re-enter the unpacked archive explicitly.
+cd s3lite-src
 export GO111MODULE=on
 export GOPATH="%{_builddir}/gopath"
 export GOCACHE="%{_builddir}/gocache"
+# Dependencies are vendored; never touch the network — fail loudly instead.
+export GOFLAGS=-mod=vendor
+export GOPROXY=off
 (cd src/server && go build -trimpath -ldflags "-s -w" -o s3lite-server ./cmd/server)
 
 %install
+cd s3lite-src
 mkdir -p %{buildroot}%{_bindir}
 mkdir -p %{buildroot}%{_unitdir}
 mkdir -p %{buildroot}%{_sysconfdir}/s3lite
