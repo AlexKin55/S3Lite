@@ -7,13 +7,23 @@ OBS builds the `s3lite-server` and `s3lite-agent` RPM packages for openSUSE 16
 
 | File                             | Purpose                                                        |
 |----------------------------------|----------------------------------------------------------------|
-| [`_service`](_service)           | `tar_scm`: downloads the `release` branch as `s3lite.tar.gz` (same file for both packages) |
+| [`_service`](_service)           | `tar_scm`: downloads the S3Lite repo as `s3lite.tar.gz` (same file for both packages) |
 | `server/s3lite-server.spec`      | Control plane package                                          |
 | `agent/s3lite-agent.spec`        | Node agent package (bundles the `weed` binary)                 |
 
 The version source of truth is `src/server/VERSION` / `src/agent/VERSION`
-committed on the `release` branch. Every spec has `Version:` and verifies in
-`%prep` that it matches its `VERSION` file — a mismatch fails the build.
+(today on `main`, later on `release`). Every spec has `Version:` and verifies
+in `%prep` that it matches its `VERSION` file — a mismatch fails the build.
+
+## Current phase: building from main (debug)
+
+`_service` points `revision` at **`main`** while the OBS packages are being
+debugged. Once the build is green:
+
+1. slice `main` -> `release` (`git checkout release && git merge main`,
+   push),
+2. change `revision` in `_service` to `release`,
+3. re-run services on both OBS packages.
 
 ## Repository layout in OBS
 
