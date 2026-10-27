@@ -50,15 +50,16 @@ bin/server -listen=:8099 \
 Agents connect with `-server=https://<control-ip>:8099 -insecure`
 (remove `-insecure` once the CA is trusted on the nodes).
 
-### Installing from deb/rpm packages
+### Installing from OBS packages
 
-Build native installable packages for the agent and the control plane with
-[nfpm](https://nfpm.goreleaser.com) (details in
-[`deploy/packaging/README.md`](deploy/packaging/README.md)):
+RPMs for the agent and the control plane are built by
+[OBS](https://build.opensuse.org) from the
+[`deploy/obs/`](deploy/obs) directory (details in its
+[README](deploy/obs/README.md); sources come from the `release` git branch):
 
 ```bash
-./deploy/packaging/build_packages.sh        # deb + rpm for agent and server
-# artifacts: deploy/packaging/dist/packages/
+zypper install s3lite-server s3lite-agent    # openSUSE / SLES
+dnf install s3lite-server s3lite-agent       # Fedora / RHEL
 ```
 
 - **`s3lite-agent`** bundles the `weed` binary; set the control plane address
@@ -70,14 +71,9 @@ Build native installable packages for the agent and the control plane with
 ### Installing the agent as a service
 
 - Linux (systemd): `sudo ./deploy/systemd/install_agent.sh <CONTROL_PLANE_ADDR> [PORT]`
-- Windows (NSSM): `powershell -File deploy/windows/s3lite-agent.ps1 -ControlPlane 192.168.1.9`
 
 ### High availability
 
-- **Control plane**: run two+ instances behind a load balancer with a shared
-  PostgreSQL registry ([`deploy/postgres/schema.sql`](deploy/postgres/schema.sql));
-  the node registry and placement history move to PostgreSQL (in-memory is the
-  development default).
 - **SeaweedFS**: run the master as a Raft trio (`weed master -peers=...`) and
   multiple filers/S3 gateways behind a proxy.
 
@@ -109,8 +105,7 @@ the data: 192.168.1.9:8085
 - If a node is lost permanently, use `ec.rebuild` (weed shell) to reconstruct
   missing shards on live nodes; AT_RISK notifications name the exact PCs to
   power back on.
-- Store the EC shard layout (`ec_placement` table) so recommendations survive
-  control-plane restarts.
+- Store the EC shard layout so recommendations survive control-plane restarts.
 
 ## Testing
 

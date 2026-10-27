@@ -1,6 +1,6 @@
 module github.com/seaweedfs/seaweedfs/weed/pb/master_pb
 
-go 1.27.0
+go 1.26.0
 
 require (
 	github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb v0.0.0

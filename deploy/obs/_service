@@ -1,20 +1,4 @@
 <services>
-  <!--
-    S3Lite OBS source service (shared by the s3lite-server and s3lite-agent
-    packages).
-
-    Downloads the whole S3Lite repository from the git "release" branch and
-    packs it into s3lite-<revision>.tar.gz. No versionformat by design: the
-    archive name reflects the git revision, while the real package versions
-    come from the VERSION files inside the archive. The archive contains
-    every component (src/server, src/agent, src/thirdparty/seaweedfs) plus
-    the VERSION files (src/server/VERSION, src/agent/VERSION) that carry the
-    per-component package versions.
-
-    NOTE: currently builds from "main" while the OBS packages are being
-    debugged. Switch to "release" (and slice main -> release) once the
-    build works.
-  -->
   <service name="tar_scm">
     <param name="scm">git</param>
     <param name="url">https://github.com/AlexKin55/S3Lite.git</param>

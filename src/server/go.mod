@@ -1,6 +1,6 @@
 module s3lite.dev/server
 
-go 1.27.0
+go 1.26.0
 
 require (
 	github.com/seaweedfs/seaweedfs/weed/pb/master_pb v0.0.0

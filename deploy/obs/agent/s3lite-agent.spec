@@ -3,11 +3,23 @@
 #
 # S3Lite node agent, built by OBS from the git "release" branch.
 #
+# One spec for all target repositories: the OBS project defines the
+# repositories (openSUSE_16, Fedora_44, Ubuntu_25.04) and this spec is
+# built against each of them. Per-distro differences are handled by the
+# %%if blocks below — the macros (%%suse_version, %%fedora, %%ubuntu/%%debian)
+# are injected by OBS depending on the build repository. On Debian/Ubuntu
+# targets OBS produces a .deb from this rpm-style spec and the rpm macros
+# resolve to the Debian paths (%%{_bindir}=/usr/bin, %%{_unitdir}=/lib/systemd/system,
+# %%{_sysconfdir}=/etc, %%{_localstatedir}=/var, %%{_defaultdocdir}=/usr/share/doc).
+#
 # Source handling:
 #   _service (tar_scm) downloads the S3Lite repo and produces
 #   s3lite-<revision>.tar.gz (no versionformat by design — the archive name
 #   reflects the git revision). The spec has no Source0; %prep unpacks the
 #   matching archive via a glob and the VERSION file pins the real version.
+#   The systemd unit (deploy/obs/agent/s3lite-agent.service) and the env
+#   template (deploy/obs/env/s3lite-agent.env) are installed from the
+#   unpacked archive by their repo-relative paths.
 #
 # Versioning:
 #   The single source of truth for the package version is
@@ -19,14 +31,26 @@ Version:        0.0.1
 Release:        0
 Summary:        S3Lite distributed S3 storage - node agent
 License:        Apache-2.0
-Group:          System/Daemons
 URL:            https://github.com/AlexKin55/S3Lite
-BuildRequires:  golang >= 1.27
+
+# --- per-distro build/runtime prerequisites -------------------------------
+%if 0%{?suse_version}
+Group:          System/Daemons
+BuildRoot:      %{_tmppath}/%{name}-%{version}-build
+BuildRequires:  golang >= 1.26
 Requires(pre):  shadow
+%endif
+%if 0%{?fedora}
+BuildRequires:  golang >= 1.26
+Requires(pre):  shadow-utils
+%endif
+%if 0%{?ubuntu} || 0%{?debian}
+BuildRequires:  golang-go >= 1.26
+Requires(pre):  passwd
+%endif
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
-BuildRoot:      %{_tmppath}/%{name}-%{version}-build
 
 %description
 The S3Lite node agent runs on every PC that contributes storage to the
@@ -50,6 +74,10 @@ cd s3lite-src
 # Vendored Go deps ship as a compressed bundle (the artifact the official
 # obs-service-go_modules produces); extract it back into the module.
 tar xzf deploy/obs/vendor/seaweedfs.tar.gz -C src/thirdparty/seaweedfs
+# Diagnostics: confirm the bundle carried real content, not an LFS pointer.
+ls -lh deploy/obs/vendor/
+du -sh src/thirdparty/seaweedfs/vendor
+ls src/thirdparty/seaweedfs/vendor | head -5
 # The VERSION file on the release branch is the version source of truth.
 test "$(cat src/agent/VERSION)" = "%{version}" || {
   echo "ERROR: src/agent/VERSION ($(cat src/agent/VERSION)) does not match spec Version (%{version})" >&2
@@ -77,9 +105,9 @@ mkdir -p %{buildroot}%{_sysconfdir}/s3lite
 mkdir -p %{buildroot}%{_localstatedir}/lib/s3lite/agent
 install -m 0755 src/agent/s3lite-agent %{buildroot}%{_bindir}/s3lite-agent
 install -m 0755 src/thirdparty/seaweedfs/weed/weed %{buildroot}%{_bindir}/weed
-install -m 0644 deploy/packaging/systemd/s3lite-agent.service %{buildroot}%{_unitdir}/s3lite-agent.service
-install -m 0640 deploy/packaging/env/s3lite-agent.env %{buildroot}%{_sysconfdir}/s3lite/agent.env
-install -m 0644 README.md %{buildroot}%{_defaultdocdir}/s3lite-agent/README.md
+install -m 0644 deploy/obs/agent/s3lite-agent.service %{buildroot}%{_unitdir}/s3lite-agent.service
+install -m 0640 deploy/obs/env/s3lite-agent.env %{buildroot}%{_sysconfdir}/s3lite/agent.env
+install -D -m 0644 README.md %{buildroot}%{_defaultdocdir}/s3lite-agent/README.md
 
 %pre
 # Shared service account (also used by s3lite-server).
@@ -113,6 +141,7 @@ exit 0
 %{_bindir}/s3lite-agent
 %{_bindir}/weed
 %{_unitdir}/s3lite-agent.service
+%dir %attr(0755,root,root) %{_sysconfdir}/s3lite
 %config(noreplace) %attr(0640,root,root) %{_sysconfdir}/s3lite/agent.env
 %dir %attr(0750,s3lite,s3lite) %{_localstatedir}/lib/s3lite
 %dir %attr(0750,s3lite,s3lite) %{_localstatedir}/lib/s3lite/agent
@@ -120,4 +149,5 @@ exit 0
 
 %changelog
 * Mon Oct 26 2026 S3Lite <dev@s3lite.dev> - 0.0.1-0
-- Initial OBS package: sources from the release git branch (VERSION file driven)
+- Unified spec: one package built for openSUSE 16 / Fedora 44 / Ubuntu 25 (OBS repositories)
+- Go floor lowered to 1.26 (Fedora 44 ships Go 1.26.1)
