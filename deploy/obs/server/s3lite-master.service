@@ -1,0 +1,29 @@
+[Unit]
+Description=S3Lite SeaweedFS master
+After=network-online.target
+Wants=network-online.target
+
+# The master needs no configuration: the weed binary (shipped by the
+# s3lite-agent package, which s3lite-server Requires) auto-detects the first
+# non-loopback IPv4 address and advertises it to the cluster, while
+# -ip.bind=0.0.0.0 makes it listen on all interfaces. The control plane
+# (s3lite-server) and the node agents reach it via the MASTER variable in
+# /etc/s3lite/server.env.
+
+[Service]
+Type=simple
+User=s3lite
+ExecStart=/usr/bin/weed master \
+    -port=9333 \
+    -mdir=/var/lib/s3lite/master \
+    -ip.bind=0.0.0.0
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

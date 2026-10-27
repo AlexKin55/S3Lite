@@ -12,6 +12,7 @@ Sources for building the `s3lite-server` and `s3lite-agent` packages on
 | `agent/s3lite-agent.service` | systemd unit shipped in the agent package |
 | `server/s3lite-server.spec` | Spec for the control plane server package |
 | `server/s3lite-server.service` | systemd unit shipped in the server package |
+| `server/s3lite-master.service` | systemd unit for the bundled SeaweedFS master (installed and started by the server package) |
 | `env/` | conffile templates installed to `/etc/s3lite/*.env` (shared by all distros) |
 | `vendor/` | vendored Go dependency bundles (`server.tar.gz`, `seaweedfs.tar.gz`) unpacked in `%prep` — must be present in the OBS sources, they are consumed with `GOFLAGS=-mod=vendor` and no network access |
 
