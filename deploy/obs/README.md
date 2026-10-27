@@ -49,16 +49,9 @@ Adding another distro of the same family (e.g. `openSUSE_Tumbleweed`,
   `src/server/VERSION` for `s3lite-server`, `src/agent/VERSION` for
   `s3lite-agent`. The spec `Version:` must match it — `%prep` aborts the build
   otherwise.
-- `_service` checks out the `release` branch (currently `main` while the OBS
-  packages are being debugged). To cut a release, slice `main` into `release`:
-
-  ```bash
-  git checkout release
-  git merge main
-  git push origin release
-  ```
-
-  OBS picks up the new state on its next build.
+- `_service` checks out the `main` branch directly (there is no `release`
+  branch). Bumping a version means committing the new value on `main` and
+  pushing; OBS picks up the new state on its next build.
 
 ## Local build check
 

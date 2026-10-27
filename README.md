@@ -55,7 +55,7 @@ Agents connect with `-server=https://<control-ip>:8099 -insecure`
 RPMs for the agent and the control plane are built by
 [OBS](https://build.opensuse.org) from the
 [`deploy/obs/`](deploy/obs) directory (details in its
-[README](deploy/obs/README.md); sources come from the `release` git branch):
+[README](deploy/obs/README.md); sources come from the `main` git branch):
 
 ```bash
 zypper install s3lite-server s3lite-agent    # openSUSE / SLES
