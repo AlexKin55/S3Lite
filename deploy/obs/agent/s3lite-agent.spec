@@ -27,7 +27,7 @@
 #   spec must match it (the check in %prep fails the build otherwise).
 #
 Name:           s3lite-agent
-Version:        0.0.1
+Version:        0.0.2
 Release:        0
 Summary:        S3Lite distributed S3 storage - node agent
 License:        Apache-2.0
