@@ -111,8 +111,11 @@ install -D -m 0644 README.md %{buildroot}%{_defaultdocdir}/s3lite-agent/README.m
 
 %pre
 # Shared service account (also used by s3lite-server).
+# Create the group first, then the user as its member.
+getent group s3lite >/dev/null 2>&1 || \
+  groupadd --system s3lite 2>/dev/null || :
 getent passwd s3lite >/dev/null 2>&1 || \
-  useradd --system --no-create-home --home-dir /var/lib/s3lite/agent \
+  useradd --system --gid s3lite --no-create-home --home-dir /var/lib/s3lite/agent \
           --shell /usr/sbin/nologin s3lite 2>/dev/null || :
 exit 0
 
@@ -143,8 +146,11 @@ exit 0
 %{_unitdir}/s3lite-agent.service
 %dir %attr(0755,root,root) %{_sysconfdir}/s3lite
 %config(noreplace) %attr(0640,root,root) %{_sysconfdir}/s3lite/agent.env
-%dir %attr(0750,s3lite,s3lite) %{_localstatedir}/lib/s3lite
-%dir %attr(0750,s3lite,s3lite) %{_localstatedir}/lib/s3lite/agent
+# Ownership is fixed to s3lite:s3lite by the post scriptlet.
+# Keep root:root here so rpm does not auto-generate the
+# user(s3lite)/group(s3lite) dependencies that block first install.
+%dir %attr(0750,root,root) %{_localstatedir}/lib/s3lite
+%dir %attr(0750,root,root) %{_localstatedir}/lib/s3lite/agent
 %doc README.md
 
 %changelog
