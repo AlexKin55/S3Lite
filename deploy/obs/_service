@@ -2,7 +2,7 @@
   <service name="tar_scm">
     <param name="scm">git</param>
     <param name="url">https://github.com/AlexKin55/S3Lite.git</param>
-    <param name="revision">main</param>
+    <param name="revision">release</param>
     <param name="filename">s3lite</param>
   </service>
   <service name="recompress">
