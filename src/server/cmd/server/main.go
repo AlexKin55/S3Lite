@@ -28,6 +28,10 @@ type server struct {
 	// Fixed volume parameters handed to agents at registration.
 	volumeCfg VolumeTemplate
 
+	// Heartbeat TTL used to decide the online/offline node state shown in the
+	// dashboard: a node is online while its heartbeat is fresher than this.
+	hbTTL time.Duration
+
 	// Latest redundancy evaluation snapshot.
 	lastReports atomic.Value // []redundancy.Report
 	lastUpdate  atomic.Value // time.Time
@@ -79,6 +83,7 @@ func main() {
 		reg:      reg,
 		master:   masterapi.New(*masterHTTP, 10*time.Second),
 		notifier: notifier,
+		hbTTL:    time.Duration(*hbTTL) * time.Second,
 		volumeCfg: VolumeTemplate{
 			Master:     *masterHTTP,
 			DataCenter: *dc,
@@ -238,10 +243,9 @@ func (s *server) buildOnline(topo *master_pb.TopologyInfo) map[string]bool {
 	}
 
 	online := make(map[string]bool)
-	now := time.Now()
 	for _, n := range s.reg.All() {
 		addr := fmt.Sprintf("%s:%d", n.IP, n.VolumePort)
-		if now.Sub(n.LastHeartbeat) <= time.Duration(60)*time.Second && n.Alive {
+		if s.nodeStatus(n) == "online" {
 			online[addr] = true
 		}
 	}
@@ -259,7 +263,7 @@ func (s *server) buildOnline(topo *master_pb.TopologyInfo) map[string]bool {
 // POST /api/v1/nodes — register; GET /api/v1/nodes — list.
 func (s *server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		writeJSON(w, http.StatusOK, map[string]any{"nodes": s.reg.All()})
+		writeJSON(w, http.StatusOK, map[string]any{"nodes": s.nodeViews()})
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -315,7 +319,14 @@ func (s *server) handleNodePath(w http.ResponseWriter, r *http.Request) {
 	}
 	nodeID := parts[3]
 	if len(parts) == 4 {
-		http.NotFound(w, r)
+		switch r.Method {
+		case http.MethodGet:
+			s.handleNodeGet(w, r, nodeID)
+		case http.MethodDelete:
+			s.handleNodeDelete(w, r, nodeID)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
 		return
 	}
 	switch parts[4] {
@@ -379,6 +390,34 @@ func (s *server) handleNodeConfig(w http.ResponseWriter, r *http.Request, nodeID
 			"volume_port": n.VolumePort,
 		},
 	})
+}
+
+// GET /api/v1/nodes/{id} — single node with computed online/offline state.
+func (s *server) handleNodeGet(w http.ResponseWriter, r *http.Request, nodeID string) {
+	n, ok := s.reg.Get(nodeID)
+	if !ok {
+		http.Error(w, "unknown node", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.nodeView(n))
+}
+
+// DELETE /api/v1/nodes/{id} — permanently remove a node from the registry.
+// A deleted node disappears from the dashboard entirely (also when offline)
+// and re-appears only after its agent registers again.
+func (s *server) handleNodeDelete(w http.ResponseWriter, r *http.Request, nodeID string) {
+	if !s.reg.Delete(nodeID) {
+		http.Error(w, "unknown node", http.StatusNotFound)
+		return
+	}
+	log.Printf("node deleted by admin: %s", nodeID)
+	s.notifier.Notify("node_deleted_"+nodeID, notify.Event{
+		Kind:    "node_deleted",
+		Summary: "Node deleted: " + nodeID,
+		Detail:  "Node was removed from the control plane by an administrator. It will re-appear only if its agent registers again.",
+		At:      time.Now(),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // GET /api/v1/cluster/status.
@@ -490,4 +529,33 @@ func sameStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// nodeStatus computes the node state shown in the dashboard: "online" while
+// the agent heartbeat is fresh (within the TTL) and the volume server was
+// reported alive, otherwise "offline".
+func (s *server) nodeStatus(n *store.Node) string {
+	if n.Alive && time.Since(n.LastHeartbeat) <= s.hbTTL {
+		return "online"
+	}
+	return "offline"
+}
+
+// nodeView returns a snapshot copy of the node whose Alive/Status fields are
+// recomputed from heartbeat freshness instead of the raw heartbeat payload.
+func (s *server) nodeView(n *store.Node) store.Node {
+	v := *n
+	v.Status = s.nodeStatus(n)
+	v.Alive = v.Status == "online"
+	return v
+}
+
+// nodeViews returns a snapshot of all registered nodes with computed state.
+func (s *server) nodeViews() []store.Node {
+	all := s.reg.All()
+	views := make([]store.Node, 0, len(all))
+	for _, n := range all {
+		views = append(views, s.nodeView(n))
+	}
+	return views
 }

@@ -40,18 +40,18 @@ type HeartbeatUpdate struct {
 // Registry is a thread-safe in-memory node registry.
 // A PostgreSQL-backed implementation will replace this in production.
 type Registry struct {
-	mu         sync.RWMutex
-	nodes      map[string]*Node
-	nextRack   int
-	portBase   int
+	mu           sync.RWMutex
+	nodes        map[string]*Node
+	nextRack     int
+	portBase     int
 	heartbeatTTL time.Duration
 }
 
 func NewRegistry(portBase int, heartbeatTTL time.Duration) *Registry {
 	return &Registry{
-		nodes:      make(map[string]*Node),
-		nextRack:   1,
-		portBase:   portBase,
+		nodes:        make(map[string]*Node),
+		nextRack:     1,
+		portBase:     portBase,
 		heartbeatTTL: heartbeatTTL,
 	}
 }
@@ -77,7 +77,13 @@ func (r *Registry) Register(id string, capacity int64, zone, ip, osName, arch st
 	n.IP = ip
 	n.OS = osName
 	n.Arch = arch
-	n.RegisteredAt = time.Now()
+	// The agent just proved it is alive by registering, so treat the
+	// registration moment as its most recent proof-of-life. Without this a
+	// freshly registered node would show a zero last_heartbeat until its
+	// first heartbeat arrives (the agent sends one every few seconds).
+	now := time.Now()
+	n.RegisteredAt = now
+	n.LastHeartbeat = now
 	n.Alive = true
 	n.Status = "online"
 	return n, !exists
@@ -119,6 +125,19 @@ func (r *Registry) All() []*Node {
 		out = append(out, n)
 	}
 	return out
+}
+
+// Delete permanently removes a registered node from the registry.
+// The node disappears from the dashboard entirely (also when offline).
+// Returns false if no node with the given id is registered.
+func (r *Registry) Delete(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.nodes[id]; !ok {
+		return false
+	}
+	delete(r.nodes, id)
+	return true
 }
 
 // OnlineIDs returns the node IDs whose agent heartbeat is fresh and whose
