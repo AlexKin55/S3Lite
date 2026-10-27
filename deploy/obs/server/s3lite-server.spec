@@ -51,10 +51,10 @@ Requires(pre):  passwd
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
-# The SeaweedFS weed binary (needed to run a master and shipped by the agent
-# package) is always required at runtime, so installing s3lite-server pulls
-# in s3lite-agent automatically.
-Requires:       s3lite-agent
+# The SeaweedFS weed binary (needed to run the master) is always required at
+# runtime; it comes from the shared s3lite-weed package, so installing
+# s3lite-server does not pull in the node agent itself.
+Requires:       s3lite-weed
 
 %description
 Central control plane of the S3Lite distributed S3 storage: node registry,
@@ -62,9 +62,9 @@ health monitoring, volume classification (OK/DEGRADED/AT_RISK), redundancy
 evaluation and notifications, plus a browser dashboard and Prometheus
 /metrics endpoint.
 
-The s3lite-agent package (node agent + the SeaweedFS weed binary) is pulled
-in automatically as a dependency, and a SeaweedFS master
-(s3lite-master.service) is installed and started right away.
+The s3lite-weed package (bundled SeaweedFS binaries) is pulled in
+automatically as a dependency, and a SeaweedFS master (s3lite-master.service)
+is installed and started right away.
 
 Configure /etc/s3lite/server.env, then start the service:
 
@@ -173,10 +173,12 @@ exit 0
 
 %changelog
 * Tue Oct 27 2026 S3Lite <dev@s3lite.dev> - 0.0.2-0
+- Switch the hard dependency from s3lite-agent to s3lite-weed: the control
+  plane no longer pulls the node agent, only the shared SeaweedFS binaries
 - Ship and auto-start s3lite-master.service: the SeaweedFS master is now
   installed and started with the control plane (data in /var/lib/s3lite/master)
-- Pull in s3lite-agent as a hard dependency: installing s3lite-server also
-  installs the node agent and the SeaweedFS weed binary (needed to run a master)
+- Pull in s3lite-weed as a hard dependency (formerly s3lite-agent): provides
+  the SeaweedFS weed binary needed to run the master
 * Mon Oct 26 2026 S3Lite <dev@s3lite.dev> - 0.0.1-0
 - Unified spec: one package built for openSUSE 16 / Fedora 44 / Ubuntu 25 (OBS repositories)
 - Go floor lowered to 1.26 (Fedora 44 ships Go 1.26.1)

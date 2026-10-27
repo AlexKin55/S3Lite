@@ -3,8 +3,8 @@ Description=S3Lite SeaweedFS master
 After=network-online.target
 Wants=network-online.target
 
-# The master needs no configuration: the weed binary (shipped by the
-# s3lite-agent package, which s3lite-server Requires) auto-detects the first
+# The master needs no configuration: the weed binary (shipped by the shared
+# s3lite-weed package, which s3lite-server Requires) auto-detects the first
 # non-loopback IPv4 address and advertises it to the cluster, while
 # -ip.bind=0.0.0.0 makes it listen on all interfaces. The control plane
 # (s3lite-server) and the node agents reach it via the MASTER variable in

@@ -1,15 +1,16 @@
 # S3Lite OBS packaging
 
-Sources for building the `s3lite-server` and `s3lite-agent` packages on
-[Open Build Service](https://build.opensuse.org).
+Sources for building the `s3lite-server`, `s3lite-agent` and `s3lite-weed`
+packages on [Open Build Service](https://build.opensuse.org).
 
 ## Layout
 
 | Path | Purpose |
 |------|---------|
 | `_service` | OBS source service: `tar_scm` downloads the S3Lite repo from git and packs it into `s3lite-<revision>.tar.gz` |
-| `agent/s3lite-agent.spec` | Spec for the node agent package (bundles the `weed` binary) |
+| `agent/s3lite-agent.spec` | Spec for the node agent package (uses the shared `s3lite-weed`) |
 | `agent/s3lite-agent.service` | systemd unit shipped in the agent package |
+| `weed/s3lite-weed.spec` | Spec for the bundled SeaweedFS binaries, shared by server and agent |
 | `server/s3lite-server.spec` | Spec for the control plane server package |
 | `server/s3lite-server.service` | systemd unit shipped in the server package |
 | `server/s3lite-master.service` | systemd unit for the bundled SeaweedFS master (installed and started by the server package) |
@@ -20,8 +21,8 @@ Sources for building the `s3lite-server` and `s3lite-agent` packages on
 
 In OBS one package holds **one spec**; distro targets are *repositories* of
 the project, not specs. Create a single OBS project (e.g. `s3lite`) with the
-packages `s3lite-agent` and `s3lite-server`, and add one repository per
-target:
+packages `s3lite-weed`, `s3lite-agent` and `s3lite-server`, and add one
+repository per target:
 
 * `openSUSE_16` — rpm
 * `Fedora_44` — rpm

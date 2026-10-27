@@ -51,12 +51,15 @@ Requires(pre):  passwd
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
+# The SeaweedFS weed binary for the local volume server comes from the
+# shared s3lite-weed package.
+Requires:       s3lite-weed
 
 %description
 The S3Lite node agent runs on every PC that contributes storage to the
 S3Lite cluster. It registers the node with the control plane, starts and
-supervises a local SeaweedFS volume server (the weed binary is bundled)
-and reports health/disk metrics to the control plane.
+supervises a local SeaweedFS volume server (the weed binary comes from the
+s3lite-weed package) and reports health/disk metrics to the control plane.
 
 Set the control plane address in /etc/s3lite/agent.env, then start the
 service:
@@ -71,13 +74,8 @@ rm -rf s3lite-src
 mkdir s3lite-src
 tar --strip-components=1 -xzf %{_sourcedir}/*s3lite*.tar.gz -C s3lite-src
 cd s3lite-src
-# Vendored Go deps ship as a compressed bundle (the artifact the official
-# obs-service-go_modules produces); extract it back into the module.
-tar xzf deploy/obs/vendor/seaweedfs.tar.gz -C src/thirdparty/seaweedfs
-# Diagnostics: confirm the bundle carried real content, not an LFS pointer.
-ls -lh deploy/obs/vendor/
-du -sh src/thirdparty/seaweedfs/vendor
-ls src/thirdparty/seaweedfs/vendor | head -5
+# The agent has no third-party Go dependencies (see src/agent/go.mod), so no
+# vendor bundle is extracted here; the weed binary now ships in s3lite-weed.
 # The VERSION file on the release branch is the version source of truth.
 test "$(cat src/agent/VERSION)" = "%{version}" || {
   echo "ERROR: src/agent/VERSION ($(cat src/agent/VERSION)) does not match spec Version (%{version})" >&2
@@ -95,7 +93,6 @@ export GOCACHE="%{_builddir}/gocache"
 export GOFLAGS=-mod=vendor
 export GOPROXY=off
 (cd src/agent && go build -trimpath -ldflags "-s -w" -o s3lite-agent ./cmd/agent)
-(cd src/thirdparty/seaweedfs/weed && go build -trimpath -ldflags "-s -w" -o weed .)
 
 %install
 cd s3lite-src
@@ -104,7 +101,6 @@ mkdir -p %{buildroot}%{_unitdir}
 mkdir -p %{buildroot}%{_sysconfdir}/s3lite
 mkdir -p %{buildroot}%{_localstatedir}/lib/s3lite/agent
 install -m 0755 src/agent/s3lite-agent %{buildroot}%{_bindir}/s3lite-agent
-install -m 0755 src/thirdparty/seaweedfs/weed/weed %{buildroot}%{_bindir}/weed
 install -m 0644 deploy/obs/agent/s3lite-agent.service %{buildroot}%{_unitdir}/s3lite-agent.service
 install -m 0640 deploy/obs/env/s3lite-agent.env %{buildroot}%{_sysconfdir}/s3lite/agent.env
 install -D -m 0644 README.md %{buildroot}%{_defaultdocdir}/s3lite-agent/README.md
@@ -142,7 +138,6 @@ exit 0
 %files
 %defattr(-,root,root)
 %{_bindir}/s3lite-agent
-%{_bindir}/weed
 %{_unitdir}/s3lite-agent.service
 %dir %attr(0755,root,root) %{_sysconfdir}/s3lite
 %config(noreplace) %attr(0640,root,root) %{_sysconfdir}/s3lite/agent.env
@@ -154,6 +149,9 @@ exit 0
 %doc README.md
 
 %changelog
+* Tue Oct 27 2026 S3Lite <dev@s3lite.dev> - 0.0.2-0
+- Drop the bundled weed build: the binary now ships in the shared s3lite-weed
+  package (added as a hard dependency)
 * Mon Oct 26 2026 S3Lite <dev@s3lite.dev> - 0.0.1-0
 - Unified spec: one package built for openSUSE 16 / Fedora 44 / Ubuntu 25 (OBS repositories)
 - Go floor lowered to 1.26 (Fedora 44 ships Go 1.26.1)
