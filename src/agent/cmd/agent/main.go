@@ -145,6 +145,32 @@ func run(agentDir, serverOverride string, portOverride int, weedOverride, storag
 			hb := heartbeatPayload(sup, dataDir, cfg.CapacityBytes)
 			if err := client.Heartbeat(ctx, cfg.NodeID, hb); err != nil {
 				fmt.Printf("agent: heartbeat error: %v\n", err)
+				// The control plane keeps its node registry in memory and
+				// forgets nodes on restart; re-register to recover.
+				newCfg, rerr := register(ctx, client, cfg, lastIP)
+				if rerr != nil {
+					fmt.Printf("agent: re-register failed: %v\n", rerr)
+					continue
+				}
+				volCfg = newCfg
+				volArgs := sup.Args()
+				newPort := pickPort(volCfg.VolumePort, cfg.Port)
+				newMax := pickMax(cfg.MaxVolumes, volCfg.MaxVolumes)
+				newDisk := pickDisk(cfg.DiskType, volCfg.DiskType)
+				newRack := pickRack(cfg.Rack, volCfg.Rack)
+				if volArgs.Master != volCfg.Master || volArgs.Port != newPort ||
+					volArgs.MaxVolumes != newMax || volArgs.DiskType != newDisk ||
+					volArgs.Rack != newRack {
+					volArgs.Master = volCfg.Master
+					volArgs.Port = newPort
+					volArgs.MaxVolumes = newMax
+					volArgs.DiskType = newDisk
+					volArgs.Rack = newRack
+					if err := sup.Restart(volArgs, 2*time.Second); err != nil {
+						fmt.Printf("agent: restart after re-register failed: %v\n", err)
+					}
+				}
+				fmt.Println("agent: re-registered after heartbeat error")
 			}
 		}
 	}
