@@ -21,16 +21,18 @@ func main() {
 	serverAddr := flag.String("server", "", "control plane address (overrides config)")
 	port := flag.Int("port", 0, "volume server port (overrides config)")
 	weedBin := flag.String("weed", "", "path to the weed binary (overrides config)")
+	storageDir := flag.String("storage", "", "volume data directory (overrides config)")
+	capacityMB := flag.Int64("capacity", 0, "node capacity in megabytes (overrides config)")
 	insecureTLS := flag.Bool("insecure", false, "skip TLS certificate verification for HTTPS control plane")
 	flag.Parse()
 
-	if err := run(*agentDir, *serverAddr, *port, *weedBin, *insecureTLS); err != nil {
+	if err := run(*agentDir, *serverAddr, *port, *weedBin, *storageDir, *capacityMB, *insecureTLS); err != nil {
 		fmt.Fprintf(os.Stderr, "agent: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(agentDir, serverOverride string, portOverride int, weedOverride string, insecureTLS bool) error {
+func run(agentDir, serverOverride string, portOverride int, weedOverride, storageOverride string, capacityOverrideMB int64, insecureTLS bool) error {
 	agentDir = abs(agentDir)
 
 	cfg, err := config.Load(agentDir)
@@ -48,6 +50,12 @@ func run(agentDir, serverOverride string, portOverride int, weedOverride string,
 	}
 	if cfg.WeedBin == "" {
 		return fmt.Errorf("weed binary path is empty: pass -weed or set weed_bin in %s", config.Path(agentDir))
+	}
+	if storageOverride != "" {
+		cfg.DataDir = storageOverride
+	}
+	if capacityOverrideMB > 0 {
+		cfg.CapacityBytes = capacityOverrideMB * 1024 * 1024
 	}
 
 	if insecureTLS {
@@ -70,8 +78,8 @@ func run(agentDir, serverOverride string, portOverride int, weedOverride string,
 	}
 	logPath := filepath.Join(agentDir, "volume.log")
 
-	fmt.Printf("agent %s: server=%s ip=%s port=%d zone=%s\n",
-		cfg.NodeID, cfg.Server, ip, cfg.Port, cfg.Zone)
+	fmt.Printf("agent %s: server=%s ip=%s port=%d zone=%s cap=%dMiB\n",
+		cfg.NodeID, cfg.Server, ip, cfg.Port, cfg.Zone, cfg.CapacityBytes/(1024*1024))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

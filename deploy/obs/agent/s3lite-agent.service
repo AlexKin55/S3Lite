@@ -8,11 +8,17 @@ Type=simple
 User=s3lite
 Environment=CONTROL_PLANE=https://CHANGE_ME:8099
 Environment=WEED_BIN=/usr/bin/weed
+# Storage this node contributes: data directory (must be writable by the
+# s3lite user) and maximum size in megabytes.
+Environment=STORAGE=/var/lib/s3lite/data
+Environment=STORAGE_SIZE=100
 EnvironmentFile=-/etc/s3lite/agent.env
 ExecStart=/usr/bin/s3lite-agent \
     -dir=/var/lib/s3lite/agent \
     -server=${CONTROL_PLANE} \
     -weed=${WEED_BIN} \
+    -storage=${STORAGE} \
+    -capacity=${STORAGE_SIZE} \
     -insecure
 Restart=on-failure
 RestartSec=5
