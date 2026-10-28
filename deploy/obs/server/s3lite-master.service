@@ -13,10 +13,14 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=s3lite
+# Volume size limit (MB) per volume. Together with the per-node -max handed
+# out by the control plane it caps how much a node can store (STORAGE_SIZE).
+Environment=VOLUME_SIZE_LIMIT_MB=100
 ExecStart=/usr/bin/weed master \
     -port=9333 \
     -mdir=/var/lib/s3lite/master \
-    -ip.bind=0.0.0.0
+    -ip.bind=0.0.0.0 \
+    -volumeSizeLimitMB=${VOLUME_SIZE_LIMIT_MB}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536

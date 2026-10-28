@@ -28,6 +28,10 @@ type server struct {
 	// Fixed volume parameters handed to agents at registration.
 	volumeCfg VolumeTemplate
 
+	// Volume size limit (MB) reported by the master; used to derive the
+	// per-node max volume count from the node's capacity quota.
+	volSizeLimitMB int
+
 	// Heartbeat TTL used to decide the online/offline node state shown in the
 	// dashboard: a node is online while its heartbeat is fresher than this.
 	hbTTL time.Duration
@@ -150,11 +154,12 @@ func (s *server) monitorLoop(ctx context.Context, interval time.Duration) {
 }
 
 func (s *server) evaluate(ctx context.Context) {
-	topo, _, err := s.master.Topology(ctx)
+	topo, limitMB, err := s.master.Topology(ctx)
 	if err != nil {
 		log.Printf("monitor: topology fetch failed: %v", err)
 		return
 	}
+	s.volSizeLimitMB = int(limitMB)
 	online := s.buildOnline(topo)
 	fresh := redundancy.Collect(topo)
 	// Merge the fresh snapshot into the placement history: shard layouts of
@@ -297,13 +302,22 @@ func (s *server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		Detail:  fmt.Sprintf("%s rack=%s port=%d", n.IP, n.Rack, n.VolumePort),
 		At:      time.Now(),
 	})
+	// Derive the per-node volume count from the node's capacity quota and the
+	// master's volume size limit, so a node can never store more than its
+	// configured STORAGE_SIZE (maxVolumes * volumeSizeLimitMB <= capacity).
+	maxVol := s.volumeCfg.MaxVolumes
+	if s.volSizeLimitMB > 0 && req.CapacityBytes > 0 {
+		if n := int(req.CapacityBytes / (int64(s.volSizeLimitMB) * 1024 * 1024)); n > 0 {
+			maxVol = n
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"node_id": n.NodeID,
 		"volume": map[string]any{
 			"master":      s.volumeCfg.Master,
 			"data_center": s.volumeCfg.DataCenter,
 			"rack":        n.Rack,
-			"max_volumes": s.volumeCfg.MaxVolumes,
+			"max_volumes": maxVol,
 			"disk_type":   s.volumeCfg.DiskType,
 			"weed_url":    "",
 			"volume_port": n.VolumePort,

@@ -142,7 +142,7 @@ func run(agentDir, serverOverride string, portOverride int, weedOverride, storag
 			}
 
 			// Heartbeat with live statistics.
-			hb := heartbeatPayload(sup, dataDir)
+			hb := heartbeatPayload(sup, dataDir, cfg.CapacityBytes)
 			if err := client.Heartbeat(ctx, cfg.NodeID, hb); err != nil {
 				fmt.Printf("agent: heartbeat error: %v\n", err)
 			}
@@ -169,13 +169,22 @@ func register(ctx context.Context, client *api.Client, cfg *config.Config, ip st
 	return &resp.Volume, nil
 }
 
-// heartbeatPayload collects disk and volume server statistics.
-func heartbeatPayload(sup *supervisor.Supervisor, dataDir string) api.HeartbeatRequest {
+// heartbeatPayload collects volume server statistics and reports storage
+// usage against the configured quota: used = bytes actually stored by the
+// agent, free = remaining quota (capacity - used). The node is marked
+// degraded once the quota is exhausted.
+func heartbeatPayload(sup *supervisor.Supervisor, dataDir string, capacityBytes int64) api.HeartbeatRequest {
 	status := sup.FetchStatus(2 * time.Second)
-	free, used := diskUsage(dataDir)
+	used := dirSize(dataDir)
+	free := capacityBytes - used
+	if free < 0 {
+		free = 0
+	}
 	state := "online"
 	if !status.Alive {
 		state = "degraded"
+	} else if used >= capacityBytes {
+		state = "degraded" // storage quota exhausted
 	}
 	return api.HeartbeatRequest{
 		Status:            state,
