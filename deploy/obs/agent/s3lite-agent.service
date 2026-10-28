@@ -6,6 +6,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=s3lite
+# Re-create the agent working directory with the right owner on every start
+# (the + prefix runs this as root despite User=s3lite), so a missing or
+# mis-owned /var/lib/s3lite/agent can never crash-loop the agent.
+ExecStartPre=+/usr/bin/install -d -o s3lite -g s3lite -m 0750 /var/lib/s3lite/agent
 Environment=CONTROL_PLANE=https://CHANGE_ME:8099
 Environment=WEED_BIN=/usr/bin/weed
 # Storage this node contributes: data directory (must be writable by the

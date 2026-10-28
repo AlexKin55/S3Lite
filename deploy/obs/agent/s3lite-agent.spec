@@ -3,15 +3,6 @@
 #
 # S3Lite node agent, built by OBS from the git "release" branch.
 #
-# One spec for all target repositories: the OBS project defines the
-# repositories (openSUSE_16, Fedora_44, Ubuntu_25.04) and this spec is
-# built against each of them. Per-distro differences are handled by the
-# %%if blocks below — the macros (%%suse_version, %%fedora, %%ubuntu/%%debian)
-# are injected by OBS depending on the build repository. On Debian/Ubuntu
-# targets OBS produces a .deb from this rpm-style spec and the rpm macros
-# resolve to the Debian paths (%%{_bindir}=/usr/bin, %%{_unitdir}=/lib/systemd/system,
-# %%{_sysconfdir}=/etc, %%{_localstatedir}=/var, %%{_defaultdocdir}=/usr/share/doc).
-#
 # Source handling:
 #   _service (tar_scm) downloads the S3Lite repo and produces
 #   s3lite-<revision>.tar.gz (no versionformat by design — the archive name
@@ -27,7 +18,7 @@
 #   spec must match it (the check in %prep fails the build otherwise).
 #
 Name:           s3lite-agent
-Version:        0.0.2
+Version:        0.0.3
 Release:        0
 Summary:        S3Lite distributed S3 storage - node agent
 License:        Apache-2.0
@@ -133,6 +124,13 @@ exit 0
 
 %postun
 # Data under /var/lib/s3lite is intentionally kept on package removal.
+if [ "$1" = 0 ]; then
+  # Remove the shared s3lite-weed package if the control plane is not
+  # installed on this host (i.e. this node was the last consumer of weed).
+  if [ ! -x /usr/bin/s3lite-server ]; then
+    timeout 20 rpm -e s3lite-weed >/dev/null 2>&1 || :
+  fi
+fi
 exit 0
 
 %files
@@ -150,6 +148,8 @@ exit 0
 
 %changelog
 * Tue Oct 27 2026 S3Lite <dev@s3lite.dev> - 0.0.2-0
+- Remove the shared s3lite-weed package on uninstall when the control plane
+  is not installed on the same host
 - Drop the bundled weed build: the binary now ships in the shared s3lite-weed
   package (added as a hard dependency)
 * Mon Oct 26 2026 S3Lite <dev@s3lite.dev> - 0.0.1-0

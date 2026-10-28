@@ -6,14 +6,6 @@
 # s3lite-agent (runs a local volume server), so the control plane does not
 # have to pull the node agent just to obtain the weed binary.
 #
-# One spec for all target repositories: the OBS project defines the
-# repositories (openSUSE_16, Fedora_44, Ubuntu_25.04) and this spec is
-# built against each of them. Per-distro differences are handled by the
-# %%if blocks below — the macros (%%suse_version, %%fedora, %%ubuntu/%%debian)
-# are injected by OBS depending on the build repository. On Debian/Ubuntu
-# targets OBS produces a .deb from this rpm-style spec and the rpm macros
-# resolve to the Debian paths (%%{_bindir}=/usr/bin, %%{_defaultdocdir}=/usr/share/doc).
-#
 # Source handling:
 #   _service (tar_scm) downloads the S3Lite repo and produces
 #   s3lite-<revision>.tar.gz (no versionformat by design — the archive name
@@ -26,7 +18,7 @@
 #   spec must match it (the check in %prep fails the build otherwise).
 #
 Name:           s3lite-weed
-Version:        0.0.2
+Version:        0.0.3
 Release:        0
 Summary:        S3Lite distributed S3 storage - bundled SeaweedFS binaries
 License:        Apache-2.0
