@@ -107,7 +107,15 @@ getent passwd s3lite >/dev/null 2>&1 || \
 exit 0
 
 %post
-install -d -m 0750 -o s3lite -g s3lite %{_localstatedir}/lib/s3lite/agent 2>/dev/null || :
+# The s3lite user must be able to traverse /var/lib/s3lite AND write inside
+# its agent dir. The parent is created root:root (0750) by %files, and a
+# root-owned parent without o+x would block the agent with "permission
+# denied", so take ownership of both here.
+if getent passwd s3lite >/dev/null 2>&1; then
+  install -d -m 0750 -o s3lite -g s3lite %{_localstatedir}/lib/s3lite %{_localstatedir}/lib/s3lite/agent
+else
+  install -d -m 0750 %{_localstatedir}/lib/s3lite %{_localstatedir}/lib/s3lite/agent
+fi
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemctl daemon-reload >/dev/null 2>&1 || :
   # Enabled but NOT started: /etc/s3lite/agent.env must be configured first.
@@ -148,6 +156,9 @@ exit 0
 
 %changelog
 * Tue Oct 27 2026 S3Lite <dev@s3lite.dev> - 0.0.2-0
+- Fix %post ownership: /var/lib/s3lite must be s3lite:s3lite too, otherwise
+  a root-owned 0750 parent makes the agent dir unreachable from the service
+  user ("permission denied" crash loop)
 - Remove the shared s3lite-weed package on uninstall when the control plane
   is not installed on the same host
 - Drop the bundled weed build: the binary now ships in the shared s3lite-weed
