@@ -349,9 +349,33 @@ func (s *server) handleNodePath(w http.ResponseWriter, r *http.Request) {
 		s.handleHeartbeat(w, r, nodeID)
 	case "config":
 		s.handleNodeConfig(w, r, nodeID)
+	case "agent":
+		if len(parts) == 6 && parts[5] == "update" {
+			s.handleAgentUpdate(w, r, nodeID)
+			return
+		}
+		http.NotFound(w, r)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// POST /api/v1/nodes/{id}/agent/update — schedule an agent self-update.
+// The update_agent command is delivered to the agent with its next heartbeat
+// response; the agent then reinstalls the s3lite-agent package in place
+// (preserving the node configuration) and restarts its service.
+func (s *server) handleAgentUpdate(w http.ResponseWriter, r *http.Request, nodeID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	n, ok := s.reg.RequestAgentUpdate(nodeID)
+	if !ok {
+		http.Error(w, "unknown node", http.StatusNotFound)
+		return
+	}
+	log.Printf("agent update requested: %s (reported version %s)", nodeID, n.AgentVersion)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "node_id": nodeID})
 }
 
 // POST /api/v1/nodes/{id}/heartbeat.
@@ -374,6 +398,8 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request, nodeID 
 		RestartsTotal     int    `json:"restarts_total"`
 		StatsAgeSec       int64  `json:"stats_age_sec"`
 		LogTail           string `json:"log_tail"`
+		UpdateStatus      string `json:"update_status"`
+		UpdateDetail      string `json:"update_detail"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -393,12 +419,20 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request, nodeID 
 		RestartsTotal:     req.RestartsTotal,
 		StatsAgeSec:       req.StatsAgeSec,
 		LogTail:           req.LogTail,
+		UpdateStatus:      req.UpdateStatus,
+		UpdateDetail:      req.UpdateDetail,
 	})
 	if !ok {
 		http.Error(w, "unknown node", http.StatusNotFound)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	resp := map[string]any{"ok": true}
+	// Deliver a pending agent-update command exactly once: the agent
+	// reinstalls its package (configs preserved) and restarts its service.
+	if s.reg.TakeAgentUpdateCommand(nodeID) {
+		resp["commands"] = []string{"update_agent"}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // GET /api/v1/nodes/{id}/config.

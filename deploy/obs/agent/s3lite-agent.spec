@@ -18,7 +18,7 @@
 #   spec must match it (the check in %prep fails the build otherwise).
 #
 Name:           s3lite-agent
-Version:        0.0.3
+Version:        0.0.4
 Release:        0
 Summary:        S3Lite distributed S3 storage - node agent
 License:        Apache-2.0
@@ -89,10 +89,18 @@ export GOPROXY=off
 cd s3lite-src
 mkdir -p %{buildroot}%{_bindir}
 mkdir -p %{buildroot}%{_unitdir}
+mkdir -p %{buildroot}%{_prefix}/lib/s3lite
 mkdir -p %{buildroot}%{_sysconfdir}/s3lite
 mkdir -p %{buildroot}%{_localstatedir}/lib/s3lite/agent
 install -m 0755 src/agent/s3lite-agent %{buildroot}%{_bindir}/s3lite-agent
 install -m 0644 deploy/obs/agent/s3lite-agent.service %{buildroot}%{_unitdir}/s3lite-agent.service
+# Privileged self-update helper: a root one-shot unit + a systemd path unit
+# watching for the agent's request file + the root-owned update script.
+# The unprivileged "s3lite" service user makes no privileged calls: it only
+# creates a request file in its own directory (no D-Bus/polkit/sudo/setuid).
+install -m 0644 deploy/obs/agent/s3lite-agent-update.service %{buildroot}%{_unitdir}/s3lite-agent-update.service
+install -m 0644 deploy/obs/agent/s3lite-agent-update.path %{buildroot}%{_unitdir}/s3lite-agent-update.path
+install -m 0755 src/agent/cmd/agent/reinstall_agent.sh %{buildroot}%{_prefix}/lib/s3lite/agent-update.sh
 install -m 0640 deploy/obs/env/s3lite-agent.env %{buildroot}%{_sysconfdir}/s3lite/agent.env
 install -D -m 0644 README.md %{buildroot}%{_defaultdocdir}/s3lite-agent/README.md
 
@@ -120,11 +128,15 @@ if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemctl daemon-reload >/dev/null 2>&1 || :
   # Enabled but NOT started: /etc/s3lite/agent.env must be configured first.
   systemctl enable s3lite-agent.service >/dev/null 2>&1 || :
+  # The self-update trigger is started right away: it only watches for the
+  # agent's request file (no privileged action until the file appears).
+  systemctl enable --now s3lite-agent-update.path >/dev/null 2>&1 || :
 fi
 exit 0
 
 %preun
 if [ "$1" = 0 ]; then
+  systemctl disable --now s3lite-agent-update.path >/dev/null 2>&1 || :
   systemctl disable --now s3lite-agent.service >/dev/null 2>&1 || :
   systemctl daemon-reload >/dev/null 2>&1 || :
 fi
@@ -145,6 +157,9 @@ exit 0
 %defattr(-,root,root)
 %{_bindir}/s3lite-agent
 %{_unitdir}/s3lite-agent.service
+%{_unitdir}/s3lite-agent-update.service
+%{_unitdir}/s3lite-agent-update.path
+%{_prefix}/lib/s3lite/agent-update.sh
 %dir %attr(0755,root,root) %{_sysconfdir}/s3lite
 %config(noreplace) %attr(0640,root,root) %{_sysconfdir}/s3lite/agent.env
 # Ownership is fixed to s3lite:s3lite by the post scriptlet.
@@ -155,6 +170,15 @@ exit 0
 %doc README.md
 
 %changelog
+* Sun Nov 02 2026 S3Lite <dev@s3lite.dev> - 0.0.4-0
+- Agent self-update: the control plane dashboard can request an agent
+  reinstall (fresh binaries from the repo even at the same version); the
+  command is delivered to the agent with its heartbeat and the agent drops
+  a request file that the root s3lite-agent-update.path unit picks up (no
+  D-Bus, no polkit, no sudo — the privileged reinstall with config
+  backup/restore runs from the root-owned helper unit shipped by this RPM)
+- Ship s3lite-agent-update.service, s3lite-agent-update.path and
+  /usr/lib/s3lite/agent-update.sh
 * Tue Oct 27 2026 S3Lite <dev@s3lite.dev> - 0.0.2-0
 - Fix %post ownership: /var/lib/s3lite must be s3lite:s3lite too, otherwise
   a root-owned 0750 parent makes the agent dir unreachable from the service

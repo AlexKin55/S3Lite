@@ -1,0 +1,19 @@
+# s3lite-agent-update.path
+#
+# Watches for the agent self-update request file. The unprivileged agent
+# (s3lite-agent.service, User=s3lite) asks for a package reinstall by
+# creating /var/lib/s3lite/agent/update-request in its own working
+# directory; systemd starts the root s3lite-agent-update.service unit.
+# This keeps the privilege boundary clean: the agent makes no privileged
+# calls at all — no D-Bus, no polkit, no sudo, no setuid. The request file
+# is removed by the helper unit's ExecStartPre, re-arming the trigger.
+
+[Unit]
+Description=S3Lite agent self-update request watcher
+
+[Path]
+PathExists=/var/lib/s3lite/agent/update-request
+Unit=s3lite-agent-update.service
+
+[Install]
+WantedBy=multi-user.target

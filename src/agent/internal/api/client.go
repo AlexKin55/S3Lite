@@ -89,21 +89,28 @@ type HeartbeatRequest struct {
 	StatsAgeSec int64 `json:"stats_age_sec,omitempty"`
 	// LogTail carries the last volume-server log lines (sent when degraded).
 	LogTail string `json:"log_tail,omitempty"`
+
+	// Agent self-update progress: "running" while the update is in progress;
+	// "done"/"failed" is the one-shot outcome reported to the control plane.
+	UpdateStatus string `json:"update_status,omitempty"`
+	UpdateDetail string `json:"update_detail,omitempty"`
 }
 
-// Heartbeat sends the node's heartbeat.
-func (c *Client) Heartbeat(ctx context.Context, nodeID string, req HeartbeatRequest) error {
-	resp := &struct {
-		Error string `json:"error"`
-	}{}
+// HeartbeatResponse is the server's reply to a heartbeat. Commands carries
+// control-plane actions for the agent; currently only "update_agent" is
+// defined (reinstall the agent package preserving configuration).
+type HeartbeatResponse struct {
+	Commands []string `json:"commands,omitempty"`
+}
+
+// Heartbeat sends the node's heartbeat and returns the server's commands.
+func (c *Client) Heartbeat(ctx context.Context, nodeID string, req HeartbeatRequest) (*HeartbeatResponse, error) {
+	resp := &HeartbeatResponse{}
 	path := fmt.Sprintf("/api/v1/nodes/%s/heartbeat", nodeID)
 	if err := c.do(ctx, http.MethodPost, path, req, resp); err != nil {
-		return err
+		return nil, err
 	}
-	if resp.Error != "" {
-		return fmt.Errorf("server: %s", resp.Error)
-	}
-	return nil
+	return resp, nil
 }
 
 // UpdateConfig fetches the updated volume configuration (GET /api/v1/nodes/{id}/config).

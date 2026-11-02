@@ -6,14 +6,39 @@
 # scripts/reinstall_agents.sh). It reinstalls the s3lite-agent package,
 # preserving the node's configuration, and restarts the service.
 #
-# Emits machine-readable KEY=VALUE lines that the orchestrator parses:
+# An embedded copy of this script lives at
+# src/agent/cmd/agent/reinstall_agent.sh (the agent self-update feature:
+# there it runs inside the root s3lite-agent-update.service helper unit);
+# keep both files in sync — only the header comment differs.
+#
+# Emits machine-readable KEY=VALUE lines that the caller parses:
 #   HOSTNAME, PM, WAS_INSTALLED, OLD_VERSION, BACKUP_DIR,
 #   REINSTALL_RC / INSTALL_RC, NOW_INSTALLED, NEW_VERSION,
 #   RESTORED, CONFIGURED, ACTIVE, SERVICE_ERR, RESULT, DETAIL
 #
+# It also writes a self-update result marker to
+# /var/lib/s3lite/agent/update-result (STATUS/VERSION/TS/DETAIL); the agent
+# consumes it at startup to report the update outcome to the control plane.
+#
 # Usage: agent_reinstall_remote.sh [package-name]   (default: s3lite-agent)
 
 PKG="${1:-s3lite-agent}"
+
+# Self-update result marker (consumed by the agent, owned by it after chown).
+result_dir=/var/lib/s3lite/agent
+result_file="$result_dir/update-result"
+
+# write_update_marker STATUS [DETAIL]
+write_update_marker() {
+    mkdir -p "$result_dir" 2>/dev/null
+    {
+        echo "STATUS=$1"
+        echo "VERSION=${new_version:--}"
+        echo "TS=$(date +%s)"
+        [ -n "$2" ] && echo "DETAIL=$2"
+    } > "$result_file" 2>/dev/null
+    chown s3lite:s3lite "$result_file" 2>/dev/null || true
+}
 
 echo "HOSTNAME=$(hostname 2>/dev/null || echo '?')"
 
@@ -30,6 +55,7 @@ elif command -v apt-get >/dev/null 2>&1; then
 fi
 echo "PM=$PM"
 if [ -z "$PM" ]; then
+    write_update_marker failed "no supported package manager (dnf/zypper/apt-get)"
     echo "RESULT=FAIL"
     echo "DETAIL=no supported package manager (dnf/zypper/apt-get)"
     exit 0
@@ -63,7 +89,9 @@ mkdir -p "$backup_dir"
 echo "BACKUP_DIR=$backup_dir"
 
 # ---------------------------------------------------------------------------
-# Reinstall (keeping config) or install fresh
+# Reinstall (keeping config) or install fresh. NOTE: this is always a
+# reinstall of the CURRENT package from the repo — the binaries are
+# re-deployed even when the version is unchanged (same version, new build).
 # ---------------------------------------------------------------------------
 if [ "$was_installed" = 1 ]; then
     case "$PM" in
@@ -96,6 +124,7 @@ fi
 echo "NOW_INSTALLED=$now_installed"
 echo "NEW_VERSION=$new_version"
 if [ "$now_installed" != 1 ]; then
+    write_update_marker failed "package $PKG not present after install/reinstall"
     echo "RESULT=FAIL"
     echo "DETAIL=package $PKG not present after install/reinstall"
     exit 0
@@ -125,24 +154,36 @@ if [ -f /etc/s3lite/agent.env ] && ! grep -q 'CHANGE_ME' /etc/s3lite/agent.env 2
 fi
 echo "CONFIGURED=$configured"
 
-# ---------------------------------------------------------------------------
-# Restart the service (only if configured; otherwise leave it stopped)
-# ---------------------------------------------------------------------------
+echo "RESULT=OK"
+
 systemctl daemon-reload >/dev/null 2>&1
 systemctl enable s3lite-agent.service >/dev/null 2>&1 || true
 
-active="unknown"
+# ---------------------------------------------------------------------------
+# Restart the service — SKIPPED when S3LITE_SKIP_RESTART=1 (the caller
+# restarts it itself after reading the result).
+# ---------------------------------------------------------------------------
+if [ "${S3LITE_SKIP_RESTART:-0}" = "1" ]; then
+    exit 0
+fi
+
+# Restart the agent (only if configured; otherwise leave it stopped).
+# In the self-update flow this runs in the helper unit's own cgroup: the
+# agent process is replaced, the script keeps running.
 if [ "$configured" = 1 ]; then
     systemctl restart s3lite-agent.service 2>&1
     sleep 3
     if systemctl is-active --quiet s3lite-agent.service; then
-        active="yes"
+        echo "ACTIVE=yes"
+        write_update_marker done
     else
-        active="no"
-        echo "SERVICE_ERR=$(systemctl status s3lite-agent.service --no-pager -n 5 2>&1 | tr '\n' '|' | cut -c1-300)"
+        service_err="$(systemctl status s3lite-agent.service --no-pager -n 5 2>&1 | tr '\n' '|' | cut -c1-300)"
+        echo "ACTIVE=no"
+        echo "SERVICE_ERR=$service_err"
+        echo "RESULT=FAIL"
+        echo "DETAIL=s3lite-agent service not active after restart"
+        write_update_marker failed "s3lite-agent service not active after restart: $service_err"
     fi
 else
-    active="not-configured"
+    echo "ACTIVE=not-configured"
 fi
-echo "ACTIVE=$active"
-echo "RESULT=OK"

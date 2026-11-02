@@ -112,6 +112,9 @@ func run(agentDir, serverOverride string, portOverride int, weedOverride, storag
 	fmt.Printf("volume server started on %s:%d (master %s)\n", ip, volumePort, volCfg.Master)
 
 	st := &agentState{lastIP: ip, volCfg: volCfg, startedAt: time.Now()}
+	// If a previous self-update finished while the agent process was being
+	// replaced (the update helper restarts the service), report its outcome.
+	consumeUpdateResult(st)
 
 	// Slow statistics (volume server status, data dir size) are collected in
 	// the background with caching: the heartbeat loop must never block on a
@@ -121,7 +124,7 @@ func run(agentDir, serverOverride string, portOverride int, weedOverride, storag
 
 	// Heartbeats run in their own goroutine: the agent proves it is alive on
 	// schedule no matter what else it is doing (stat collection, restarts).
-	go heartbeatLoop(ctx, client, cfg, sup, st, cache)
+	go heartbeatLoop(ctx, client, cfg, sup, st, cache, agentDir)
 
 	// IP changes (DHCP renew) are watched separately from heartbeats.
 	go ipWatchLoop(ctx, client, cfg, sup, st)
@@ -133,17 +136,34 @@ func run(agentDir, serverOverride string, portOverride int, weedOverride, storag
 
 // agentState is the mutable agent state shared between the background loops.
 // startedAt is immutable (agent process start time, shown on the dashboard).
+// updateStatus/updateDetail carry the agent self-update progress; they are
+// reported with every heartbeat ("running") until the outcome ("done" /
+// "failed") is acknowledged by the control plane and cleared (one-shot).
 type agentState struct {
-	mu        sync.Mutex
-	lastIP    string
-	volCfg    *api.VolumeConfig
-	startedAt time.Time
+	mu           sync.Mutex
+	lastIP       string
+	volCfg       *api.VolumeConfig
+	startedAt    time.Time
+	updateStatus string
+	updateDetail string
 }
 
 func (st *agentState) snapshot() (ip string, volCfg *api.VolumeConfig) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return st.lastIP, st.volCfg
+}
+
+func (st *agentState) setUpdate(status, detail string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.updateStatus, st.updateDetail = status, detail
+}
+
+func (st *agentState) updateSnapshot() (status, detail string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.updateStatus, st.updateDetail
 }
 
 // statsCache caches slow-to-collect node statistics so heartbeat payloads are
@@ -210,7 +230,7 @@ func statsLoop(ctx context.Context, cache *statsCache, sup *supervisor.Superviso
 }
 
 // heartbeatLoop sends a heartbeat every interval, starting immediately.
-func heartbeatLoop(ctx context.Context, client *api.Client, cfg *config.Config, sup *supervisor.Supervisor, st *agentState, cache *statsCache) {
+func heartbeatLoop(ctx context.Context, client *api.Client, cfg *config.Config, sup *supervisor.Supervisor, st *agentState, cache *statsCache, agentDir string) {
 	interval := time.Duration(cfg.HeartbeatIntervalSec) * time.Second
 	if interval <= 0 {
 		interval = 10 * time.Second
@@ -223,7 +243,7 @@ func heartbeatLoop(ctx context.Context, client *api.Client, cfg *config.Config, 
 	case <-ctx.Done():
 		return
 	}
-	sendHeartbeat(ctx, client, cfg, sup, st, cache)
+	sendHeartbeat(ctx, client, cfg, sup, st, cache, agentDir)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -232,14 +252,14 @@ func heartbeatLoop(ctx context.Context, client *api.Client, cfg *config.Config, 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			sendHeartbeat(ctx, client, cfg, sup, st, cache)
+			sendHeartbeat(ctx, client, cfg, sup, st, cache, agentDir)
 		}
 	}
 }
 
 // sendHeartbeat reports the cached statistics; on a heartbeat error it
 // re-registers to recover (the control plane registry is in-memory).
-func sendHeartbeat(ctx context.Context, client *api.Client, cfg *config.Config, sup *supervisor.Supervisor, st *agentState, cache *statsCache) {
+func sendHeartbeat(ctx context.Context, client *api.Client, cfg *config.Config, sup *supervisor.Supervisor, st *agentState, cache *statsCache, agentDir string) {
 	used, status, restarts, statsAge, logTail := cache.get()
 	free := cfg.CapacityBytes - used
 	if free < 0 {
@@ -267,7 +287,14 @@ func sendHeartbeat(ctx context.Context, client *api.Client, cfg *config.Config, 
 		StatsAgeSec:     int64(statsAge.Seconds()),
 		LogTail:         logTail,
 	}
-	if err := client.Heartbeat(ctx, cfg.NodeID, hb); err != nil {
+	// Agent self-update progress: "running" is reported with every heartbeat
+	// while the update is in progress; the final "done"/"failed" status is
+	// one-shot and cleared once the control plane has acknowledged it.
+	if updStatus, updDetail := st.updateSnapshot(); updStatus != "" {
+		hb.UpdateStatus, hb.UpdateDetail = updStatus, updDetail
+	}
+	resp, err := client.Heartbeat(ctx, cfg.NodeID, hb)
+	if err != nil {
 		fmt.Printf("agent: heartbeat error: %v\n", err)
 		// The control plane keeps its node registry in memory and
 		// forgets nodes on restart; re-register to recover.
@@ -280,6 +307,22 @@ func sendHeartbeat(ctx context.Context, client *api.Client, cfg *config.Config, 
 		applyVolumeConfig(sup, cfg, newCfg)
 		fmt.Println("agent: re-registered after heartbeat error")
 		return
+	}
+
+	// One-shot update statuses ("done"/"failed") are cleared as soon as the
+	// control plane acknowledged them; "running" persists until the update
+	// finishes (the agent process is then replaced by the service restart).
+	if s, _ := st.updateSnapshot(); s == "done" || s == "failed" {
+		st.setUpdate("", "")
+	}
+
+	// Control-plane commands delivered with this heartbeat. Currently only
+	// "update_agent" exists: it reinstalls the agent package preserving the
+	// node configuration and restarts the agent service (selfupdate.go).
+	for _, cmd := range resp.Commands {
+		if cmd == "update_agent" {
+			triggerSelfUpdate(ctx, agentDir, st)
+		}
 	}
 }
 

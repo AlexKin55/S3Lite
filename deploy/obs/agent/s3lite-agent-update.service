@@ -1,0 +1,36 @@
+# s3lite-agent-update.service
+#
+# Privileged one-shot helper for the agent SELF-UPDATE feature: the agent
+# runs as the unprivileged "s3lite" user (s3lite-agent.service) and therefore
+# cannot install/remove packages itself. This root unit performs the package
+# reinstall (with configuration backup/restore) on the agent's request.
+#
+# Privilege boundary — no D-Bus, no polkit, no sudo, no setuid:
+#   - the agent only creates a request file (update-request) in its own
+#     working directory; the root s3lite-agent-update.path unit (inotify
+#     rule, see s3lite-agent-update.path) starts this unit when the file
+#     appears — the privileged action is performed by systemd itself, the
+#     agent makes no privileged calls;
+#   - this unit and the update script (/usr/lib/s3lite/agent-update.sh) are
+#     root-owned files shipped by the RPM: the "s3lite" user cannot modify
+#     what runs with root privileges;
+#   - the script restarts s3lite-agent.service at the end; that is safe
+#     here because this unit runs in its own cgroup.
+#
+# Output is appended to /var/lib/s3lite/agent/update.log (truncated by
+# ExecStartPre) and the outcome is written to the update-result marker,
+# which the fresh agent process consumes at startup (the requesting agent
+# process is replaced by the restart) — see selfupdate.go.
+
+[Unit]
+Description=S3Lite agent self-update (package reinstall, configs preserved)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/truncate -s 0 /var/lib/s3lite/agent/update.log
+ExecStartPre=/usr/bin/rm -f /var/lib/s3lite/agent/update-request
+ExecStart=/usr/lib/s3lite/agent-update.sh s3lite-agent
+StandardOutput=append:/var/lib/s3lite/agent/update.log
+StandardError=append:/var/lib/s3lite/agent/update.log

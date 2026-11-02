@@ -36,6 +36,16 @@ type Node struct {
 	RestartsTotal   int    `json:"restarts_total,omitempty"`
 	StatsAgeSec     int64  `json:"stats_age_sec,omitempty"`
 	LogTail         string `json:"log_tail,omitempty"`
+
+	// Agent self-update state (dashboard "Update agent" button). Status
+	// flow: "requested" (admin) -> "dispatched" (command delivered with a
+	// heartbeat response) -> "running" (agent is reinstalling the package)
+	// -> "done"/"failed" (agent-reported; the control plane also marks
+	// "done" when a fresh heartbeat arrives after the restart, because the
+	// update replaces the reporting agent process).
+	UpdateRequestedAt time.Time `json:"update_requested_at,omitempty"`
+	UpdateStatus      string    `json:"update_status,omitempty"`
+	UpdateDetail      string    `json:"update_detail,omitempty"`
 }
 
 // HeartbeatUpdate carries the mutable per-node stats from heartbeats.
@@ -53,6 +63,8 @@ type HeartbeatUpdate struct {
 	RestartsTotal     int
 	StatsAgeSec       int64
 	LogTail           string
+	UpdateStatus      string // agent self-update progress: "running"|"done"|"failed"
+	UpdateDetail      string
 }
 
 // Registry is a thread-safe in-memory node registry.
@@ -135,7 +147,45 @@ func (r *Registry) UpdateHeartbeat(id string, hb HeartbeatUpdate) (*Node, bool) 
 	n.RestartsTotal = hb.RestartsTotal
 	n.StatsAgeSec = hb.StatsAgeSec
 	n.LogTail = hb.LogTail
+	// Agent self-update progress. A heartbeat without an update status while
+	// the update is "running" means the update helper restarted the agent
+	// service and the fresh agent is reporting again: the update completed.
+	if hb.UpdateStatus != "" {
+		n.UpdateStatus = hb.UpdateStatus
+		n.UpdateDetail = hb.UpdateDetail
+	} else if n.UpdateStatus == "running" {
+		n.UpdateStatus = "done"
+		n.UpdateDetail = "agent restarted; now reporting version " + hb.AgentVersion
+	}
 	return n, true
+}
+
+// RequestAgentUpdate schedules an agent self-update: the update_agent
+// command is delivered to the agent with its next heartbeat response.
+func (r *Registry) RequestAgentUpdate(id string) (*Node, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n, ok := r.nodes[id]
+	if !ok {
+		return nil, false
+	}
+	n.UpdateRequestedAt = time.Now()
+	n.UpdateStatus = "requested"
+	n.UpdateDetail = ""
+	return n, true
+}
+
+// TakeAgentUpdateCommand atomically marks a pending agent-update request as
+// dispatched and reports it, so the command is delivered exactly once.
+func (r *Registry) TakeAgentUpdateCommand(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n, ok := r.nodes[id]
+	if !ok || n.UpdateStatus != "requested" {
+		return false
+	}
+	n.UpdateStatus = "dispatched"
+	return true
 }
 
 // Get returns a node by id.
