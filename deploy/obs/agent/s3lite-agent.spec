@@ -159,6 +159,9 @@ exit 0
 %{_unitdir}/s3lite-agent.service
 %{_unitdir}/s3lite-agent-update.service
 %{_unitdir}/s3lite-agent-update.path
+# Own the directory itself, otherwise the post-build check reports
+# "directories not owned by a package: /usr/lib/s3lite".
+%dir %{_prefix}/lib/s3lite
 %{_prefix}/lib/s3lite/agent-update.sh
 %dir %attr(0755,root,root) %{_sysconfdir}/s3lite
 %config(noreplace) %attr(0640,root,root) %{_sysconfdir}/s3lite/agent.env
@@ -170,7 +173,7 @@ exit 0
 %doc README.md
 
 %changelog
-* Sun Nov 02 2026 S3Lite <dev@s3lite.dev> - 0.0.4-0
+* Mon Nov 02 2026 S3Lite <dev@s3lite.dev> - 0.0.4-0
 - Agent self-update: the control plane dashboard can request an agent
   reinstall (fresh binaries from the repo even at the same version); the
   command is delivered to the agent with its heartbeat and the agent drops
