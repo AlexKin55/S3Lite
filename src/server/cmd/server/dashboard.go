@@ -62,13 +62,23 @@ func (s *server) dashboardAPI(w http.ResponseWriter, r *http.Request) {
 			riskC++
 		}
 	}
-	// Summary cluster health: critical when a node is offline or an EC volume
-	// is at risk, degraded when something needs attention, else healthy.
+	// Summary cluster health, derived from actual EC data availability rather
+	// than raw node counts: with an k+m scheme (e.g. 6+4) a few offline nodes
+	// only reduce redundancy, so they are "degraded". Critical means some
+	// volume has burned through all m parity shards (available <= k, i.e.
+	// zero redundancy left) or already lost data (AT_RISK), or node IDs are
+	// duplicated (shard placement is no longer trustworthy).
+	exhaustedC := 0
+	for _, rep := range reports {
+		if rep.Available <= rep.DataShards && rep.Available < rep.Total {
+			exhaustedC++
+		}
+	}
 	health := "healthy"
 	switch {
-	case offlineC > 0 || riskC > 0 || len(dupNodeIDs) > 0:
+	case exhaustedC > 0 || riskC > 0 || len(dupNodeIDs) > 0:
 		health = "critical"
-	case degradedC > 0 || degC > 0:
+	case offlineC > 0 || degradedC > 0 || degC > 0:
 		health = "degraded"
 	}
 	payload := map[string]any{
