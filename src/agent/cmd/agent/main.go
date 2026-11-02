@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -110,7 +111,7 @@ func run(agentDir, serverOverride string, portOverride int, weedOverride, storag
 	}
 	fmt.Printf("volume server started on %s:%d (master %s)\n", ip, volumePort, volCfg.Master)
 
-	st := &agentState{lastIP: ip, volCfg: volCfg}
+	st := &agentState{lastIP: ip, volCfg: volCfg, startedAt: time.Now()}
 
 	// Slow statistics (volume server status, data dir size) are collected in
 	// the background with caching: the heartbeat loop must never block on a
@@ -131,10 +132,12 @@ func run(agentDir, serverOverride string, portOverride int, weedOverride, storag
 }
 
 // agentState is the mutable agent state shared between the background loops.
+// startedAt is immutable (agent process start time, shown on the dashboard).
 type agentState struct {
-	mu     sync.Mutex
-	lastIP string
-	volCfg *api.VolumeConfig
+	mu        sync.Mutex
+	lastIP    string
+	volCfg    *api.VolumeConfig
+	startedAt time.Time
 }
 
 func (st *agentState) snapshot() (ip string, volCfg *api.VolumeConfig) {
@@ -146,10 +149,13 @@ func (st *agentState) snapshot() (ip string, volCfg *api.VolumeConfig) {
 // statsCache caches slow-to-collect node statistics so heartbeat payloads are
 // assembled instantly. The first completed refresh closes ready.
 type statsCache struct {
-	mu     sync.Mutex
-	used   int64
-	status supervisor.Status
-	ready  chan struct{}
+	mu          sync.Mutex
+	used        int64
+	status      supervisor.Status
+	restarts    int       // volume server process starts (supervisor counter)
+	refreshedAt time.Time // when these statistics were collected
+	logTail     string    // volume log tail, filled only when degraded
+	ready       chan struct{}
 }
 
 // refresh recomputes the cached statistics. It may take seconds (volume
@@ -157,9 +163,19 @@ type statsCache struct {
 func (c *statsCache) refresh(dataDir string, sup *supervisor.Supervisor) {
 	status := sup.FetchStatus(5 * time.Second)
 	used := dirSize(dataDir)
+	// The log tail is collected only while the volume server is down: it
+	// explains WHY the node is degraded (disk full, io error, ...) and is
+	// shown in the dashboard's node details.
+	tail := ""
+	if !status.Alive {
+		tail = strings.Join(sup.LogTail(4), "\n")
+	}
 	c.mu.Lock()
 	c.used = used
 	c.status = status
+	c.restarts = sup.RestartCount()
+	c.refreshedAt = time.Now()
+	c.logTail = tail
 	c.mu.Unlock()
 	select {
 	case <-c.ready:
@@ -168,10 +184,14 @@ func (c *statsCache) refresh(dataDir string, sup *supervisor.Supervisor) {
 	}
 }
 
-func (c *statsCache) get() (used int64, status supervisor.Status) {
+func (c *statsCache) get() (used int64, status supervisor.Status, restarts int, statsAge time.Duration, logTail string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.used, c.status
+	age := time.Duration(0)
+	if !c.refreshedAt.IsZero() {
+		age = time.Since(c.refreshedAt)
+	}
+	return c.used, c.status, c.restarts, age, c.logTail
 }
 
 // statsLoop refreshes the statistics cache every 30 seconds in the background.
@@ -220,7 +240,7 @@ func heartbeatLoop(ctx context.Context, client *api.Client, cfg *config.Config, 
 // sendHeartbeat reports the cached statistics; on a heartbeat error it
 // re-registers to recover (the control plane registry is in-memory).
 func sendHeartbeat(ctx context.Context, client *api.Client, cfg *config.Config, sup *supervisor.Supervisor, st *agentState, cache *statsCache) {
-	used, status := cache.get()
+	used, status, restarts, statsAge, logTail := cache.get()
 	free := cfg.CapacityBytes - used
 	if free < 0 {
 		free = 0
@@ -238,6 +258,14 @@ func sendHeartbeat(ctx context.Context, client *api.Client, cfg *config.Config, 
 		VolumeServerAlive: status.Alive,
 		VolumesCount:      status.VolumesCount,
 		EcShardsCount:     status.EcShardsCount,
+
+		AgentVersion:    agentVersion,
+		WeedVersion:     status.WeedVersion,
+		AgentUptimeSec:  int64(time.Since(st.startedAt).Seconds()),
+		VolumeUptimeSec: int64(status.VolumeUptime.Seconds()),
+		RestartsTotal:   restarts,
+		StatsAgeSec:     int64(statsAge.Seconds()),
+		LogTail:         logTail,
 	}
 	if err := client.Heartbeat(ctx, cfg.NodeID, hb); err != nil {
 		fmt.Printf("agent: heartbeat error: %v\n", err)
@@ -251,6 +279,7 @@ func sendHeartbeat(ctx context.Context, client *api.Client, cfg *config.Config, 
 		}
 		applyVolumeConfig(sup, cfg, newCfg)
 		fmt.Println("agent: re-registered after heartbeat error")
+		return
 	}
 }
 

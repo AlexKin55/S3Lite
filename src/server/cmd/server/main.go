@@ -367,6 +367,13 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request, nodeID 
 		VolumeServerAlive bool   `json:"volume_server_alive"`
 		VolumesCount      int    `json:"volumes_count"`
 		EcShardsCount     int    `json:"ec_shards_count"`
+		AgentVersion      string `json:"agent_version"`
+		WeedVersion       string `json:"weed_version"`
+		AgentUptimeSec    int64  `json:"agent_uptime_sec"`
+		VolumeUptimeSec   int64  `json:"volume_uptime_sec"`
+		RestartsTotal     int    `json:"restarts_total"`
+		StatsAgeSec       int64  `json:"stats_age_sec"`
+		LogTail           string `json:"log_tail"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -379,6 +386,13 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request, nodeID 
 		VolumeServerAlive: req.VolumeServerAlive,
 		VolumesCount:      req.VolumesCount,
 		EcShardsCount:     req.EcShardsCount,
+		AgentVersion:      req.AgentVersion,
+		WeedVersion:       req.WeedVersion,
+		AgentUptimeSec:    req.AgentUptimeSec,
+		VolumeUptimeSec:   req.VolumeUptimeSec,
+		RestartsTotal:     req.RestartsTotal,
+		StatsAgeSec:       req.StatsAgeSec,
+		LogTail:           req.LogTail,
 	})
 	if !ok {
 		http.Error(w, "unknown node", http.StatusNotFound)

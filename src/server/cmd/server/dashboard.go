@@ -28,21 +28,25 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 // dashboardAPI returns aggregated JSON used by the dashboard's fetch() calls:
-// nodes (with computed online/offline state), node counters, cluster capacity
-// and the volume reports from the live monitors.
+// nodes (with computed online/offline state), node counters, cluster capacity,
+// a summary cluster health badge and the volume reports from the live monitors.
 func (s *server) dashboardAPI(w http.ResponseWriter, r *http.Request) {
 	reports := s.lastReports.Load().([]*redundancy.Report)
 	nodes := s.nodeViews()
 
-	var okC, degC, riskC, onlineC, offlineC int
-	var totalCap, usedCap int64
+	var okC, degC, riskC, onlineC, degradedC, offlineC int
+	var totalCap, usedCap, freeCap int64
 	for _, n := range nodes {
 		totalCap += n.CapacityBytes
 		usedCap += n.DiskUsed
+		freeCap += n.DiskFree
 		if n.Status == "online" {
 			onlineC++
 		} else {
 			offlineC++
+		}
+		if n.Health == "degraded" {
+			degradedC++
 		}
 	}
 	for _, rep := range reports {
@@ -55,17 +59,29 @@ func (s *server) dashboardAPI(w http.ResponseWriter, r *http.Request) {
 			riskC++
 		}
 	}
+	// Summary cluster health: critical when a node is offline or an EC volume
+	// is at risk, degraded when something needs attention, else healthy.
+	health := "healthy"
+	switch {
+	case offlineC > 0 || riskC > 0:
+		health = "critical"
+	case degradedC > 0 || degC > 0:
+		health = "degraded"
+	}
 	payload := map[string]any{
-		"nodes": nodes,
+		"nodes":  nodes,
+		"health": health,
 		"node_status": map[string]int{
-			"online":  onlineC,
-			"offline": offlineC,
+			"online":   onlineC,
+			"degraded": degradedC,
+			"offline":  offlineC,
 		},
 		"volumes": reports,
 		"ec":      map[string]int{"ok": okC, "degraded": degC, "at_risk": riskC, "total": len(reports)},
 		"capacity": map[string]int64{
 			"total_bytes": totalCap,
 			"used_bytes":  usedCap,
+			"free_bytes":  freeCap,
 		},
 	}
 	writeJSON(w, http.StatusOK, payload)

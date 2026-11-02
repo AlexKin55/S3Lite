@@ -21,21 +21,38 @@ type Node struct {
 	RegisteredAt  time.Time `json:"registered_at"`
 	LastHeartbeat time.Time `json:"last_heartbeat"`
 	Alive         bool      `json:"alive"`
-	Status        string    `json:"status"`
+	Status        string    `json:"status"`           // computed: "online" | "offline" (heartbeat TTL)
+	Health        string    `json:"health,omitempty"` // agent-reported: "online" | "degraded"
 	DiskFree      int64     `json:"disk_free"`
 	DiskUsed      int64     `json:"disk_used"`
 	VolumesCount  int       `json:"volumes_count"`
 	EcShardsCount int       `json:"ec_shards_count"`
+
+	// Diagnostics reported by the agent in heartbeats (dashboard node details).
+	AgentVersion    string `json:"agent_version,omitempty"`
+	WeedVersion     string `json:"weed_version,omitempty"`
+	AgentUptimeSec  int64  `json:"agent_uptime_sec,omitempty"`
+	VolumeUptimeSec int64  `json:"volume_uptime_sec,omitempty"`
+	RestartsTotal   int    `json:"restarts_total,omitempty"`
+	StatsAgeSec     int64  `json:"stats_age_sec,omitempty"`
+	LogTail         string `json:"log_tail,omitempty"`
 }
 
 // HeartbeatUpdate carries the mutable per-node stats from heartbeats.
 type HeartbeatUpdate struct {
-	Status            string
+	Status            string // agent health: "online" | "degraded"
 	DiskFree          int64
 	DiskUsed          int64
 	VolumeServerAlive bool
 	VolumesCount      int
 	EcShardsCount     int
+	AgentVersion      string
+	WeedVersion       string
+	AgentUptimeSec    int64
+	VolumeUptimeSec   int64
+	RestartsTotal     int
+	StatsAgeSec       int64
+	LogTail           string
 }
 
 // Registry is a thread-safe in-memory node registry.
@@ -83,8 +100,12 @@ func (r *Registry) Register(id string, capacity int64, zone, ip, osName, osVersi
 	// registration moment as its most recent proof-of-life. Without this a
 	// freshly registered node would show a zero last_heartbeat until its
 	// first heartbeat arrives (the agent sends one every few seconds).
+	// RegisteredAt is set only once so the dashboard shows the true node age
+	// even after re-registrations (heartbeat-error recovery, IP changes).
 	now := time.Now()
-	n.RegisteredAt = now
+	if !exists {
+		n.RegisteredAt = now
+	}
 	n.LastHeartbeat = now
 	n.Alive = true
 	n.Status = "online"
@@ -102,11 +123,18 @@ func (r *Registry) UpdateHeartbeat(id string, hb HeartbeatUpdate) (*Node, bool) 
 	now := time.Now()
 	n.LastHeartbeat = now
 	n.Alive = hb.VolumeServerAlive
-	n.Status = hb.Status
+	n.Health = hb.Status
 	n.DiskFree = hb.DiskFree
 	n.DiskUsed = hb.DiskUsed
 	n.VolumesCount = hb.VolumesCount
 	n.EcShardsCount = hb.EcShardsCount
+	n.AgentVersion = hb.AgentVersion
+	n.WeedVersion = hb.WeedVersion
+	n.AgentUptimeSec = hb.AgentUptimeSec
+	n.VolumeUptimeSec = hb.VolumeUptimeSec
+	n.RestartsTotal = hb.RestartsTotal
+	n.StatsAgeSec = hb.StatsAgeSec
+	n.LogTail = hb.LogTail
 	return n, true
 }
 

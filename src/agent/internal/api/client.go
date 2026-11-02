@@ -70,6 +70,8 @@ func (c *Client) Register(ctx context.Context, req RegisterRequest) (*RegisterRe
 }
 
 // HeartbeatRequest is the POST /api/v1/nodes/{id}/heartbeat body.
+// All fields beyond the first six are optional diagnostics shown on the
+// control plane dashboard (versions, uptime, restart counters, log tail).
 type HeartbeatRequest struct {
 	Status            string `json:"status"`
 	DiskFreeBytes     int64  `json:"disk_free"`
@@ -77,6 +79,16 @@ type HeartbeatRequest struct {
 	VolumeServerAlive bool   `json:"volume_server_alive"`
 	VolumesCount      int    `json:"volumes_count"`
 	EcShardsCount     int    `json:"ec_shards_count"`
+
+	AgentVersion    string `json:"agent_version,omitempty"`
+	WeedVersion     string `json:"weed_version,omitempty"`
+	AgentUptimeSec  int64  `json:"agent_uptime_sec,omitempty"`
+	VolumeUptimeSec int64  `json:"volume_uptime_sec,omitempty"`
+	RestartsTotal   int    `json:"restarts_total,omitempty"`
+	// StatsAgeSec is how long ago the cached slow statistics were refreshed.
+	StatsAgeSec int64 `json:"stats_age_sec,omitempty"`
+	// LogTail carries the last volume-server log lines (sent when degraded).
+	LogTail string `json:"log_tail,omitempty"`
 }
 
 // Heartbeat sends the node's heartbeat.

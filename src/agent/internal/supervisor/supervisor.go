@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -33,6 +34,8 @@ type Status struct {
 	Alive         bool
 	VolumesCount  int
 	EcShardsCount int
+	WeedVersion   string        // reported by the volume server /status endpoint
+	VolumeUptime  time.Duration // time since the current process was started
 }
 
 // Supervisor manages the weed volume process: start, watch, restart on crash.
@@ -43,6 +46,7 @@ type Supervisor struct {
 	stopCh       chan struct{}
 	log          *os.File
 	restartCount int
+	lastStart    time.Time // when the current process was started
 }
 
 func New(args VolumeArgs) *Supervisor {
@@ -99,6 +103,7 @@ func (s *Supervisor) startLocked(restartDelay time.Duration) error {
 	}
 	s.cmd = cmd
 	s.restartCount++
+	s.lastStart = time.Now()
 
 	go s.watch(restartDelay)
 	return nil
@@ -204,7 +209,10 @@ func (s *Supervisor) Args() VolumeArgs {
 // The Volumes field covers both regular volumes and EC shards (each entry has
 // an "EcShards" sub-list), so EcShardsCount is derived from the nested lists.
 func (s *Supervisor) FetchStatus(timeout time.Duration) Status {
+	s.mu.Lock()
 	url := fmt.Sprintf("http://%s:%d/status", s.args.IP, s.args.Port)
+	started := s.lastStart
+	s.mu.Unlock()
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Get(url)
 	if err != nil {
@@ -216,6 +224,7 @@ func (s *Supervisor) FetchStatus(timeout time.Duration) Status {
 		return Status{Alive: false}
 	}
 	var st struct {
+		Version string `json:"Version"`
 		Volumes []struct {
 			EcShards []any `json:"EcShards"`
 		} `json:"Volumes"`
@@ -229,7 +238,46 @@ func (s *Supervisor) FetchStatus(timeout time.Duration) Status {
 		Alive:         true,
 		VolumesCount:  len(st.Volumes),
 		EcShardsCount: ec,
+		WeedVersion:   st.Version,
+		VolumeUptime:  time.Since(started),
 	}
+}
+
+// LogTail returns the last lines of the volume server log file (at most
+// maxLines). It reads only the tail of the file, so it is cheap even for a
+// large log. Returns nil when the log is not configured or unreadable.
+func (s *Supervisor) LogTail(maxLines int) []string {
+	s.mu.Lock()
+	path := s.args.LogPath
+	s.mu.Unlock()
+	if path == "" || maxLines <= 0 {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	const chunk = 8 * 1024 // read at most the last 8 KiB
+	st, err := f.Stat()
+	if err != nil || st.Size() == 0 {
+		return nil
+	}
+	read := int64(chunk)
+	if st.Size() < read {
+		read = st.Size()
+	}
+	buf := make([]byte, read)
+	if _, err := f.ReadAt(buf, st.Size()-read); err != nil {
+		return nil
+	}
+	text := strings.TrimRight(string(buf), "\n")
+	lines := strings.Split(text, "\n")
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return lines
 }
 
 // DetectIP returns the first non-loopback IPv4 address of the machine.
