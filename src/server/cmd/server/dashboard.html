@@ -51,12 +51,15 @@
   button.upd:hover { background:#f59e0b; }
   button.upd:disabled { background:#475569; cursor:wait; }
   .result { margin-top:8px; font-size:13px; color:#94a3b8; min-height:16px; }
+  .banner { background:#450a0a; color:#fecaca; border:1px solid #7f1d1d; border-radius:8px;
+            padding:10px 14px; margin:10px 0; font-size:13.5px; line-height:1.5; }
   a { color:#0ea5e9; }
 </style>
 </head>
 <body>
 <h1>🛰 S3Lite — control plane</h1>
 <div class="grid" id="stats"></div>
+<div id="dup-banner" class="banner" hidden></div>
 
 <h2>Registered nodes <span class="hint">status computed from heartbeat freshness (TTL) · click a row for node details</span></h2>
 <div class="card">
@@ -106,6 +109,17 @@ function diskBar(used, cap){
 async function load(){
   const j = await (await fetch('/api/v1/dashboard')).json();
   const ec = j.ec, cap = j.capacity, ns = j.node_status, nodes = j.nodes, health = j.health||'healthy';
+  const dups = j.duplicates || [];
+  const dupBanner = document.getElementById('dup-banner');
+  if (dups.length) {
+    dupBanner.hidden = false;
+    dupBanner.innerHTML = '⚠ <b>Duplicate node IDs detected:</b> '+dups.map(esc).join(', ')+
+      ' — several machines share one node_id (e.g. cloned VM images carry the same '+
+      '/var/lib/s3lite/agent/agent.json). They collide in the registry: shared rack/port, '+
+      'mixed stats, misdirected update commands. '+
+      'Fix: give each machine a unique node_id in /var/lib/s3lite/agent/agent.json '+
+      'and restart s3lite-agent.';
+  } else { dupBanner.hidden = true; }
   document.getElementById('stats').innerHTML =
     '<span class="cluster-badge '+esc(health)+'">'+esc(health.toUpperCase())+'</span>'+
     '<div class="stat"><b>'+nodes.length+'</b>nodes</div>'+
@@ -119,7 +133,8 @@ async function load(){
   const nt=nodes.map(n=>{
     const cl = n.status === 'online' ? 'ok' : 'offline';
     const badge = '<span class="badge '+cl+'">'+n.status+'</span>'+
-      (n.health==='degraded' ? ' <span class="badge warn">degraded</span>' : '');
+      (n.health==='degraded' ? ' <span class="badge warn">degraded</span>' : '')+
+      (dups.includes(n.node_id) ? ' <span class="badge warn" title="This node_id is seen from more than one machine">duplicate id</span>' : '');
     const os = [n.os, n.os_version].filter(Boolean).join(' ');
     const sub = [n.rack, n.zone, n.stability].filter(Boolean).join(' · ');
     const detail =

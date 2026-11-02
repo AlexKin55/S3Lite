@@ -33,6 +33,9 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 func (s *server) dashboardAPI(w http.ResponseWriter, r *http.Request) {
 	reports := s.lastReports.Load().([]*redundancy.Report)
 	nodes := s.nodeViews()
+	// Node IDs recently seen from more than one machine (e.g. cloned VM
+	// images ship the same /var/lib/s3lite/agent/agent.json to every clone).
+	dupNodeIDs := s.reg.DuplicateNodeIDs()
 
 	var okC, degC, riskC, onlineC, degradedC, offlineC int
 	var totalCap, usedCap, freeCap int64
@@ -63,14 +66,15 @@ func (s *server) dashboardAPI(w http.ResponseWriter, r *http.Request) {
 	// is at risk, degraded when something needs attention, else healthy.
 	health := "healthy"
 	switch {
-	case offlineC > 0 || riskC > 0:
+	case offlineC > 0 || riskC > 0 || len(dupNodeIDs) > 0:
 		health = "critical"
 	case degradedC > 0 || degC > 0:
 		health = "degraded"
 	}
 	payload := map[string]any{
-		"nodes":  nodes,
-		"health": health,
+		"nodes":      nodes,
+		"health":     health,
+		"duplicates": dupNodeIDs,
 		"node_status": map[string]int{
 			"online":   onlineC,
 			"degraded": degradedC,

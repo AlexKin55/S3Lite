@@ -1,9 +1,19 @@
 package store
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
+
+// duplicateWindow is how long a distinct control-plane request source IP is
+// remembered when detecting several machines sharing one node_id (which
+// happens when a VM image with an initialized agent is cloned: every clone
+// carries the same /var/lib/s3lite/agent/agent.json). Agents heartbeat every
+// few seconds, so two minutes is plenty for both machines to be seen; a node
+// whose IP legitimately changed (DHCP renewal) stops being flagged when its
+// old address expires from the window.
+const duplicateWindow = 2 * time.Minute
 
 // Node is the control plane's view of a registered storage node.
 type Node struct {
@@ -27,6 +37,12 @@ type Node struct {
 	DiskUsed      int64     `json:"disk_used"`
 	VolumesCount  int       `json:"volumes_count"`
 	EcShardsCount int       `json:"ec_shards_count"`
+
+	// Recent control-plane request source IPs (register/heartbeat). More
+	// than one distinct source IP within duplicateWindow means the node_id
+	// is used by several machines at once. Internal only (json:"-"), the
+	// duplicate verdict is exposed via Registry.DuplicateNodeIDs.
+	SourceIPs map[string]time.Time `json:"-"`
 
 	// Diagnostics reported by the agent in heartbeats (dashboard node details).
 	AgentVersion    string `json:"agent_version,omitempty"`
@@ -84,6 +100,54 @@ func NewRegistry(portBase int, heartbeatTTL time.Duration) *Registry {
 		portBase:     portBase,
 		heartbeatTTL: heartbeatTTL,
 	}
+}
+
+// RecordSourceIP notes that a control-plane request (register or heartbeat)
+// for the node arrived from the given client IP. Entries older than
+// duplicateWindow are pruned, so a node that legitimately changed its IP
+// (DHCP renewal) stops being flagged after the window passes.
+func (r *Registry) RecordSourceIP(id, ip string) {
+	if ip == "" {
+		return
+	}
+	now := time.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n, ok := r.nodes[id]
+	if !ok {
+		return
+	}
+	if n.SourceIPs == nil {
+		n.SourceIPs = make(map[string]time.Time)
+	}
+	n.SourceIPs[ip] = now
+	for k, t := range n.SourceIPs {
+		if now.Sub(t) > duplicateWindow {
+			delete(n.SourceIPs, k)
+		}
+	}
+}
+
+// DuplicateNodeIDs returns node IDs that were recently seen from more than
+// one distinct source IP, i.e. most likely used by several machines at once.
+func (r *Registry) DuplicateNodeIDs() []string {
+	now := time.Now()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []string
+	for _, n := range r.nodes {
+		cnt := 0
+		for _, t := range n.SourceIPs {
+			if now.Sub(t) <= duplicateWindow {
+				cnt++
+			}
+		}
+		if cnt > 1 {
+			out = append(out, n.NodeID)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Register adds a node or updates its network identity on re-registration.

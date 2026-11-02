@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -293,6 +294,10 @@ func (s *server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n, isNew := s.reg.Register(req.NodeID, req.CapacityBytes, req.Zone, req.IP, req.OS, req.OSVersion, req.Arch)
+	// Remember the TCP source address: several distinct source IPs for one
+	// node_id mean several machines share it (e.g. cloned VM images); the
+	// dashboard shows a warning banner in that case.
+	s.reg.RecordSourceIP(req.NodeID, clientIP(r))
 	if isNew {
 		log.Printf("node registered: %s (%s) os=%s/%s arch=%s rack=%s port=%d zone=%s",
 			n.NodeID, n.IP, req.OS, req.OSVersion, req.Arch, n.Rack, n.VolumePort, n.Zone)
@@ -405,6 +410,8 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request, nodeID 
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	// See handleRegister: track where heartbeats for this node_id come from.
+	s.reg.RecordSourceIP(nodeID, clientIP(r))
 	_, ok := s.reg.UpdateHeartbeat(nodeID, store.HeartbeatUpdate{
 		Status:            req.Status,
 		DiskFree:          req.DiskFree,
@@ -614,6 +621,15 @@ func (s *server) nodeView(n *store.Node) store.Node {
 }
 
 // nodeViews returns a snapshot of all registered nodes with computed state.
+// clientIP extracts the remote client IP from the request (port stripped).
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 func (s *server) nodeViews() []store.Node {
 	all := s.reg.All()
 	views := make([]store.Node, 0, len(all))

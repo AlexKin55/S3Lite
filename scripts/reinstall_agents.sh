@@ -108,8 +108,13 @@ process_node() {
     fi
 
     # --- copy the helper script to the node ---
-    if ! scp -q $SSH_OPTS "${port_opts[@]}" "${key_opts[@]}" \
-         "$REMOTE_SCRIPT_SRC" "$target:$REMOTE_PATH" >/dev/null 2>&1; then
+    # NOTE: scp is not used deliberately: node aliases ("Home:Fedora") contain a
+    # colon, which scp treats as a host:path separator (and the SFTP subsystem
+    # may be disabled on the nodes). Copying via `ssh cat` avoids both problems.
+    if ! ssh $SSH_OPTS "${port_opts[@]}" "${key_opts[@]}" \
+         -o ConnectTimeout="$SSH_TIMEOUT" "$target" \
+         "cat > $REMOTE_PATH && chmod 755 $REMOTE_PATH" \
+         < "$REMOTE_SCRIPT_SRC" >/dev/null 2>&1; then
         echo "  ERROR: failed to copy the helper script to the node"
         report_add "$node|FAIL|failed to copy helper script"
         failed=$((failed + 1))
