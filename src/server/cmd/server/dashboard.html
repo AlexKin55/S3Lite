@@ -106,6 +106,9 @@ function diskBar(used, cap){
   return fmtBytes(used)+' / '+fmtBytes(cap)+' ('+pct+'%)'+
     '<div class="diskbar"><div class="'+cls+'" style="width:'+Math.min(100,pct)+'%"></div></div>';
 }
+// Node ids expanded by the user; re-applied on every auto-refresh so the
+// details row doesn't collapse when the table is re-rendered.
+const expanded = new Set();
 async function load(){
   const j = await (await fetch('/api/v1/dashboard')).json();
   const ec = j.ec, cap = j.capacity, ns = j.node_status, nodes = j.nodes, health = j.health||'healthy';
@@ -151,8 +154,9 @@ async function load(){
       (n.volume_uptime_sec ? '<div><b>Volume uptime</b>'+fmtUptime(n.volume_uptime_sec)+'</div>' : '')+
       (n.restarts_total ? '<div><b>Volume restarts</b>'+n.restarts_total+'</div>' : '')+
       (n.stats_age_sec ? '<div><b>Stats freshness</b>'+ago(new Date(Date.now()-n.stats_age_sec*1000).toISOString())+'</div>' : '');
+    const isOpen = expanded.has(n.node_id);
     return '<tr class="node-row" data-id="'+esc(n.node_id)+'">'+
-      '<td class="chev">▶</td>'+
+      '<td class="chev">'+(isOpen?'▼':'▶')+'</td>'+
       '<td><b>'+esc(n.node_id)+'</b>'+(sub?'<span class="sub">'+esc(sub)+'</span>':'')+'</td>'+
       '<td>'+esc(n.ip)+':'+n.volume_port+'</td>'+
       '<td title="'+esc(n.arch)+'">'+esc(os||'—')+(n.arch?'<span class="sub">'+esc(n.arch)+'</span>':'')+'</td>'+
@@ -161,7 +165,7 @@ async function load(){
       '<td>'+ago(n.last_heartbeat)+'</td>'+
       '<td>'+n.volumes_count+'</td><td>'+n.ec_shards_count+'</td>'+
       '<td><button class="del" data-id="'+esc(n.node_id)+'" title="Delete node permanently">✕</button></td></tr>'+
-      (detail ? '<tr class="detail-row" hidden><td colspan="10"><div class="detail-grid">'+detail+'</div>'+
+      (detail ? '<tr class="detail-row"'+(isOpen?'':' hidden')+'><td colspan="10"><div class="detail-grid">'+detail+'</div>'+
         (n.log_tail ? '<div class="logtail">'+esc(n.log_tail)+'</div>' : '')+'</td></tr>' : '');
   }).join('');
   document.querySelector('#nodes tbody').innerHTML = nt || '<tr><td colspan=10>— no nodes registered —</td></tr>';
@@ -184,6 +188,7 @@ document.querySelector('#nodes tbody').addEventListener('click', async (e)=>{
   if(det && det.classList.contains('detail-row')){
     det.hidden = !det.hidden;
     row.querySelector('.chev').textContent = det.hidden ? '▶' : '▼';
+    if(det.hidden) expanded.delete(row.dataset.id); else expanded.add(row.dataset.id);
   }
 });
 document.querySelector('#nodes tbody').addEventListener('click', async (e)=>{
