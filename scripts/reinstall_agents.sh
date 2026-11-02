@@ -9,7 +9,8 @@
 #                                       backed up anyway)
 #
 # Behavior per node:
-#   - agent installed    -> reinstall (dnf reinstall / zypper install --force),
+#   - agent installed    -> backup config, remove the package, refresh repo
+#                           metadata, install the package from the repo,
 #                           restore config if needed, daemon-reload + restart;
 #   - agent not installed -> install; if /etc/s3lite/agent.env is not
 #                           configured (contains CHANGE_ME or is missing),

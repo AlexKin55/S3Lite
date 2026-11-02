@@ -3,8 +3,10 @@
 # agent_reinstall_remote.sh
 #
 # Helper script that runs ON the remote node (copied there by
-# scripts/reinstall_agents.sh). It reinstalls the s3lite-agent package,
-# preserving the node's configuration, and restarts the service.
+# scripts/reinstall_agents.sh). It removes the s3lite-agent package (after
+# backing up its configuration), refreshes repository metadata, installs the
+# package fresh from the repository, restores the saved configuration and
+# restarts the service.
 #
 # An embedded copy of this script lives at
 # src/agent/cmd/agent/reinstall_agent.sh (the agent self-update feature:
@@ -13,7 +15,7 @@
 #
 # Emits machine-readable KEY=VALUE lines that the caller parses:
 #   HOSTNAME, PM, WAS_INSTALLED, OLD_VERSION, BACKUP_DIR,
-#   REINSTALL_RC / INSTALL_RC, NOW_INSTALLED, NEW_VERSION,
+#   REMOVE_RC / INSTALL_RC, NOW_INSTALLED, NEW_VERSION,
 #   RESTORED, CONFIGURED, ACTIVE, SERVICE_ERR, RESULT, DETAIL
 #
 # It also writes a self-update result marker to
@@ -89,34 +91,42 @@ mkdir -p "$backup_dir"
 echo "BACKUP_DIR=$backup_dir"
 
 # ---------------------------------------------------------------------------
-# Reinstall (keeping config) or install fresh. NOTE: this is always a
-# reinstall of the CURRENT package from the repo — the binaries are
-# re-deployed even when the version is unchanged (same version, new build).
+# 1) Remove the old package (config already backed up above).
+# 2) Rescan repositories / refresh the package-manager cache: a stale cache
+#    hides freshly published builds (dnf/zypper would otherwise install an
+#    old version from cache).
+# 3) Install the package from the repository — whatever it currently
+#    publishes: a newer build when there is one, the same version otherwise
+#    (unlike `dnf reinstall`, which pins the installed NEVRA and would
+#    silently redeploy an outdated agent).
+# 4) Restore the saved configuration (agent.env / agent.json) if the
+#    package replaced or removed it, and restart s3lite-agent.
+#
+# NOTE: between the remove and the install steps the node temporarily has no
+# agent package; if the install fails the node is left without an agent and
+# the caller reports FAIL.
 # ---------------------------------------------------------------------------
-# Refresh repo metadata first: a stale package-manager cache hides freshly
-# published builds (dnf/zypper happily reinstall an old version from cache),
-# which is how nodes could end up "reinstalled" with an outdated agent.
+if [ "$was_installed" = 1 ]; then
+    case "$PM" in
+        dnf)    dnf -y -q remove "$PKG" ;;
+        zypper) zypper --non-interactive --quiet remove "$PKG" ;;
+        apt)    DEBIAN_FRONTEND=noninteractive apt-get remove -y "$PKG" ;;
+    esac
+    echo "REMOVE_RC=$?"
+fi
+
 case "$PM" in
     dnf)    dnf -y -q --refresh makecache >/dev/null 2>&1 || true ;;
     zypper) zypper --non-interactive --quiet refresh >/dev/null 2>&1 || true ;;
     apt)    apt-get update -qq >/dev/null 2>&1 || true ;;
 esac
 
-if [ "$was_installed" = 1 ]; then
-    case "$PM" in
-        dnf)    dnf -y -q --refresh reinstall "$PKG" ;;
-        zypper) zypper --non-interactive --quiet install --force "$PKG" ;;
-        apt)    DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y "$PKG" ;;
-    esac
-    echo "REINSTALL_RC=$?"
-else
-    case "$PM" in
-        dnf)    dnf -y -q --refresh install "$PKG" ;;
-        zypper) zypper --non-interactive --quiet install "$PKG" ;;
-        apt)    DEBIAN_FRONTEND=noninteractive apt-get install -y "$PKG" ;;
-    esac
-    echo "INSTALL_RC=$?"
-fi
+case "$PM" in
+    dnf)    dnf -y -q install "$PKG" ;;
+    zypper) zypper --non-interactive --quiet install --force "$PKG" ;;
+    apt)    DEBIAN_FRONTEND=noninteractive apt-get install -y "$PKG" ;;
+esac
+echo "INSTALL_RC=$?"
 
 # ---------------------------------------------------------------------------
 # Verify the package is actually present now
@@ -133,16 +143,26 @@ fi
 echo "NOW_INSTALLED=$now_installed"
 echo "NEW_VERSION=$new_version"
 if [ "$now_installed" != 1 ]; then
-    write_update_marker failed "package $PKG not present after install/reinstall"
+    write_update_marker failed "package $PKG not present after install"
     echo "RESULT=FAIL"
-    echo "DETAIL=package $PKG not present after install/reinstall"
+    echo "DETAIL=package $PKG not present after install"
     exit 0
 fi
 
 # ---------------------------------------------------------------------------
-# Restore the configuration if the package replaced it
+# 4a) Restore the configuration if the package replaced or removed it.
+# agent.env needs restoring not only when it is missing: a fresh install
+# ships the template with CHANGE_ME placeholders, which would otherwise
+# mask the saved (configured) backup.
 # ---------------------------------------------------------------------------
-if [ ! -f /etc/s3lite/agent.env ] && [ -f "$backup_dir/agent.env" ]; then
+restore_env=0
+if [ -f "$backup_dir/agent.env" ]; then
+    if [ ! -f /etc/s3lite/agent.env ] || \
+       grep -q 'CHANGE_ME' /etc/s3lite/agent.env 2>/dev/null; then
+        restore_env=1
+    fi
+fi
+if [ "$restore_env" = 1 ]; then
     install -m 0640 "$backup_dir/agent.env" /etc/s3lite/agent.env
     echo "RESTORED=agent.env"
 fi
