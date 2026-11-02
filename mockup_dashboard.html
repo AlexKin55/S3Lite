@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>S3Lite — dashboard mockup</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 24px; background:#0f172a; color:#e2e8f0; }
+  h1 { font-size: 22px; }
+  h2 { font-size: 16px; margin-top: 28px; color:#94a3b8; text-transform: uppercase; letter-spacing:.08em; }
+  .hint { font-size:12px; text-transform:none; letter-spacing:0; color:#64748b; margin-left:8px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+  th, td { text-align:left; padding:6px 10px; border-bottom:1px solid #1e293b; font-size: 13px;}
+  th { color:#94a3b8; }
+  .ok { color:#4ade80; font-weight:600; }
+  .degraded { color:#facc15; font-weight:600; }
+  .at-risk { color:#f87171; font-weight:600; }
+  .offline { color:#f87171; }
+  .card { background:#1e293b; border-radius:10px; padding:14px 18px; margin:10px 0; }
+  .grid { display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .stat { background:#1e293b; border-radius:10px; padding:12px 18px; }
+  .stat b { font-size: 26px; display:block; }
+  .stat.ok b { color:#4ade80; }
+  .stat.risk b { color:#f87171; }
+  .badge { display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; font-weight:600; }
+  .badge.ok { background:#052e16; color:#4ade80; }
+  .badge.offline { background:#450a0a; color:#f87171; }
+  .badge.warn { background:#422006; color:#facc15; }
+  .badge.muted { background:#1e293b; color:#94a3b8; font-weight:400; }
+  .cluster-badge { padding:6px 18px; border-radius:999px; font-size:15px; font-weight:700; letter-spacing:.05em; }
+  .cluster-badge.healthy { background:#052e16; color:#4ade80; }
+  .cluster-badge.degraded { background:#422006; color:#facc15; }
+  .sub { font-size:11px; color:#64748b; display:block; margin-top:1px; }
+  /* compact disk usage bar */
+  .diskbar { background:#0f172a; border-radius:4px; height:10px; width:110px; margin-top:3px; overflow:hidden; }
+  .diskbar > div { height:100%; border-radius:4px; }
+  .diskbar .low  { background:#4ade80; }
+  .diskbar .mid  { background:#facc15; }
+  .diskbar .high { background:#f87171; }
+  .diskcell { min-width:150px; }
+  /* accordion detail row */
+  tr.detail-row td { background:#16223b; border-bottom:2px solid #1e293b; padding:12px 16px; }
+  .detail-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap:8px 24px; font-size:12.5px; }
+  .detail-grid div b { color:#94a3b8; font-weight:600; display:block; font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
+  .logtail { background:#0b1220; border:1px solid #1e293b; border-radius:6px; padding:8px 10px; margin-top:10px;
+             font-family: ui-monospace, monospace; font-size:11.5px; color:#f87171; white-space:pre; overflow-x:auto; }
+  .node-row { cursor:pointer; }
+  .node-row:hover td { background:#1a2740; }
+  .chev { color:#64748b; font-size:11px; }
+  button { background:#0ea5e9; color:#fff; border:0; border-radius:6px; padding:8px 14px; cursor:pointer; font-size:13px;}
+  button.del { background:#7f1d1d; padding:4px 10px; }
+  button.del:hover { background:#ef4444; }
+  a { color:#0ea5e9; }
+  .note { color:#64748b; font-size:12px; margin-top:6px; }
+</style>
+</head>
+<body>
+<h1>🛰 S3Lite — control plane <span style="font-weight:400;font-size:13px;color:#64748b;">(макет)</span></h1>
+
+<!-- 1. Сводный бейдж кластера + агрегаты -->
+<div class="grid">
+  <span class="cluster-badge degraded">DEGRADED</span>
+  <div class="stat"><b>5</b>nodes</div>
+  <div class="stat ok"><b>4</b>online</div>
+  <div class="stat"><b>1</b>degraded</div>
+  <div class="stat risk"><b>1</b>offline</div>
+  <div class="stat"><b>2</b>EC ok</div>
+  <div class="stat risk"><b>1</b>EC at risk</div>
+  <div class="stat"><b>1.4 TB</b>used / 2.0 TB</div>
+  <div class="stat ok"><b>620 GB</b>free</div>
+</div>
+
+<h2>Registered nodes <span class="hint">клик по строке — детали ноды</span></h2>
+<div class="card">
+ <table id="nodes">
+   <thead><tr>
+     <th></th><th>Node</th><th>IP:port</th><th>OS</th><th>Status</th><th>Disk</th><th>Last heartbeat</th><th>Volumes</th><th>EC shards</th><th></th>
+   </tr></thead>
+   <tbody>
+
+   <!-- обычная нода: колонки уплотнены, полоска диска -->
+   <tr class="node-row">
+     <td class="chev">▶</td>
+     <td><b>node-a1</b><span class="sub">rack1 · zone-msk</span></td>
+     <td>192.168.1.10:8081</td>
+     <td>Ubuntu 22.04.4 LTS<span class="sub">amd64</span></td>
+     <td><span class="badge ok">online</span></td>
+     <td class="diskcell">212 GB / 500 GB (42%)
+       <div class="diskbar"><div class="low" style="width:42%"></div></div></td>
+     <td>4s ago</td>
+     <td>12</td><td>0</td>
+     <td><button class="del" title="Delete node permanently">✕</button></td>
+   </tr>
+
+   <!-- нода с двумя бейджами: online + degraded + unstable -->
+   <tr class="node-row">
+     <td class="chev">▶</td>
+     <td><b>node-b2</b><span class="sub">rack2 · zone-msk · unstable</span></td>
+     <td>192.168.1.11:8082</td>
+     <td>ALT Server 10.2<span class="sub">amd64</span></td>
+     <td><span class="badge ok">online</span> <span class="badge warn">degraded</span></td>
+     <td class="diskcell">498 GB / 500 GB (99.6%)
+       <div class="diskbar"><div class="high" style="width:99%"></div></div></td>
+     <td>6s ago</td>
+     <td>31</td><td>8</td>
+     <td><button class="del" title="Delete node permanently">✕</button></td>
+   </tr>
+
+   <!-- оффлайн-нода с раскрытым аккордеоном -->
+   <tr class="node-row" style="opacity:.75">
+     <td class="chev">▼</td>
+     <td><b>node-c3</b><span class="sub">rack3 · zone-spb</span></td>
+     <td>192.168.1.12:8083</td>
+     <td>Debian 12<span class="sub">arm64</span></td>
+     <td><span class="badge offline">offline</span></td>
+     <td class="diskcell">87 GB / 500 GB (17%)
+       <div class="diskbar"><div class="low" style="width:17%"></div></div></td>
+     <td>14m ago</td>
+     <td>9</td><td>4</td>
+     <td><button class="del" title="Delete node permanently">✕</button></td>
+   </tr>
+   <!-- аккордеон: всё второстепенное здесь, без горизонтального скролла -->
+   <tr class="detail-row">
+     <td colspan="10">
+       <div class="detail-grid">
+         <div><b>Friendly name</b>storage-spb-03</div>
+         <div><b>Registered at</b>2026-09-14 08:22 (49d ago)</div>
+         <div><b>Agent version</b>v0.4.1</div>
+         <div><b>Weed version</b>3.80 3.5GB 2dc60f9</div>
+         <div><b>Volume server uptime</b>3d 12h</div>
+         <div><b>Restarts (24h)</b>2 · last: IP change</div>
+         <div><b>Stats freshness</b>30s ago ✓</div>
+         <div><b>Heartbeat errors (24h)</b>14</div>
+         <div><b>IP changes (24h)</b>1 (10.0.0.7 → 192.168.1.12)</div>
+         <div><b>Capacity / data dir</b>500 GB · /var/lib/s3lite (ext4)</div>
+       </div>
+       <div class="logtail">E1102 21:14:03.221 volume: read /var/lib/s3lite/3,4/xxx.dat: input/output error
+E1102 21:14:03.224 volume: shutting down volume 4 due to io error</div>
+     </td>
+   </tr>
+
+   <tr class="node-row">
+     <td class="chev">▶</td>
+     <td><b>node-d4</b><span class="sub">rack4 · zone-msk</span></td>
+     <td>192.168.1.13:8084</td>
+     <td>Ubuntu 24.04 LTS<span class="sub">amd64</span></td>
+     <td><span class="badge ok">online</span></td>
+     <td class="diskcell">320 GB / 500 GB (64%)
+       <div class="diskbar"><div class="mid" style="width:64%"></div></div></td>
+     <td>2s ago</td>
+     <td>18</td><td>4</td>
+     <td><button class="del" title="Delete node permanently">✕</button></td>
+   </tr>
+
+   </tbody>
+</table>
+</div>
+
+<h2>EC volumes <span class="hint">добавлена конфигурация EC (data+parity)</span></h2>
+<div class="card">
+ <table id="volumes">
+   <thead><tr>
+     <th>Collection</th><th>Volume</th><th>Config</th><th>State</th><th>Shards</th><th>Offline nodes</th><th>Power on to restore</th>
+   </tr></thead>
+   <tbody>
+     <tr><td>collection-a</td><td>3</td><td>10+4</td><td class="ok">OK</td><td>14/14</td><td>—</td><td>—</td></tr>
+     <tr><td>collection-b</td><td>7</td><td>6+3</td><td class="ok">OK</td><td>9/9</td><td>—</td><td>—</td></tr>
+     <tr><td>collection-c</td><td>4</td><td>10+4</td><td class="at-risk">AT RISK</td><td>12/14</td><td>node-c3</td><td>node-c3</td></tr>
+   </tbody>
+</table>
+</div>
+
+<h2>Actions</h2>
+<div class="card">
+  <button>Test notification</button>
+  <span class="note">Кнопки в макете не активны</span>
+</div>
+
+<script>
+// Демо: клик по строке ноды — показать/скрыть аккордеон
+document.querySelectorAll('tr.node-row').forEach(r=>{
+  r.addEventListener('click', ()=>{ alert('В реальной панели здесь раскроется строка с деталями ноды'); });
+});
+</script>
+</body>
+</html>
