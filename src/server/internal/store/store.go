@@ -12,6 +12,7 @@ type Node struct {
 	Zone          string    `json:"zone"`
 	IP            string    `json:"ip"`
 	OS            string    `json:"os"`
+	OSVersion     string    `json:"os_version,omitempty"`
 	Arch          string    `json:"arch"`
 	Rack          string    `json:"rack"`
 	VolumePort    int       `json:"volume_port"`
@@ -58,7 +59,7 @@ func NewRegistry(portBase int, heartbeatTTL time.Duration) *Registry {
 
 // Register adds a node or updates its network identity on re-registration.
 // A fresh node receives the next rack number and volume port.
-func (r *Registry) Register(id string, capacity int64, zone, ip, osName, arch string) (*Node, bool) {
+func (r *Registry) Register(id string, capacity int64, zone, ip, osName, osVersion, arch string) (*Node, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -76,6 +77,7 @@ func (r *Registry) Register(id string, capacity int64, zone, ip, osName, arch st
 	}
 	n.IP = ip
 	n.OS = osName
+	n.OSVersion = osVersion
 	n.Arch = arch
 	// The agent just proved it is alive by registering, so treat the
 	// registration moment as its most recent proof-of-life. Without this a

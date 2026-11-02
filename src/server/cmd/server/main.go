@@ -281,6 +281,7 @@ func (s *server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		Zone          string `json:"zone"`
 		IP            string `json:"ip"`
 		OS            string `json:"os"`
+		OSVersion     string `json:"os_version"`
 		Arch          string `json:"arch"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -291,10 +292,10 @@ func (s *server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "node_id required", http.StatusBadRequest)
 		return
 	}
-	n, isNew := s.reg.Register(req.NodeID, req.CapacityBytes, req.Zone, req.IP, req.OS, req.Arch)
+	n, isNew := s.reg.Register(req.NodeID, req.CapacityBytes, req.Zone, req.IP, req.OS, req.OSVersion, req.Arch)
 	if isNew {
-		log.Printf("node registered: %s (%s) rack=%s port=%d zone=%s",
-			n.NodeID, n.IP, n.Rack, n.VolumePort, n.Zone)
+		log.Printf("node registered: %s (%s) os=%s/%s arch=%s rack=%s port=%d zone=%s",
+			n.NodeID, n.IP, req.OS, req.OSVersion, req.Arch, n.Rack, n.VolumePort, n.Zone)
 	}
 	s.notifier.Notify("node_registered_"+n.NodeID, notify.Event{
 		Kind:    "node_registered",

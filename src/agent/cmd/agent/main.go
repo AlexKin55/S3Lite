@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -109,68 +110,204 @@ func run(agentDir, serverOverride string, portOverride int, weedOverride, storag
 	}
 	fmt.Printf("volume server started on %s:%d (master %s)\n", ip, volumePort, volCfg.Master)
 
+	st := &agentState{lastIP: ip, volCfg: volCfg}
+
+	// Slow statistics (volume server status, data dir size) are collected in
+	// the background with caching: the heartbeat loop must never block on a
+	// busy volume server or on a large data directory walk.
+	cache := &statsCache{ready: make(chan struct{})}
+	go statsLoop(ctx, cache, sup, dataDir)
+
+	// Heartbeats run in their own goroutine: the agent proves it is alive on
+	// schedule no matter what else it is doing (stat collection, restarts).
+	go heartbeatLoop(ctx, client, cfg, sup, st, cache)
+
+	// IP changes (DHCP renew) are watched separately from heartbeats.
+	go ipWatchLoop(ctx, client, cfg, sup, st)
+
+	<-ctx.Done()
+	fmt.Println("agent: stopping")
+	return sup.Stop()
+}
+
+// agentState is the mutable agent state shared between the background loops.
+type agentState struct {
+	mu     sync.Mutex
+	lastIP string
+	volCfg *api.VolumeConfig
+}
+
+func (st *agentState) snapshot() (ip string, volCfg *api.VolumeConfig) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.lastIP, st.volCfg
+}
+
+// statsCache caches slow-to-collect node statistics so heartbeat payloads are
+// assembled instantly. The first completed refresh closes ready.
+type statsCache struct {
+	mu     sync.Mutex
+	used   int64
+	status supervisor.Status
+	ready  chan struct{}
+}
+
+// refresh recomputes the cached statistics. It may take seconds (volume
+// status request, data dir walk): only call it from the background loop.
+func (c *statsCache) refresh(dataDir string, sup *supervisor.Supervisor) {
+	status := sup.FetchStatus(5 * time.Second)
+	used := dirSize(dataDir)
+	c.mu.Lock()
+	c.used = used
+	c.status = status
+	c.mu.Unlock()
+	select {
+	case <-c.ready:
+	default:
+		close(c.ready)
+	}
+}
+
+func (c *statsCache) get() (used int64, status supervisor.Status) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.used, c.status
+}
+
+// statsLoop refreshes the statistics cache every 30 seconds in the background.
+func statsLoop(ctx context.Context, cache *statsCache, sup *supervisor.Supervisor, dataDir string) {
+	cache.refresh(dataDir, sup) // first sample right away
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cache.refresh(dataDir, sup)
+		}
+	}
+}
+
+// heartbeatLoop sends a heartbeat every interval, starting immediately.
+func heartbeatLoop(ctx context.Context, client *api.Client, cfg *config.Config, sup *supervisor.Supervisor, st *agentState, cache *statsCache) {
 	interval := time.Duration(cfg.HeartbeatIntervalSec) * time.Second
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
+	// Give the first statistics sample up to 5 seconds; the heartbeat must
+	// not be held hostage by a slow volume server or a huge data directory.
+	select {
+	case <-cache.ready:
+	case <-time.After(5 * time.Second):
+	case <-ctx.Done():
+		return
+	}
+	sendHeartbeat(ctx, client, cfg, sup, st, cache)
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
-	lastIP := ip
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("agent: stopping")
-			return sup.Stop()
+			return
 		case <-ticker.C:
-			// IP changed => re-register and restart the volume server.
+			sendHeartbeat(ctx, client, cfg, sup, st, cache)
+		}
+	}
+}
+
+// sendHeartbeat reports the cached statistics; on a heartbeat error it
+// re-registers to recover (the control plane registry is in-memory).
+func sendHeartbeat(ctx context.Context, client *api.Client, cfg *config.Config, sup *supervisor.Supervisor, st *agentState, cache *statsCache) {
+	used, status := cache.get()
+	free := cfg.CapacityBytes - used
+	if free < 0 {
+		free = 0
+	}
+	state := "online"
+	if !status.Alive {
+		state = "degraded"
+	} else if used >= cfg.CapacityBytes {
+		state = "degraded" // storage quota exhausted
+	}
+	hb := api.HeartbeatRequest{
+		Status:            state,
+		DiskFreeBytes:     free,
+		DiskUsedBytes:     used,
+		VolumeServerAlive: status.Alive,
+		VolumesCount:      status.VolumesCount,
+		EcShardsCount:     status.EcShardsCount,
+	}
+	if err := client.Heartbeat(ctx, cfg.NodeID, hb); err != nil {
+		fmt.Printf("agent: heartbeat error: %v\n", err)
+		// The control plane keeps its node registry in memory and
+		// forgets nodes on restart; re-register to recover.
+		ip, _ := st.snapshot()
+		newCfg, rerr := register(ctx, client, cfg, ip)
+		if rerr != nil {
+			fmt.Printf("agent: re-register failed: %v\n", rerr)
+			return
+		}
+		applyVolumeConfig(sup, cfg, newCfg)
+		fmt.Println("agent: re-registered after heartbeat error")
+	}
+}
+
+// applyVolumeConfig restarts the volume server if the new config differs.
+func applyVolumeConfig(sup *supervisor.Supervisor, cfg *config.Config, volCfg *api.VolumeConfig) {
+	volArgs := sup.Args()
+	newPort := pickPort(volCfg.VolumePort, cfg.Port)
+	newMax := pickMax(cfg.MaxVolumes, volCfg.MaxVolumes)
+	newDisk := pickDisk(cfg.DiskType, volCfg.DiskType)
+	newRack := pickRack(cfg.Rack, volCfg.Rack)
+	if volArgs.Master != volCfg.Master || volArgs.Port != newPort ||
+		volArgs.MaxVolumes != newMax || volArgs.DiskType != newDisk ||
+		volArgs.Rack != newRack {
+		volArgs.Master = volCfg.Master
+		volArgs.Port = newPort
+		volArgs.MaxVolumes = newMax
+		volArgs.DiskType = newDisk
+		volArgs.Rack = newRack
+		if err := sup.Restart(volArgs, 2*time.Second); err != nil {
+			fmt.Printf("agent: restart after re-register failed: %v\n", err)
+		}
+	}
+}
+
+// ipWatchLoop re-registers and restarts the volume server when the local IP
+// changes (DHCP renew). Runs in its own goroutine so it never delays a
+// heartbeat.
+func ipWatchLoop(ctx context.Context, client *api.Client, cfg *config.Config, sup *supervisor.Supervisor, st *agentState) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 			newIP, err := supervisor.DetectIP()
-			if err == nil && newIP != lastIP {
-				fmt.Printf("agent: IP changed %s -> %s, re-registering\n", lastIP, newIP)
-				volCfg, err = register(ctx, client, cfg, newIP)
-				if err != nil {
-					fmt.Printf("agent: re-register failed: %v\n", err)
-					continue
-				}
-				lastIP = newIP
-				volArgs := sup.Args()
-				volArgs.IP = newIP
-				if err := sup.Restart(volArgs, 2*time.Second); err != nil {
-					fmt.Printf("agent: restart after IP change failed: %v\n", err)
-				}
+			if err != nil {
 				continue
 			}
-
-			// Heartbeat with live statistics.
-			hb := heartbeatPayload(sup, dataDir, cfg.CapacityBytes)
-			if err := client.Heartbeat(ctx, cfg.NodeID, hb); err != nil {
-				fmt.Printf("agent: heartbeat error: %v\n", err)
-				// The control plane keeps its node registry in memory and
-				// forgets nodes on restart; re-register to recover.
-				newCfg, rerr := register(ctx, client, cfg, lastIP)
-				if rerr != nil {
-					fmt.Printf("agent: re-register failed: %v\n", rerr)
-					continue
-				}
-				volCfg = newCfg
-				volArgs := sup.Args()
-				newPort := pickPort(volCfg.VolumePort, cfg.Port)
-				newMax := pickMax(cfg.MaxVolumes, volCfg.MaxVolumes)
-				newDisk := pickDisk(cfg.DiskType, volCfg.DiskType)
-				newRack := pickRack(cfg.Rack, volCfg.Rack)
-				if volArgs.Master != volCfg.Master || volArgs.Port != newPort ||
-					volArgs.MaxVolumes != newMax || volArgs.DiskType != newDisk ||
-					volArgs.Rack != newRack {
-					volArgs.Master = volCfg.Master
-					volArgs.Port = newPort
-					volArgs.MaxVolumes = newMax
-					volArgs.DiskType = newDisk
-					volArgs.Rack = newRack
-					if err := sup.Restart(volArgs, 2*time.Second); err != nil {
-						fmt.Printf("agent: restart after re-register failed: %v\n", err)
-					}
-				}
-				fmt.Println("agent: re-registered after heartbeat error")
+			lastIP, _ := st.snapshot()
+			if newIP == lastIP {
+				continue
+			}
+			fmt.Printf("agent: IP changed %s -> %s, re-registering\n", lastIP, newIP)
+			volCfg, err := register(ctx, client, cfg, newIP)
+			if err != nil {
+				fmt.Printf("agent: re-register failed: %v\n", err)
+				continue
+			}
+			st.mu.Lock()
+			st.lastIP = newIP
+			st.volCfg = volCfg
+			st.mu.Unlock()
+			volArgs := sup.Args()
+			volArgs.IP = newIP
+			if err := sup.Restart(volArgs, 2*time.Second); err != nil {
+				fmt.Printf("agent: restart after IP change failed: %v\n", err)
 			}
 		}
 	}
@@ -184,6 +321,7 @@ func register(ctx context.Context, client *api.Client, cfg *config.Config, ip st
 		Zone:          cfg.Zone,
 		IP:            ip,
 		OS:            runtime.GOOS,
+		OSVersion:     osVersion(),
 		Arch:          runtime.GOARCH,
 	})
 	if err != nil {
@@ -193,33 +331,6 @@ func register(ctx context.Context, client *api.Client, cfg *config.Config, ip st
 		fmt.Printf("agent: server warning: %s\n", resp.Warning)
 	}
 	return &resp.Volume, nil
-}
-
-// heartbeatPayload collects volume server statistics and reports storage
-// usage against the configured quota: used = bytes actually stored by the
-// agent, free = remaining quota (capacity - used). The node is marked
-// degraded once the quota is exhausted.
-func heartbeatPayload(sup *supervisor.Supervisor, dataDir string, capacityBytes int64) api.HeartbeatRequest {
-	status := sup.FetchStatus(2 * time.Second)
-	used := dirSize(dataDir)
-	free := capacityBytes - used
-	if free < 0 {
-		free = 0
-	}
-	state := "online"
-	if !status.Alive {
-		state = "degraded"
-	} else if used >= capacityBytes {
-		state = "degraded" // storage quota exhausted
-	}
-	return api.HeartbeatRequest{
-		Status:            state,
-		DiskFreeBytes:     free,
-		DiskUsedBytes:     used,
-		VolumeServerAlive: status.Alive,
-		VolumesCount:      status.VolumesCount,
-		EcShardsCount:     status.EcShardsCount,
-	}
 }
 
 func pickPort(serverPort, localPort int) int {

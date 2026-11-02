@@ -39,7 +39,7 @@
 <div class="card">
  <table id="nodes">
    <thead><tr>
-     <th>Node</th><th>IP:port</th><th>Status</th><th>Last heartbeat</th><th>Disk free</th><th>Volumes</th><th>EC shards</th><th></th>
+     <th>Node</th><th>IP:port</th><th>OS</th><th>Status</th><th>Last heartbeat</th><th>Disk free</th><th>Volumes</th><th>EC shards</th><th></th>
    </tr></thead>
    <tbody></tbody>
  </table>
@@ -84,14 +84,16 @@ async function load(){
   const nt=nodes.map(n=>{
     const cl = n.status === 'online' ? 'ok' : 'offline';
     const badge = '<span class="badge '+cl+'">'+n.status+'</span>';
+    const os = [n.os, n.os_version].filter(Boolean).join(' ');
     return '<tr><td>'+esc(n.node_id)+'</td><td>'+esc(n.ip)+':'+n.volume_port+'</td>'+
+      '<td title="'+esc(n.arch)+'">'+esc(os||'—')+'</td>'+
       '<td>'+badge+'</td>'+
       '<td>'+ago(n.last_heartbeat)+'</td>'+
       '<td>'+fmtBytes(n.disk_free)+'</td>'+
       '<td>'+n.volumes_count+'</td><td>'+n.ec_shards_count+'</td>'+
       '<td><button class="del" data-id="'+esc(n.node_id)+'" title="Delete node permanently">✕</button></td></tr>';
   }).join('');
-  document.querySelector('#nodes tbody').innerHTML = nt || '<tr><td colspan=8>— no nodes registered —</td></tr>';
+  document.querySelector('#nodes tbody').innerHTML = nt || '<tr><td colspan=9>— no nodes registered —</td></tr>';
   const vt=j.volumes.map(v=>'<tr><td>'+esc(v.collection)+'</td><td>'+v.volume_id+'</td>'+
     '<td class="'+v.state.toLowerCase()+'">'+v.state+'</td>'+
     '<td>'+v.available_shards+'/'+v.total_shards+'</td>'+

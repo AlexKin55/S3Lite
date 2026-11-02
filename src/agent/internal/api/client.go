@@ -38,6 +38,7 @@ type RegisterRequest struct {
 	Zone          string `json:"zone"`
 	IP            string `json:"ip"`
 	OS            string `json:"os"`
+	OSVersion     string `json:"os_version"`
 	Arch          string `json:"arch"`
 }
 
