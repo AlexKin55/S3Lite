@@ -93,16 +93,25 @@ echo "BACKUP_DIR=$backup_dir"
 # reinstall of the CURRENT package from the repo — the binaries are
 # re-deployed even when the version is unchanged (same version, new build).
 # ---------------------------------------------------------------------------
+# Refresh repo metadata first: a stale package-manager cache hides freshly
+# published builds (dnf/zypper happily reinstall an old version from cache),
+# which is how nodes could end up "reinstalled" with an outdated agent.
+case "$PM" in
+    dnf)    dnf -y -q --refresh makecache >/dev/null 2>&1 || true ;;
+    zypper) zypper --non-interactive --quiet refresh >/dev/null 2>&1 || true ;;
+    apt)    apt-get update -qq >/dev/null 2>&1 || true ;;
+esac
+
 if [ "$was_installed" = 1 ]; then
     case "$PM" in
-        dnf)    dnf -y -q reinstall "$PKG" ;;
+        dnf)    dnf -y -q --refresh reinstall "$PKG" ;;
         zypper) zypper --non-interactive --quiet install --force "$PKG" ;;
         apt)    DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y "$PKG" ;;
     esac
     echo "REINSTALL_RC=$?"
 else
     case "$PM" in
-        dnf)    dnf -y -q install "$PKG" ;;
+        dnf)    dnf -y -q --refresh install "$PKG" ;;
         zypper) zypper --non-interactive --quiet install "$PKG" ;;
         apt)    DEBIAN_FRONTEND=noninteractive apt-get install -y "$PKG" ;;
     esac
