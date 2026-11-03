@@ -104,7 +104,9 @@ mkdir -p %{buildroot}%{_unitdir}
 mkdir -p %{buildroot}%{_sysconfdir}/s3lite
 mkdir -p %{buildroot}%{_sysconfdir}/s3lite/tls
 mkdir -p %{buildroot}%{_localstatedir}/lib/s3lite
-mkdir -p %{buildroot}%{_localstatedir}/lib/s3lite/master
+for d in master filer admin worker; do
+  mkdir -p "%{buildroot}%{_localstatedir}/lib/s3lite/${d}"
+done
 install -m 0755 src/server/s3lite-server %{buildroot}%{_bindir}/s3lite-server
 install -m 0755 src/s3proxy/s3proxy %{buildroot}%{_bindir}/s3proxy
 for unit in s3lite-server s3lite-master s3lite-filer s3lite-s3 s3lite-admin s3lite-ecworker s3lite-s3proxy; do
@@ -189,10 +191,10 @@ exit 0
 %dir %attr(0750,root,root) %{_localstatedir}/lib/s3lite
 %dir %attr(0750,root,root) %{_localstatedir}/lib/s3lite/master
 %dir %attr(0750,root,root) %{_sysconfdir}/s3lite/tls
-%doc README.md
+%doc s3lite-src/README.md
 
 %changelog
-* Mon Nov 03 2026 S3Lite <dev@s3lite.dev> - 0.0.4-0
+* Tue Nov 03 2026 S3Lite <dev@s3lite.dev> - 0.0.4-0
 - Install-and-run cluster: ship and auto-start filer, S3 gateway, maintenance
   admin (EC task config UI) and EC worker (automatic 6+4 erasure coding)
   along with the master; data under /var/lib/s3lite/{filer,admin,worker}
