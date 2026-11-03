@@ -18,3 +18,6 @@ __pycache__/
 
 # deb/rpm packaging artifacts
 deploy/packaging/dist/
+
+# Agent reinstall run logs (never commit)
+s3lite_agent_reinstall_*.txt
