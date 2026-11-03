@@ -18,7 +18,7 @@
 #   spec must match it (the check in %prep fails the build otherwise).
 #
 Name:           s3lite-server
-Version:        0.0.3
+Version:        0.0.4
 Release:        0
 Summary:        S3Lite distributed S3 storage - control plane server
 License:        Apache-2.0
@@ -93,6 +93,9 @@ export GOCACHE="%{_builddir}/gocache"
 export GOFLAGS=-mod=vendor
 export GOPROXY=off
 (cd src/server && go build -trimpath -ldflags "-s -w" -o s3lite-server ./cmd/server)
+# s3proxy is its own module with stdlib-only dependencies: vendor mode is not
+# needed, and GOPROXY=off proves it (nothing to download).
+(cd src/s3proxy && GOFLAGS= GOPROXY=off go build -trimpath -ldflags "-s -w" -o s3proxy .)
 
 %install
 cd s3lite-src
@@ -103,9 +106,14 @@ mkdir -p %{buildroot}%{_sysconfdir}/s3lite/tls
 mkdir -p %{buildroot}%{_localstatedir}/lib/s3lite
 mkdir -p %{buildroot}%{_localstatedir}/lib/s3lite/master
 install -m 0755 src/server/s3lite-server %{buildroot}%{_bindir}/s3lite-server
-install -m 0644 deploy/obs/server/s3lite-server.service %{buildroot}%{_unitdir}/s3lite-server.service
-install -m 0644 deploy/obs/server/s3lite-master.service %{buildroot}%{_unitdir}/s3lite-master.service
+install -m 0755 src/s3proxy/s3proxy %{buildroot}%{_bindir}/s3proxy
+for unit in s3lite-server s3lite-master s3lite-filer s3lite-s3 s3lite-admin s3lite-ecworker s3lite-s3proxy; do
+  install -m 0644 "deploy/obs/server/${unit}.service" "%{buildroot}%{_unitdir}/${unit}.service"
+done
 install -m 0640 deploy/obs/env/s3lite-server.env %{buildroot}%{_sysconfdir}/s3lite/server.env
+# Default S3 gateway identity config; edit access keys before exposing :8333.
+# Mode 0644: the gateway process runs as the s3lite user and must read it.
+install -m 0644 deploy/obs/env/s3lite-s3.json %{buildroot}%{_sysconfdir}/s3lite/s3.json
 install -D -m 0644 README.md %{buildroot}%{_defaultdocdir}/s3lite-server/README.md
 
 %pre
@@ -120,13 +128,18 @@ exit 0
 
 %post
 install -d -m 0750 -o s3lite -g s3lite %{_localstatedir}/lib/s3lite
-install -d -m 0750 -o s3lite -g s3lite %{_localstatedir}/lib/s3lite/master
+for d in master filer admin worker; do
+  install -d -m 0750 -o s3lite -g s3lite %{_localstatedir}/lib/s3lite/${d}
+done
 install -d -m 0750 %{_sysconfdir}/s3lite/tls
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemctl daemon-reload >/dev/null 2>&1 || :
-  # The master needs no configuration (auto-detects the LAN IP), so it is
-  # enabled AND started right away: the control plane monitor requires it.
-  systemctl enable --now s3lite-master.service >/dev/null 2>&1 || :
+  # Configuration-free services are enabled AND started right away; the
+  # unit files carry the ordering (master -> filer -> s3, master -> admin ->
+  # ecworker, s3 -> s3proxy), so one "enable --now" per unit is enough.
+  for unit in s3lite-master s3lite-filer s3lite-s3 s3lite-admin s3lite-ecworker s3lite-s3proxy; do
+    systemctl enable --now "${unit}.service" >/dev/null 2>&1 || :
+  done
   # Enabled but NOT started: /etc/s3lite/server.env must be configured first.
   systemctl enable s3lite-server.service >/dev/null 2>&1 || :
 fi
@@ -134,8 +147,9 @@ exit 0
 
 %preun
 if [ "$1" = 0 ]; then
-  systemctl disable --now s3lite-master.service >/dev/null 2>&1 || :
-  systemctl disable --now s3lite-server.service >/dev/null 2>&1 || :
+  for unit in s3lite-s3proxy s3lite-ecworker s3lite-admin s3lite-s3 s3lite-filer s3lite-master s3lite-server; do
+    systemctl disable --now "${unit}.service" >/dev/null 2>&1 || :
+  done
   systemctl daemon-reload >/dev/null 2>&1 || :
 fi
 exit 0
@@ -155,10 +169,20 @@ exit 0
 %files
 %defattr(-,root,root)
 %{_bindir}/s3lite-server
+%{_bindir}/s3proxy
 %{_unitdir}/s3lite-server.service
 %{_unitdir}/s3lite-master.service
+%{_unitdir}/s3lite-filer.service
+%{_unitdir}/s3lite-s3.service
+%{_unitdir}/s3lite-admin.service
+%{_unitdir}/s3lite-ecworker.service
+%{_unitdir}/s3lite-s3proxy.service
 %dir %attr(0755,root,root) %{_sysconfdir}/s3lite
 %config(noreplace) %attr(0640,root,root) %{_sysconfdir}/s3lite/server.env
+%config(noreplace) %attr(0644,root,root) %{_sysconfdir}/s3lite/s3.json
+%dir %attr(0750,root,root) %{_localstatedir}/lib/s3lite/filer
+%dir %attr(0750,root,root) %{_localstatedir}/lib/s3lite/admin
+%dir %attr(0750,root,root) %{_localstatedir}/lib/s3lite/worker
 # Ownership is fixed to s3lite:s3lite by the post scriptlet.
 # Keep root:root here so rpm does not auto-generate the
 # user(s3lite)/group(s3lite) dependencies that block first install.
@@ -168,6 +192,16 @@ exit 0
 %doc README.md
 
 %changelog
+* Mon Nov 03 2026 S3Lite <dev@s3lite.dev> - 0.0.4-0
+- Install-and-run cluster: ship and auto-start filer, S3 gateway, maintenance
+  admin (EC task config UI) and EC worker (automatic 6+4 erasure coding)
+  along with the master; data under /var/lib/s3lite/{filer,admin,worker}
+- Ship s3proxy (external S3 endpoint :8333): refuses writes while fewer than
+  -minWriteNodes (default 10 = 6+4) volume servers are online and annotates
+  failed downloads with the PCs to power on
+- Ship default /etc/s3lite/s3.json for the gateway identity config
+- Control plane: configurable min_write_nodes read-only policy, active node
+  count and writable verdict exposed via /api/v1/cluster/status and /metrics
 * Tue Oct 27 2026 S3Lite <dev@s3lite.dev> - 0.0.2-0
 - Remove the shared s3lite-weed package on uninstall when no node agent is
   installed on the same host

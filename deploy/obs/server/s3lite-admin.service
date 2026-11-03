@@ -1,0 +1,27 @@
+[Unit]
+Description=S3Lite SeaweedFS maintenance admin server
+After=network-online.target s3lite-master.service
+Wants=network-online.target s3lite-master.service
+
+# Maintenance control plane for the EC worker: stores task configuration
+# (erasure coding ratio 6+4, scan interval, thresholds) in
+# /var/lib/s3lite/admin and hands jobs to s3lite-ecworker.
+# Listens on 127.0.0.1:12535 (loopback only: the UI/API is unauthenticated).
+
+[Service]
+Type=simple
+User=s3lite
+ExecStart=/usr/bin/weed admin \
+    -port=12535 \
+    -master=127.0.0.1:9333 \
+    -dataDir=/var/lib/s3lite/admin
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

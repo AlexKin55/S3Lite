@@ -1,0 +1,26 @@
+[Unit]
+Description=S3Lite SeaweedFS S3 gateway
+After=network-online.target s3lite-filer.service
+Wants=network-online.target s3lite-filer.service
+
+# The S3 gateway speaks the S3 protocol on :8332 (the external entry point is
+# s3proxy on :8333, which adds the read-only guard and recovery hints).
+# Identity/access configuration lives in /etc/s3lite/s3.json.
+
+[Service]
+Type=simple
+User=s3lite
+ExecStart=/usr/bin/weed s3 \
+    -port=8332 \
+    -filer=127.0.0.1:8888 \
+    -config=/etc/s3lite/s3.json
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

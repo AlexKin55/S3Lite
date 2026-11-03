@@ -41,6 +41,17 @@ type server struct {
 	lastReports atomic.Value // []redundancy.Report
 	lastUpdate  atomic.Value // time.Time
 	lastTopoEC  atomic.Int64 // number of EC volumes in the last snapshot
+	// Volume servers currently listed by the master; drives the cluster-wide
+	// read-only policy (minWriteNodes) consumed by s3proxy.
+	lastActiveNodes atomic.Int64
+	// Last emitted writable verdict, for transition notifications.
+	lastWritable atomic.Bool
+	// Refuse S3 writes while fewer volume servers than this are online
+	// (cluster read-only). 0 disables the guard. Should be >= the EC scheme's
+	// data+parity shard count so a degraded cluster stops accumulating
+	// single-copy data that cannot be encoded yet.
+	minWriteNodes int
+
 	// Placement history: merged per-volume shard layout (see redundancy.Merge).
 	// Keeps nodes that dropped out of the master topology known to the advice
 	// engine so "which PCs to power back on" can name them. Entries that stop
@@ -69,6 +80,7 @@ func main() {
 	masterHTTP := flag.String("master", "192.168.1.9:9333", "SeaweedFS master HTTP address")
 	pollSec := flag.Int("poll", 15, "redundancy poll interval (seconds)")
 	hbTTL := flag.Int("heartbeatTTL", 60, "agent heartbeat TTL (seconds)")
+	minWriteNodes := flag.Int("minWriteNodes", 10, "refuse S3 writes when fewer volume servers are online than this (cluster read-only); 0 disables the guard. Set >= dataShards+parityShards of the EC scheme")
 	webhookURL := flag.String("webhook", "", "webhook URL for notifications (empty = log only)")
 	dc := flag.String("dataCenter", "dc1", "data center name for volume servers")
 	rackBase := flag.String("rackBase", "rack", "rack name prefix")
@@ -97,6 +109,7 @@ func main() {
 			DiskType:   *diskType,
 			PortBase:   *portBase,
 		},
+		minWriteNodes: *minWriteNodes,
 	}
 	srv.lastReports.Store([]*redundancy.Report{})
 	srv.histVolumes = []*redundancy.Volume{}
@@ -161,6 +174,9 @@ func (s *server) evaluate(ctx context.Context) {
 		return
 	}
 	s.volSizeLimitMB = int(limitMB)
+	activeNodes := countTopologyNodes(topo)
+	s.lastActiveNodes.Store(int64(activeNodes))
+	s.notifyWritableChange(activeNodes)
 	online := s.buildOnline(topo)
 	fresh := redundancy.Collect(topo)
 	// Merge the fresh snapshot into the placement history: shard layouts of
@@ -225,6 +241,49 @@ func (s *server) evaluate(ctx context.Context) {
 				r.VolumeID, r.Collection, r.Available, r.Total),
 			Detail: fmt.Sprintf("Data is unrecoverable right now. Restore by turning on: %v",
 				r.NodesToStart),
+			At: time.Now(),
+		})
+	}
+}
+
+// countTopologyNodes returns how many volume servers the master currently lists.
+func countTopologyNodes(topo *master_pb.TopologyInfo) int {
+	n := 0
+	for _, dci := range topo.GetDataCenterInfos() {
+		for _, rack := range dci.GetRackInfos() {
+			n += len(rack.GetDataNodeInfos())
+		}
+	}
+	return n
+}
+
+// clusterWritable implements the read-only policy: writes are allowed while at
+// least minWriteNodes volume servers are online. minWriteNodes <= 0 disables
+// the guard (always writable).
+func clusterWritable(activeNodes, minWriteNodes int) bool {
+	return minWriteNodes <= 0 || activeNodes >= minWriteNodes
+}
+
+// notifyWritableChange emits a notification when the cluster crosses the
+// read-only threshold in either direction.
+func (s *server) notifyWritableChange(activeNodes int) {
+	writable := clusterWritable(activeNodes, s.minWriteNodes)
+	if s.lastWritable.Swap(writable) == writable {
+		return
+	}
+	if writable {
+		s.notifier.Notify("cluster_writable", notify.Event{
+			Kind:    "cluster_writable",
+			Summary: "Cluster is writable again",
+			Detail:  fmt.Sprintf("%d volume servers online (threshold %d).", activeNodes, s.minWriteNodes),
+			At:      time.Now(),
+		})
+	} else {
+		s.notifier.Notify("cluster_writable", notify.Event{
+			Kind:    "cluster_read_only",
+			Summary: "Cluster is now READ-ONLY: not enough nodes",
+			Detail: fmt.Sprintf("Only %d volume servers online, writes are refused until %d are back.",
+				activeNodes, s.minWriteNodes),
 			At: time.Now(),
 		})
 	}
@@ -509,11 +568,15 @@ func (s *server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 			riskC++
 		}
 	}
+	activeNodes := int(s.lastActiveNodes.Load())
 	writeJSON(w, http.StatusOK, map[string]any{
-		"nodes":      len(s.reg.All()),
-		"ec_volumes": map[string]int{"ok": okC, "degraded": degC, "at_risk": riskC, "total": len(reports)},
-		"capacity":   map[string]int64{"total_bytes": totalCap, "used_bytes": usedCap},
-		"updated_at": s.lastUpdate.Load().(time.Time),
+		"nodes":           len(s.reg.All()),
+		"active_nodes":    activeNodes,
+		"min_write_nodes": s.minWriteNodes,
+		"writable":        clusterWritable(activeNodes, s.minWriteNodes),
+		"ec_volumes":      map[string]int{"ok": okC, "degraded": degC, "at_risk": riskC, "total": len(reports)},
+		"capacity":        map[string]int64{"total_bytes": totalCap, "used_bytes": usedCap},
+		"updated_at":      s.lastUpdate.Load().(time.Time),
 	})
 }
 
@@ -552,10 +615,21 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			risk++
 		}
 	}
+	activeNodes := int(s.lastActiveNodes.Load())
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	fmt.Fprintf(w, "# HELP s3lite_nodes_registered Registered nodes in the control plane.\n")
 	fmt.Fprintf(w, "# TYPE s3lite_nodes_registered gauge\n")
 	fmt.Fprintf(w, "s3lite_nodes_registered %d\n", len(s.reg.All()))
+	fmt.Fprintf(w, "# HELP s3lite_active_volume_servers Volume servers currently listed by the master.\n")
+	fmt.Fprintf(w, "# TYPE s3lite_active_volume_servers gauge\n")
+	fmt.Fprintf(w, "s3lite_active_volume_servers %d\n", activeNodes)
+	fmt.Fprintf(w, "# HELP s3lite_cluster_writable Whether S3 writes are currently allowed (min_write_nodes policy).\n")
+	fmt.Fprintf(w, "# TYPE s3lite_cluster_writable gauge\n")
+	if clusterWritable(activeNodes, s.minWriteNodes) {
+		fmt.Fprintf(w, "s3lite_cluster_writable 1\n")
+	} else {
+		fmt.Fprintf(w, "s3lite_cluster_writable 0\n")
+	}
 	fmt.Fprintf(w, "# TYPE s3lite_ec_volumes_by_state gauge\n")
 	fmt.Fprintf(w, "s3lite_ec_volumes_by_state{state=\"ok\"} %d\n", okc)
 	fmt.Fprintf(w, "s3lite_ec_volumes_by_state{state=\"degraded\"} %d\n", deg)

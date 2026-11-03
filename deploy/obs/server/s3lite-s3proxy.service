@@ -1,0 +1,31 @@
+[Unit]
+Description=S3Lite S3 entry-point proxy (read-only guard + recovery hints)
+After=network-online.target s3lite-s3.service
+Wants=network-online.target s3lite-s3.service
+
+# The external S3 endpoint (:8333) in front of the gateway (:8332):
+#   - refuses writes (503 S3LiteClusterReadOnly) while fewer than
+#     -minWriteNodes storage nodes are online (control plane policy);
+#   - turns failed downloads into an S3 error that names the PCs to power on.
+# Fails open when the control plane is unreachable (beyond the 5s state TTL).
+
+[Service]
+Type=simple
+User=s3lite
+Environment=S3PROXY_LISTEN=:8333
+Environment=S3PROXY_UPSTREAM=http://127.0.0.1:8332
+Environment=S3PROXY_CONTROL=http://127.0.0.1:8099
+ExecStart=/usr/bin/s3proxy \
+    -listen=${S3PROXY_LISTEN} \
+    -upstream=${S3PROXY_UPSTREAM} \
+    -control=${S3PROXY_CONTROL}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

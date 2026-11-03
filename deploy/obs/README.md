@@ -14,7 +14,12 @@ packages on [Open Build Service](https://build.opensuse.org).
 | `server/s3lite-server.spec` | Spec for the control plane server package |
 | `server/s3lite-server.service` | systemd unit shipped in the server package |
 | `server/s3lite-master.service` | systemd unit for the bundled SeaweedFS master (installed and started by the server package) |
-| `env/` | conffile templates installed to `/etc/s3lite/*.env` (shared by all distros) |
+| `server/s3lite-filer.service` | SeaweedFS filer (:8888) — file-name to volume mapping, backend of the S3 gateway |
+| `server/s3lite-s3.service` | SeaweedFS S3 gateway (:8332), identity config in `/etc/s3lite/s3.json` |
+| `server/s3lite-admin.service` | maintenance admin (:12535, loopback) — EC task configuration (ratio 6+4, thresholds) |
+| `server/s3lite-ecworker.service` | maintenance worker — automatic 6+4 erasure coding of full, quiet volumes |
+| `server/s3lite-s3proxy.service` | external S3 endpoint (:8333): read-only guard (`min_write_nodes`) + "power on" recovery hints |
+| `env/` | conffile templates installed to `/etc/s3lite/*.env` (shared by all distros); `s3lite-s3.json` is the gateway identity config |
 | `vendor/` | vendored Go dependency bundles (`server.tar.gz`, `seaweedfs.tar.gz`) unpacked in `%prep` — must be present in the OBS sources, they are consumed with `GOFLAGS=-mod=vendor` and no network access |
 
 ## One project, multiple repositories (rpm)
@@ -62,6 +67,22 @@ Adding another distro of the same family (e.g. `openSUSE_Tumbleweed`,
 
   Bumping a version means committing the new value on `main` and slicing it
   into `release`; OBS picks up the new state on its next build.
+
+## What runs after `zypper install s3lite-server`
+
+`%post` enables and starts, in dependency order: `s3lite-master` (SeaweedFS
+master, :9333), `s3lite-filer` (:8888), `s3lite-s3` (gateway, :8332),
+`s3lite-admin` (:12535, loopback only), `s3lite-ecworker` (automatic EC 6+4)
+and `s3lite-s3proxy` (external S3 endpoint, :8333). `s3lite-server` (control
+plane, :8099) is enabled but not started: fill in `/etc/s3lite/server.env`
+(master FQDN, TLS, webhook, `MIN_WRITE_NODES`) first, then
+`systemctl start s3lite-server`.
+
+The external entry point is `:8333` via s3proxy: it refuses writes while
+fewer than `MIN_WRITE_NODES` (default 10 = the 6+4 scheme) volume servers
+are online and annotates failed downloads with the PCs to power on. Edit
+`/etc/s3lite/s3.json` (access keys) before exposing `:8333` beyond the test
+network.
 
 ## Local build check
 

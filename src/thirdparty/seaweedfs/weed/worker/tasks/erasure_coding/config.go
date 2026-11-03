@@ -6,6 +6,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/admin/config"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/worker_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/worker/tasks/base"
 )
 
@@ -19,6 +20,26 @@ type Config struct {
 	PreferredTags    []string `json:"preferred_tags"`
 	ReplicaPlacement string   `json:"replica_placement"` // e.g. "020"; empty falls back to the master default replication
 	StrictPlacement  bool     `json:"strict_placement"`  // fail planning instead of relaxing placement constraints
+	DataShards       int      `json:"data_shards"`       // EC data shards for auto-encoding; <=0 falls back to erasure_coding.DataShardsCount
+	ParityShards     int      `json:"parity_shards"`     // EC parity shards for auto-encoding; <=0 falls back to erasure_coding.ParityShardsCount
+}
+
+// EffectiveDataShards returns the configured data shard count, falling back to
+// the compiled-in default when unset.
+func (c *Config) EffectiveDataShards() int {
+	if c != nil && c.DataShards > 0 {
+		return c.DataShards
+	}
+	return erasure_coding.DataShardsCount
+}
+
+// EffectiveParityShards returns the configured parity shard count, falling back
+// to the compiled-in default when unset.
+func (c *Config) EffectiveParityShards() int {
+	if c != nil && c.ParityShards > 0 {
+		return c.ParityShards
+	}
+	return erasure_coding.ParityShardsCount
 }
 
 // NewDefaultConfig creates a new default erasure coding configuration
@@ -29,11 +50,21 @@ func NewDefaultConfig() *Config {
 			ScanIntervalSeconds: 60 * 60, // 1 hour
 			MaxConcurrent:       1,
 		},
-		QuietForSeconds:  3600, // 1 hour, matching the shell ec.encode -quietFor default
-		FullnessRatio:    0.95, // 95%, matching the shell ec.encode -fullPercent default
+		QuietForSeconds: 3600, // 1 hour, matching the shell ec.encode -quietFor default
+		// 50% instead of the shell's 95% default: tail volumes (the last,
+		// partially filled volume of a collection) must not linger in
+		// single-copy state until they happen to fill up. The quiet period
+		// (no writes for QuietForSeconds) is what makes encoding a
+		// non-full volume safe.
+		FullnessRatio:    0.5,
 		CollectionFilter: "",
-		MinSizeMB:        30, // 30MB (more reasonable than 100MB)
+		MinSizeMB:        10, // 10MB: small tails are still worth encoding
 		PreferredTags:    nil,
+		// Target scheme of this fork (README): 6+4 over 10 nodes. The upstream
+		// compiled-in default is 10+4; pass explicit -dataShards/-parityShards
+		// to `shell ec.encode` for one-off encodes at a different ratio.
+		DataShards:   6,
+		ParityShards: 4,
 	}
 }
 
@@ -105,7 +136,7 @@ func GetConfigSpec() base.ConfigSpec {
 				Name:         "fullness_ratio",
 				JSONName:     "fullness_ratio",
 				Type:         config.FieldTypeFloat,
-				DefaultValue: 0.95,
+				DefaultValue: 0.5,
 				MinValue:     0.0001,
 				MaxValue:     1.0,
 				Required:     true,
@@ -134,7 +165,7 @@ func GetConfigSpec() base.ConfigSpec {
 				Name:         "min_size_mb",
 				JSONName:     "min_size_mb",
 				Type:         config.FieldTypeInt,
-				DefaultValue: 30,
+				DefaultValue: 10,
 				MinValue:     1,
 				MaxValue:     1000,
 				Required:     true,
@@ -183,6 +214,34 @@ func GetConfigSpec() base.ConfigSpec {
 				HelpText:     "When enabled, a volume is only encoded if every shard can be placed within the per-disk, anti-affinity, replica-placement and per-rack caps, so the configured resilience is preserved. When disabled (default), unsatisfiable constraints are relaxed and noted in the log",
 				InputType:    "checkbox",
 				CSSClasses:   "form-check-input",
+			},
+			{
+				Name:         "data_shards",
+				JSONName:     "data_shards",
+				Type:         config.FieldTypeInt,
+				DefaultValue: 6,
+				MinValue:     1,
+				MaxValue:     31,
+				Required:     false,
+				DisplayName:  "Data Shards (k)",
+				Description:  "Number of EC data shards for automatic encoding",
+				HelpText:     "The target erasure-coding scheme is k+m (e.g. 6+4 = 10 shards over 10 nodes, survives the loss of 4). 0 falls back to the compiled-in default",
+				InputType:    "number",
+				CSSClasses:   "form-control",
+			},
+			{
+				Name:         "parity_shards",
+				JSONName:     "parity_shards",
+				Type:         config.FieldTypeInt,
+				DefaultValue: 4,
+				MinValue:     1,
+				MaxValue:     31,
+				Required:     false,
+				DisplayName:  "Parity Shards (m)",
+				Description:  "Number of EC parity shards for automatic encoding",
+				HelpText:     "The cluster must have at least this many active nodes, and k+m must not exceed 32",
+				InputType:    "number",
+				CSSClasses:   "form-control",
 			},
 		},
 	}

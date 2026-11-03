@@ -2,6 +2,7 @@
 #
 # Local SeaweedFS test cluster (single host, distinct ports):
 #   master (9333) + volume servers x10 (8081..8090) + filer (8888) + S3 gateway (8333)
+#   + admin server (12535) + maintenance worker (auto erasure coding 6+4)
 #
 # Each volume server emulates a separate PC node: its own data directory,
 # its own port, its own rack. Future EC 6+4 needs >= 10 nodes.
@@ -29,6 +30,12 @@ S3_PORT=8333
 S3_UPSTREAM_PORT=8332
 VOLUME_BASE_PORT=8081
 VOLUME_COUNT=10
+ADMIN_PORT=12535
+# Automatic erasure coding scheme (k+m): the maintenance worker encodes full,
+# quiet volumes so data is spread over k+m shards across the nodes
+# (6 data + 4 parity = survives the loss of 4 nodes).
+EC_DATA_SHARDS=6
+EC_PARITY_SHARDS=4
 
 # Node address in the cluster. 127.0.0.1 is avoided: newer SeaweedFS versions
 # reject inner RPCs to loopback addresses (SSRF protection).
@@ -63,7 +70,7 @@ start() {
     return 0
   fi
 
-  echo "==> Starting SeaweedFS cluster: master:${MASTER_PORT}, volume x${count} (${VOLUME_BASE_PORT}..$((VOLUME_BASE_PORT + count - 1))), filer:${FILER_PORT}, s3:${S3_PORT}"
+  echo "==> Starting SeaweedFS cluster: master:${MASTER_PORT}, volume x${count} (${VOLUME_BASE_PORT}..$((VOLUME_BASE_PORT + count - 1))), filer:${FILER_PORT}, s3:${S3_PORT}, admin:${ADMIN_PORT} (EC ${EC_DATA_SHARDS}+${EC_PARITY_SHARDS})"
 
   run_bg master "${WEED}" master \
     -port="${MASTER_PORT}" \
@@ -97,6 +104,26 @@ start() {
     -config="${PROJECT_ROOT}/src/thirdparty/seaweedfs/docker/compose/s3.json"
 
   sleep 1
+  # Admin server: maintenance control plane the worker connects to. Its data
+  # dir persists task configuration, incl. the EC data/parity shard counts
+  # (defaults: 6+4, adjustable via the admin UI on :12535).
+  mkdir -p "${CLUSTER_DIR}/admin"
+  run_bg admin "${WEED}" admin \
+    -port="${ADMIN_PORT}" \
+    -master="127.0.0.1:${MASTER_PORT}" \
+    -dataDir="${CLUSTER_DIR}/admin"
+  wait_tcp "${ADMIN_PORT}"
+
+  # Maintenance worker: runs automatic erasure coding. Full, quiet volumes are
+  # encoded into EC 6+4 (10 shards over 10 nodes; any 6 shards restore the
+  # data, so up to 4 nodes may fail) and the shards are spread across nodes.
+  mkdir -p "${CLUSTER_DIR}/worker"
+  run_bg ecworker "${WEED}" worker \
+    -admin="127.0.0.1:${ADMIN_PORT}" \
+    -jobType=erasure_coding \
+    -workingDir="${CLUSTER_DIR}/worker"
+
+  sleep 1
   # Thin S3 proxy in front of the gateway: turns 5xx downloads into an S3
   # error that names the offline PCs to power on (via the control plane).
   run_bg s3proxy "${PROJECT_ROOT}/bin/s3proxy" \
@@ -117,10 +144,23 @@ start() {
   status
 }
 
+wait_tcp() {
+  local port="$1"
+  for _ in $(seq 1 20); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+      exec 3>&- 3<&- 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "WARNING: port ${port} did not open within 10s" >&2
+  return 0
+}
+
 stop() {
   echo "==> Stopping the cluster..."
-  # Stop in reverse order: s3proxy, s3, filer, volumeN..volume1, master
-  local names=(s3proxy s3 filer)
+  # Stop in reverse order: ecworker, admin, s3proxy, s3, filer, volumeN..volume1, master
+  local names=(ecworker admin s3proxy s3 filer)
   for i in $(seq "${VOLUME_COUNT}" -1 1); do
     names+=("volume${i}")
   done
@@ -168,6 +208,7 @@ status() {
   echo "  master: http://localhost:${MASTER_PORT}/ui/index.html"
   echo "  filer:  http://localhost:${FILER_PORT}/ui/index.html"
   echo "  s3:     http://localhost:${S3_PORT} (via s3proxy, upstream :${S3_UPSTREAM_PORT})"
+  echo "  admin:  http://localhost:${ADMIN_PORT} (maintenance UI; EC worker auto-encodes 6+4)"
   if curl -sf "http://127.0.0.1:${MASTER_PORT}/cluster/status" 2>/dev/null | head -c 400 >/dev/null; then
     echo
     echo "  Master topology (live volume servers):"

@@ -11,13 +11,16 @@ Environment=MASTER=127.0.0.1:9333
 Environment=TLS_CERT=
 Environment=TLS_KEY=
 Environment=WEBHOOK=
+# Cluster read-only threshold (see /etc/s3lite/server.env); 0 disables it.
+Environment=MIN_WRITE_NODES=10
 EnvironmentFile=-/etc/s3lite/server.env
 ExecStart=/usr/bin/s3lite-server \
     -listen=${LISTEN} \
     -master=${MASTER} \
     -tlsCert=${TLS_CERT} \
     -tlsKey=${TLS_KEY} \
-    -webhook=${WEBHOOK}
+    -webhook=${WEBHOOK} \
+    -minWriteNodes=${MIN_WRITE_NODES}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536

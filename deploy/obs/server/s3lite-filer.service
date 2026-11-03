@@ -1,0 +1,33 @@
+[Unit]
+Description=S3Lite SeaweedFS filer
+After=network-online.target s3lite-master.service
+Wants=network-online.target s3lite-master.service
+
+# The filer owns the file-name -> volume mapping (filer store in
+# /var/lib/s3lite/filer) and is the backend of the S3 gateway.
+#
+# DEFAULT_REPLICATION controls the replica placement of NEW volumes before
+# they get erasure-coded (the EC worker converts full volumes to 6+4
+# automatically). "000" = single copy (small storage footprint, data is
+# protected only after EC encoding); "010" = two copies on different racks
+# (recommended when nodes can disappear for hours).
+
+[Service]
+Type=simple
+User=s3lite
+Environment=DEFAULT_REPLICATION=000
+ExecStart=/usr/bin/weed filer \
+    -port=8888 \
+    -master=127.0.0.1:9333 \
+    -defaultReplication=${DEFAULT_REPLICATION} \
+    -dir=/var/lib/s3lite/filer
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
