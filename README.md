@@ -115,3 +115,10 @@ python3 src/tests/integration.py          # all cases A–E
 python3 src/tests/integration.py -c A,B  # selected cases
 python3 src/tests/integration_webhook.py # webhook delivery check (TODO-3)
 ```
+
+## Releases
+
+```
+https://build.opensuse.org/project/show/home:Alex55
+```
+
