@@ -1,3 +1,3 @@
 module s3lite.dev/s3proxy
 
-go 1.27.0
+go 1.26.0
