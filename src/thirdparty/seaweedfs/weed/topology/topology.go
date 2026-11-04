@@ -46,6 +46,12 @@ type Topology struct {
 	ecShardMap     map[needle.VolumeId]*EcShardLocations
 	ecShardMapLock sync.RWMutex
 
+	// preferredNodes is the operator-declared set of volume server addresses
+	// ("ip:port") that should receive new volume replicas before regular
+	// servers (see topology/preferred_nodes.go). nil/empty = no preference.
+	preferredNodesLock sync.RWMutex
+	preferredNodes     map[string]struct{}
+
 	pulse int64
 
 	volumeSizeLimit          uint64
@@ -796,7 +802,6 @@ func ttlEqual(a, b *needle.TTL) bool {
 	}
 	return a.ToUint32() == b.ToUint32()
 }
-
 
 // findDuplicateVolumeLayouts reports every layout that already holds v.Id on
 // data nodes other than dn. Volume ids are global, so the same id held by two

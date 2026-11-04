@@ -1,0 +1,33 @@
+# Declarative maintenance policy for `weed admin` (installed as
+# /etc/s3lite/admin.toml). Applied at every admin startup and written through
+# to the persisted task config, so these values override changes made in the
+# admin UI on each restart — edit this file, not the UI.
+# The EC worker (s3lite-ecworker) reads the resulting policy from the admin.
+#
+# Intended lifecycle: volumes are written 3x-replicated (master
+# -defaultReplication=020); ~5 minutes after writes stop the worker checks
+# the volume, and if it holds enough data it is erasure-coded into 6+4
+# shards spread across the nodes, after which the raw replicas are deleted.
+
+[maintenance]
+enabled = true
+
+[maintenance.erasure_coding]
+# Encode a volume once it has received no writes for this long. 60 s is the
+# earliest safe value: the filer chunks uploads into 4 MB pieces, and a
+# pause longer than a minute between chunks would otherwise race the coder.
+quiet_for_seconds = 300
+# Coefficient of the volume size limit after which a quiet volume is worth
+# encoding. 0.04 x 500 MB = 20 MB: any quiet volume with real data gets
+# encoded, so small files reach every node within minutes.
+fullness_ratio = 0.04
+# Never encode volumes smaller than this (MB).
+min_size_mb = 10
+# How often the worker scans for candidates. Worst-case delay between the
+# last write and the start of encoding is scan interval + quiet period.
+scan_interval_seconds = 300
+# Parallel encode jobs (each copies a raw volume, generates 6+4 shards,
+# distributes them and deletes the source replicas).
+max_concurrent = 2
+# EC shard scheme: the 6+4 ratio is the compiled-in default of this fork
+# and is not configurable at runtime.

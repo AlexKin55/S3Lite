@@ -208,13 +208,21 @@ func (n *NodeImpl) PickNodesByWeight(numberOfNodes int, option *VolumeGrowOption
 	candidates := make([]Node, 0, len(n.children))
 	candidatesWeights := make([]int64, 0, len(n.children))
 	//pick nodes which has enough free volumes as candidates, and use free volumes number as node weight.
+	// Candidates that are (or contain) an operator-preferred data node get a
+	// dominant weight boost, so preferred servers receive new replicas first;
+	// when they run out of free slots their weight is 0 and regular servers
+	// take over. See topology/preferred_nodes.go.
 	for _, node := range n.children {
-		if node.AvailableSpaceFor(option) <= 0 {
+		weight := node.AvailableSpaceFor(option)
+		if weight <= 0 {
 			continue
 		}
-		totalWeights += node.AvailableSpaceFor(option)
+		if containsPreferredDataNode(node) {
+			weight *= PreferredNodeWeightBoost
+		}
+		totalWeights += weight
 		candidates = append(candidates, node)
-		candidatesWeights = append(candidatesWeights, node.AvailableSpaceFor(option))
+		candidatesWeights = append(candidatesWeights, weight)
 	}
 	n.RUnlock()
 	if len(candidates) < numberOfNodes {

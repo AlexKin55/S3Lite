@@ -36,6 +36,17 @@ ADMIN_PORT=12535
 # (6 data + 4 parity = survives the loss of 4 nodes).
 EC_DATA_SHARDS=6
 EC_PARITY_SHARDS=4
+# Default replication for new volumes: 3 copies on 3 different racks, so
+# every write is fault tolerant from the first second; the maintenance
+# worker replaces the raw replicas with EC shards ~5 minutes after writes
+# stop. Mirrors -defaultReplication=020 shipped in s3lite-master.service.
+DEFAULT_REPLICATION=020
+# Quiet period (seconds) before a volume is erasure-coded, mirroring
+# /etc/s3lite/admin.toml of the packaged deployment.
+EC_QUIET_SECONDS=300
+# Volume fullness ratio below which quiet volumes are not encoded.
+EC_FULLNESS_RATIO=0.04
+EC_SCAN_INTERVAL_SECONDS=300
 
 # Node address in the cluster. 127.0.0.1 is avoided: newer SeaweedFS versions
 # reject inner RPCs to loopback addresses (SSRF protection).
@@ -72,10 +83,16 @@ start() {
 
   echo "==> Starting SeaweedFS cluster: master:${MASTER_PORT}, volume x${count} (${VOLUME_BASE_PORT}..$((VOLUME_BASE_PORT + count - 1))), filer:${FILER_PORT}, s3:${S3_PORT}, admin:${ADMIN_PORT} (EC ${EC_DATA_SHARDS}+${EC_PARITY_SHARDS})"
 
+  # -preferredNodesFile is the preferred-replica list; in production the
+  # control plane (s3lite-server dashboard ★ toggle) writes it and the
+  # master re-reads it periodically. Locally it can be edited by hand.
+  : >"${CLUSTER_DIR}/preferred-nodes.txt"
   run_bg master "${WEED}" master \
     -port="${MASTER_PORT}" \
     -mdir="${DATA_DIR}/master" \
-    -volumeSizeLimitMB="${VOLUME_SIZE_LIMIT_MB}"
+    -volumeSizeLimitMB="${VOLUME_SIZE_LIMIT_MB}" \
+    -defaultReplication="${DEFAULT_REPLICATION}" \
+    -preferredNodesFile="${CLUSTER_DIR}/preferred-nodes.txt"
 
   sleep 1
   for i in $(seq 1 "${count}"); do
@@ -106,9 +123,24 @@ start() {
   sleep 1
   # Admin server: maintenance control plane the worker connects to. Its data
   # dir persists task configuration, incl. the EC data/parity shard counts
-  # (defaults: 6+4, adjustable via the admin UI on :12535).
+  # (defaults: 6+4, adjustable via the admin UI on :12535). The declarative
+  # admin.toml (mirroring /etc/s3lite/admin.toml of the packaged deployment)
+  # is applied at every startup and overrides UI edits, so the local stand
+  # behaves like production: 3x replication is encoded into EC shards
+  # ~5 minutes after writes stop.
   mkdir -p "${CLUSTER_DIR}/admin"
-  run_bg admin "${WEED}" admin \
+  cat >"${CLUSTER_DIR}/admin.toml" <<EOF
+[maintenance]
+enabled = true
+
+[maintenance.erasure_coding]
+quiet_for_seconds = ${EC_QUIET_SECONDS}
+fullness_ratio = ${EC_FULLNESS_RATIO}
+min_size_mb = 10
+scan_interval_seconds = ${EC_SCAN_INTERVAL_SECONDS}
+max_concurrent = 2
+EOF
+  run_bg admin "${WEED}" -config_dir="${CLUSTER_DIR}" admin \
     -port="${ADMIN_PORT}" \
     -master="127.0.0.1:${MASTER_PORT}" \
     -dataDir="${CLUSTER_DIR}/admin"

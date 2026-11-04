@@ -3,10 +3,12 @@ Description=S3Lite maintenance worker (automatic erasure coding 6+4)
 After=network-online.target s3lite-admin.service
 Requires=s3lite-admin.service
 
-# Scans the cluster every 30 minutes and erasure-codes full, quiet volumes
+# Scans the cluster for erasure-coding candidates and encodes quiet volumes
 # into EC 6+4 (10 shards spread across 10 different nodes; the data survives
-# the loss of up to 4 nodes). The shard ratio and thresholds are configured
-# in the admin UI on 127.0.0.1:12535.
+# the loss of up to 4 nodes), then deletes the raw source replicas. The scan
+# interval and thresholds come from the declarative policy in
+# /etc/s3lite/admin.toml (see s3lite-admin.service); the shard ratio 6+4 is
+# the compiled-in default of this fork.
 
 [Service]
 Type=simple

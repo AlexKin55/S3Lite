@@ -11,7 +11,10 @@ Wants=network-online.target s3lite-master.service
 [Service]
 Type=simple
 User=s3lite
-ExecStart=/usr/bin/weed admin \
+# -config_dir points the global toml config search at /etc/s3lite, so the
+# declarative maintenance policy (s3lite-admin.toml -> admin.toml) overrides
+# admin UI edits at every startup.
+ExecStart=/usr/bin/weed -config_dir=/etc/s3lite admin \
     -port=12535 \
     -master=127.0.0.1:9333 \
     -dataDir=/var/lib/s3lite/admin

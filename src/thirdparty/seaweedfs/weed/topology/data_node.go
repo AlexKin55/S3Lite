@@ -23,6 +23,12 @@ type DataNode struct {
 	Counter       int   // in race condition, the previous dataNode was not dead
 	IsTerminating bool
 
+	// preferred marks a volume server that should receive new volume
+	// replicas before regular servers (operator-declared "reliable" node).
+	// Set via Topology.SetPreferredDataNodes; consulted by the replica
+	// placement weight in PickNodesByWeight.
+	preferred atomic.Bool
+
 	// maintenanceMode mirrors the volume server's own flag, reported over the
 	// heartbeat. A server in maintenance is being drained: the master places
 	// no new volumes on it and assigns no writes to the volumes it holds. Read
@@ -66,6 +72,17 @@ func (dn *DataNode) String() string {
 // for writes; see Topology.SetDataNodeMaintenanceMode for what that changes.
 func (dn *DataNode) InMaintenanceMode() bool {
 	return dn.maintenanceMode.Load()
+}
+
+// IsPreferred reports whether this volume server is flagged as a preferred
+// replica target (see Topology.SetPreferredDataNodes).
+func (dn *DataNode) IsPreferred() bool {
+	return dn.preferred.Load()
+}
+
+// SetPreferred records the preferred flag; see Topology.SetPreferredDataNodes.
+func (dn *DataNode) SetPreferred(on bool) {
+	dn.preferred.Store(on)
 }
 
 // SetMaintenanceMode records the flag and reports whether it changed. Prefer

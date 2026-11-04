@@ -47,6 +47,11 @@
   button { background:#0ea5e9; color:#fff; border:0; border-radius:6px; padding:8px 14px; cursor:pointer; font-size:13px;}
   button.del { background:#7f1d1d; padding:4px 10px; }
   button.del:hover { background:#ef4444; }
+  button.pref { background:#334155; padding:3px 9px; font-size:13px; }
+  button.pref.on { background:#ca8a04; }
+  button.pref:hover { background:#475569; }
+  button.pref.on:hover { background:#eab308; }
+  button.pref:disabled { background:#475569; cursor:wait; }
   button.upd { background:#b45309; padding:3px 9px; font-size:11px; margin-left:8px; vertical-align:middle; }
   button.upd:hover { background:#f59e0b; }
   button.upd:disabled { background:#475569; cursor:wait; }
@@ -65,7 +70,7 @@
 <div class="card">
  <table id="nodes">
    <thead><tr>
-     <th></th><th>Node</th><th>IP:port</th><th>OS</th><th>Status</th><th>Disk</th><th>Last heartbeat</th><th>Volumes</th><th>EC shards</th><th></th>
+     <th></th><th>Node</th><th>IP:port</th><th>OS</th><th>Status</th><th>Disk</th><th>Last heartbeat</th><th>Volumes</th><th>EC shards</th><th title="Preferred replica target: the master places new raw replicas here first (before EC coding); falls back to regular nodes">★</th><th></th>
    </tr></thead>
    <tbody></tbody>
  </table>
@@ -164,11 +169,12 @@ async function load(){
       '<td class="diskcell">'+diskBar(n.disk_used, n.capacity_bytes)+'</td>'+
       '<td>'+ago(n.last_heartbeat)+'</td>'+
       '<td>'+n.volumes_count+'</td><td>'+n.ec_shards_count+'</td>'+
+      '<td><button class="pref'+(n.preferred?' on':'')+'" data-pref="'+esc(n.node_id)+'" title="Preferred replica target: new raw replicas are placed on this node first (before EC coding)">★</button></td>'+
       '<td><button class="del" data-id="'+esc(n.node_id)+'" title="Delete node permanently">✕</button></td></tr>'+
-      (detail ? '<tr class="detail-row"'+(isOpen?'':' hidden')+'><td colspan="10"><div class="detail-grid">'+detail+'</div>'+
+      (detail ? '<tr class="detail-row"'+(isOpen?'':' hidden')+'><td colspan="11"><div class="detail-grid">'+detail+'</div>'+
         (n.log_tail ? '<div class="logtail">'+esc(n.log_tail)+'</div>' : '')+'</td></tr>' : '');
   }).join('');
-  document.querySelector('#nodes tbody').innerHTML = nt || '<tr><td colspan=10>— no nodes registered —</td></tr>';
+  document.querySelector('#nodes tbody').innerHTML = nt || '<tr><td colspan=11>— no nodes registered —</td></tr>';
   const vt=j.volumes.map(v=>'<tr><td>'+esc(v.collection)+'</td><td>'+v.volume_id+'</td>'+
     '<td>'+(v.data_shards?+(v.data_shards)+'+'+(v.parity_shards||0):'—')+'</td>'+
     '<td class="'+v.state.toLowerCase()+'">'+v.state+'</td>'+
@@ -182,6 +188,7 @@ async function load(){
 document.querySelector('#nodes tbody').addEventListener('click', async (e)=>{
   if(e.target.closest('button.del')) return;
   if(e.target.closest('button.upd')) return;
+  if(e.target.closest('button.pref')) return;
   const row = e.target.closest('tr.node-row');
   if(!row) return;
   const det = row.nextElementSibling;
@@ -219,6 +226,25 @@ document.querySelector('#nodes tbody').addEventListener('click', async (e)=>{
   document.getElementById('del-result').textContent = r.ok
     ? 'agent update requested for "'+id+'" ✓ (starts on its next heartbeat)'
     : 'agent update request failed';
+  load();
+});
+// "Preferred node" toggle (★ column): the node receives new raw replicas
+// first during the pre-EC phase; the master falls back to regular nodes
+// when preferred ones run out of free slots.
+document.querySelector('#nodes tbody').addEventListener('click', async (e)=>{
+  const btn = e.target.closest('button.pref');
+  if(!btn) return;
+  const id = btn.dataset.pref;
+  const turnOn = !btn.classList.contains('on');
+  btn.disabled = true;
+  const r = await fetch('/api/v1/nodes/'+encodeURIComponent(id)+'/preferred', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({preferred: turnOn})
+  });
+  btn.disabled = false;
+  document.getElementById('del-result').textContent = r.ok
+    ? '"'+id+'" is '+(turnOn ? 'now a preferred replica target ★' : 'no longer a preferred replica target')
+    : 'preferred toggle failed';
   load();
 });
 setInterval(load, 5000); load();

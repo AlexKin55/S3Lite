@@ -1,7 +1,11 @@
 package store
 
 import (
+	"encoding/json"
+	"net"
+	"os"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -17,17 +21,22 @@ const duplicateWindow = 2 * time.Minute
 
 // Node is the control plane's view of a registered storage node.
 type Node struct {
-	NodeID        string    `json:"node_id"`
-	CapacityBytes int64     `json:"capacity_bytes"`
-	Zone          string    `json:"zone"`
-	IP            string    `json:"ip"`
-	OS            string    `json:"os"`
-	OSVersion     string    `json:"os_version,omitempty"`
-	Arch          string    `json:"arch"`
-	Rack          string    `json:"rack"`
-	VolumePort    int       `json:"volume_port"`
-	FriendlyName  string    `json:"friendly_name,omitempty"`
-	Stability     string    `json:"stability,omitempty"` // "stable" | "unstable"
+	NodeID        string `json:"node_id"`
+	CapacityBytes int64  `json:"capacity_bytes"`
+	Zone          string `json:"zone"`
+	IP            string `json:"ip"`
+	OS            string `json:"os"`
+	OSVersion     string `json:"os_version,omitempty"`
+	Arch          string `json:"arch"`
+	Rack          string `json:"rack"`
+	VolumePort    int    `json:"volume_port"`
+	FriendlyName  string `json:"friendly_name,omitempty"`
+	Stability     string `json:"stability,omitempty"` // "stable" | "unstable"
+	// Preferred marks a node the operator trusts most (rarely switched off):
+	// the SeaweedFS master places new volume replicas on preferred nodes
+	// first, falling back to regular nodes when they are out of free slots.
+	// Applied to the pre-EC (replicated) phase only.
+	Preferred     bool      `json:"preferred,omitempty"`
 	RegisteredAt  time.Time `json:"registered_at"`
 	LastHeartbeat time.Time `json:"last_heartbeat"`
 	Alive         bool      `json:"alive"`
@@ -91,6 +100,13 @@ type Registry struct {
 	nextRack     int
 	portBase     int
 	heartbeatTTL time.Duration
+
+	// statePath persists the operator-set Preferred flags across control
+	// plane restarts (JSON, see SetStatePath). Flags remembered for node
+	// ids that are not (yet) registered live in preferredPending and are
+	// applied when the node registers.
+	statePath        string
+	preferredPending map[string]bool
 }
 
 func NewRegistry(portBase int, heartbeatTTL time.Duration) *Registry {
@@ -164,6 +180,11 @@ func (r *Registry) Register(id string, capacity int64, zone, ip, osName, osVersi
 			Zone:          zone,
 			Rack:          "rack" + itoa(r.nextRack),
 			VolumePort:    r.portBase + r.nextRack - 1,
+		}
+		// A preferred flag remembered before the node registered (state file
+		// loaded at startup) applies to the fresh registration.
+		if r.preferredPending[id] {
+			n.Preferred = true
 		}
 		r.nextRack++
 		r.nodes[id] = n
@@ -281,7 +302,104 @@ func (r *Registry) Delete(id string) bool {
 		return false
 	}
 	delete(r.nodes, id)
+	r.persistStateLocked()
 	return true
+}
+
+// SetPreferred flags a node as a preferred replica target (operator action,
+// dashboard toggle). Returns false if the node id is unknown.
+func (r *Registry) SetPreferred(id string, preferred bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n, ok := r.nodes[id]
+	if !ok {
+		return false
+	}
+	n.Preferred = preferred
+	if !preferred {
+		delete(r.preferredPending, id)
+	} else {
+		if r.preferredPending == nil {
+			r.preferredPending = make(map[string]bool)
+		}
+		r.preferredPending[id] = true
+	}
+	r.persistStateLocked()
+	return true
+}
+
+// PreferredNodeAddrs returns the "ip:port" volume server addresses of all
+// preferred nodes — the format the master's -preferredNodesFile expects.
+func (r *Registry) PreferredNodeAddrs() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []string
+	for _, n := range r.nodes {
+		if n.Preferred && n.IP != "" {
+			out = append(out, net.JoinHostPort(n.IP, strconv.Itoa(n.VolumePort)))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// SetStatePath enables persistence of the Preferred flags in a JSON file and
+// loads the existing state. Flags remembered for not-yet-registered node ids
+// are applied when the node registers.
+func (r *Registry) SetStatePath(path string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.statePath = path
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			// callers log; keep defaults
+		}
+		return
+	}
+	var state struct {
+		Preferred map[string]bool `json:"preferred"`
+	}
+	if err := json.Unmarshal(data, &state); err != nil {
+		return
+	}
+	r.preferredPending = make(map[string]bool, len(state.Preferred))
+	for id, on := range state.Preferred {
+		if !on {
+			continue
+		}
+		if n, ok := r.nodes[id]; ok {
+			n.Preferred = true
+		} else {
+			r.preferredPending[id] = true
+		}
+	}
+}
+
+// persistStateLocked writes the Preferred flags (registered and pending).
+// Callers must hold r.mu.
+func (r *Registry) persistStateLocked() {
+	if r.statePath == "" {
+		return
+	}
+	state := struct {
+		Preferred map[string]bool `json:"preferred"`
+	}{Preferred: make(map[string]bool)}
+	for id, n := range r.nodes {
+		if n.Preferred {
+			state.Preferred[id] = true
+		}
+	}
+	for id := range r.preferredPending {
+		state.Preferred[id] = true
+	}
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(r.statePath, data, 0o644); err != nil {
+		return
+	}
 }
 
 // OnlineIDs returns the node IDs whose agent heartbeat is fresh and whose

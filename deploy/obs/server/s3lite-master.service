@@ -13,14 +13,29 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=s3lite
+EnvironmentFile=-/etc/s3lite/server.env
 # Volume size limit (MB) per volume. Together with the per-node -max handed
-# out by the control plane it caps how much a node can store (STORAGE_SIZE).
-Environment=VOLUME_SIZE_LIMIT_MB=100
+# out by the control plane it caps the RAW (pre-EC) buffer a node can hold:
+# volumes are written 3x-replicated, erasure-coded by the maintenance worker
+# ~5 minutes after writes stop, and the raw replicas are then deleted.
+# 500 MB keeps shards (~85 MB data each) small and lets even lone small
+# files reach every node within minutes.
+Environment=VOLUME_SIZE_LIMIT_MB=500
+# Default replication for new volumes: 3 copies on 3 different racks (each
+# node is its own rack, so on 3 different PCs). Every write is fault tolerant
+# from the first second; the EC worker later replaces the replicas with 6+4
+# shards that survive the loss of up to 4 nodes.
+Environment=DEFAULT_REPLICATION=020
+# -preferredNodesFile is written by the control plane (s3lite-server) from
+# the "preferred node" toggles in its dashboard; the master re-reads it
+# periodically, so toggles apply without a master restart.
 ExecStart=/usr/bin/weed master \
     -port=9333 \
     -mdir=/var/lib/s3lite/master \
     -ip.bind=0.0.0.0 \
-    -volumeSizeLimitMB=${VOLUME_SIZE_LIMIT_MB}
+    -volumeSizeLimitMB=${VOLUME_SIZE_LIMIT_MB} \
+    -defaultReplication=${DEFAULT_REPLICATION} \
+    -preferredNodesFile=/var/lib/s3lite/preferred-nodes.txt
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536

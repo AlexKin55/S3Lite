@@ -113,6 +113,10 @@ for unit in s3lite-server s3lite-master s3lite-filer s3lite-s3 s3lite-admin s3li
   install -m 0644 "deploy/obs/server/${unit}.service" "%{buildroot}%{_unitdir}/${unit}.service"
 done
 install -m 0640 deploy/obs/env/s3lite-server.env %{buildroot}%{_sysconfdir}/s3lite/server.env
+# Declarative maintenance/EC policy: weed admin (started with
+# -config_dir=/etc/s3lite) applies it at every startup, overriding admin UI
+# edits. Mode 0644: the admin process runs as the s3lite user and reads it.
+install -m 0644 deploy/obs/env/s3lite-admin.toml %{buildroot}%{_sysconfdir}/s3lite/admin.toml
 # Default S3 gateway identity config; edit access keys before exposing :8333.
 # Mode 0644: the gateway process runs as the s3lite user and must read it.
 install -m 0644 deploy/obs/env/s3lite-s3.json %{buildroot}%{_sysconfdir}/s3lite/s3.json
@@ -181,6 +185,7 @@ exit 0
 %{_unitdir}/s3lite-s3proxy.service
 %dir %attr(0755,root,root) %{_sysconfdir}/s3lite
 %config(noreplace) %attr(0640,root,root) %{_sysconfdir}/s3lite/server.env
+%config(noreplace) %attr(0644,root,root) %{_sysconfdir}/s3lite/admin.toml
 %config(noreplace) %attr(0644,root,root) %{_sysconfdir}/s3lite/s3.json
 %dir %attr(0750,root,root) %{_localstatedir}/lib/s3lite/filer
 %dir %attr(0750,root,root) %{_localstatedir}/lib/s3lite/admin

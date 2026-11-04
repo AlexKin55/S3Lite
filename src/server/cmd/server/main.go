@@ -8,6 +8,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,6 +30,11 @@ type server struct {
 
 	// Fixed volume parameters handed to agents at registration.
 	volumeCfg VolumeTemplate
+
+	// preferredNodesFile, when set, is kept in sync with the registry's
+	// preferred (operator-trusted) nodes; the SeaweedFS master watches it
+	// via -preferredNodesFile and prefers those servers for new replicas.
+	preferredNodesFile string
 
 	// Volume size limit (MB) reported by the master; used to derive the
 	// per-node max volume count from the node's capacity quota.
@@ -87,6 +94,8 @@ func main() {
 	maxVol := flag.Int("maxVolumes", 8, "max volumes for volume servers")
 	diskType := flag.String("diskType", "hdd", "disk type for volume servers")
 	portBase := flag.Int("portBase", 8080, "starting port for agent volume servers")
+	stateFile := flag.String("stateFile", "", "JSON file persisting operator node flags (preferred replica targets) across restarts")
+	preferredNodesFile := flag.String("preferredNodesFile", "", "File where the preferred volume server address list (\"ip:port\" per line) is published for the master's -preferredNodesFile")
 	flag.Parse()
 
 	reg := store.NewRegistry(*portBase, time.Duration(*hbTTL)*time.Second)
@@ -116,6 +125,15 @@ func main() {
 	srv.histMiss = make(map[redundancy.VolumeKey]int)
 	srv.histMaxMiss = 10 // ~10 polls before a phantom volume is forgotten
 	srv.lastUpdate.Store(time.Time{})
+	srv.preferredNodesFile = *preferredNodesFile
+	if *stateFile != "" {
+		reg.SetStatePath(*stateFile)
+	}
+	if srv.preferredNodesFile != "" {
+		// Publish the loaded state so the master picks up the preference
+		// without waiting for the first toggle.
+		srv.writePreferredNodesFile()
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -413,6 +431,8 @@ func (s *server) handleNodePath(w http.ResponseWriter, r *http.Request) {
 		s.handleHeartbeat(w, r, nodeID)
 	case "config":
 		s.handleNodeConfig(w, r, nodeID)
+	case "preferred":
+		s.handleNodePreferred(w, r, nodeID)
 	case "agent":
 		if len(parts) == 6 && parts[5] == "update" {
 			s.handleAgentUpdate(w, r, nodeID)
@@ -440,6 +460,52 @@ func (s *server) handleAgentUpdate(w http.ResponseWriter, r *http.Request, nodeI
 	}
 	log.Printf("agent update requested: %s (reported version %s)", nodeID, n.AgentVersion)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "node_id": nodeID})
+}
+
+// POST /api/v1/nodes/{id}/preferred — toggle the preferred-replica flag.
+// Preferred ("reliable") nodes receive new volume replicas first during the
+// pre-EC phase; the master falls back to regular nodes when they run out of
+// free slots. The flag list is published to the master via the file set with
+// -preferredNodesFile; the master re-reads it periodically (no restart).
+func (s *server) handleNodePreferred(w http.ResponseWriter, r *http.Request, nodeID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Preferred *bool `json:"preferred"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Preferred == nil {
+		http.Error(w, `bad request: need {"preferred": true|false}`, http.StatusBadRequest)
+		return
+	}
+	if !s.reg.SetPreferred(nodeID, *req.Preferred) {
+		http.Error(w, "unknown node", http.StatusNotFound)
+		return
+	}
+	log.Printf("node %s preferred=%v", nodeID, *req.Preferred)
+	s.writePreferredNodesFile()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "node_id": nodeID, "preferred": *req.Preferred})
+}
+
+// writePreferredNodesFile publishes the preferred node address list for the
+// SeaweedFS master (-preferredNodesFile watches it).
+func (s *server) writePreferredNodesFile() {
+	if s.preferredNodesFile == "" {
+		return
+	}
+	addrs := s.reg.PreferredNodeAddrs()
+	var b strings.Builder
+	b.WriteString("# written by s3lite-server: preferred replica targets\n")
+	for _, a := range addrs {
+		b.WriteString(a)
+		b.WriteString("\n")
+	}
+	if err := os.WriteFile(s.preferredNodesFile, []byte(b.String()), 0o644); err != nil {
+		log.Printf("write preferred nodes file %s: %v", s.preferredNodesFile, err)
+		return
+	}
+	log.Printf("preferred nodes list published: %d node(s) -> %s", len(addrs), s.preferredNodesFile)
 }
 
 // POST /api/v1/nodes/{id}/heartbeat.

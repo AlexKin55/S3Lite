@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/topology"
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
 
 	hashicorpRaft "github.com/hashicorp/raft"
@@ -61,6 +62,7 @@ type MasterOptions struct {
 	vacuumDeleteEmptyAfterSeconds *int
 	// pulseSeconds       *int
 	defaultReplication *string
+	preferredNodesFile *string
 	garbageThreshold   *float64
 	whiteList          *string
 	disableHttp        *bool
@@ -99,6 +101,7 @@ func init() {
 	m.vacuumDeleteEmptyAfterSeconds = cmdMaster.Flag.Int("vacuumDeleteEmptyAfterSeconds", 0, "automatic sweep deletes volume copies that stay empty this many seconds; 0 disables")
 	// m.pulseSeconds = cmdMaster.Flag.Int("pulseSeconds", 5, "number of seconds between heartbeats")
 	m.defaultReplication = cmdMaster.Flag.String("defaultReplication", "", "Default replication type if not specified.")
+	m.preferredNodesFile = cmdMaster.Flag.String("preferredNodesFile", "", "Path to a file listing preferred volume servers (\"ip:port\" per line, # comments) that should receive new volume replicas first; re-read periodically.")
 	m.garbageThreshold = cmdMaster.Flag.Float64("garbageThreshold", 0.3, "threshold to vacuum and reclaim spaces")
 	m.whiteList = cmdMaster.Flag.String("whiteList", "", "comma separated Ip addresses having write permission. No limit if empty.")
 	m.disableHttp = cmdMaster.Flag.Bool("disableHttp", false, "disable http requests, only gRPC operations are allowed.")
@@ -205,6 +208,12 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 
 	r := mux.NewRouter()
 	ms := weed_server.NewMasterServer(r, masterOption.toMasterOption(masterWhiteList), masterPeers)
+	// Operator-preferred volume servers (S3Lite control plane writes the
+	// file) are re-applied to the topology periodically, so replica placement
+	// can start preferring them without a master restart.
+	if masterOption.preferredNodesFile != nil && *masterOption.preferredNodesFile != "" {
+		topology.WatchPreferredNodesFile(ms.Topo, *masterOption.preferredNodesFile, 15*time.Second)
+	}
 	listeningAddress := util.JoinHostPort(*masterOption.ipBind, *masterOption.port)
 	glog.V(0).Infof("Start Seaweed Master %s at %s", version.Version(), listeningAddress)
 	masterListener, masterLocalListener, e := util.NewIpAndLocalListeners(*masterOption.ipBind, *masterOption.port, 0)
