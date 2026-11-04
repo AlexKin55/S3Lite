@@ -19,8 +19,8 @@ Environment=DEFAULT_REPLICATION=000
 ExecStart=/usr/bin/weed filer \
     -port=8888 \
     -master=127.0.0.1:9333 \
-    -defaultReplication=${DEFAULT_REPLICATION} \
-    -dir=/var/lib/s3lite/filer
+    -defaultReplicaPlacement=${DEFAULT_REPLICATION} \
+    -defaultStoreDir=/var/lib/s3lite/filer
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
