@@ -18,7 +18,7 @@
 #   spec must match it (the check in %prep fails the build otherwise).
 #
 Name:           s3lite-agent
-Version:        0.0.4
+Version:        0.0.5
 Release:        0
 Summary:        S3Lite distributed S3 storage - node agent
 License:        Apache-2.0
@@ -173,6 +173,10 @@ exit 0
 %doc README.md
 
 %changelog
+* Tue Nov 04 2026 S3Lite <dev@s3lite.dev> - 0.0.5-0
+- Node quota STORAGE_SIZE is now in gigabytes (default 1 GB = two 500 MB
+  volumes) and is passed to the agent via the new -capacityGB flag; the old
+  -capacity (MB) flag keeps working, GB wins when both are set
 * Mon Nov 02 2026 S3Lite <dev@s3lite.dev> - 0.0.4-0
 - Agent self-update: the control plane dashboard can request an agent
   reinstall (fresh binaries from the repo even at the same version); the

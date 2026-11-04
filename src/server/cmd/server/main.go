@@ -402,6 +402,16 @@ func (s *server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	if s.volSizeLimitMB > 0 && req.CapacityBytes > 0 {
 		if n := int(req.CapacityBytes / (int64(s.volSizeLimitMB) * 1024 * 1024)); n > 0 {
 			maxVol = n
+		} else {
+			// Capacity below one volume: grant a single slot instead of
+			// silently falling back to the default maxVolumes, which would
+			// let the node hold maxVolumes * volumeSizeLimitMB — far beyond
+			// its quota. The one volume can still overflow the quota; fix
+			// the config (raise the node's STORAGE_SIZE, or recompile weed
+			// with a smaller DefaultVolumeSizeLimitMB).
+			maxVol = 1
+			log.Printf("node %s: capacity %d bytes is below one volume (%d MB); granting 1 volume slot, quota may still be exceeded",
+				req.NodeID, req.CapacityBytes, s.volSizeLimitMB)
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{

@@ -24,17 +24,18 @@ func main() {
 	port := flag.Int("port", 0, "volume server port (overrides config)")
 	weedBin := flag.String("weed", "", "path to the weed binary (overrides config)")
 	storageDir := flag.String("storage", "", "volume data directory (overrides config)")
-	capacityMB := flag.Int64("capacity", 0, "node capacity in megabytes (overrides config)")
+	capacityMB := flag.Int64("capacity", 0, "node capacity in megabytes (overrides config; legacy, prefer -capacityGB)")
+	capacityGB := flag.Int64("capacityGB", 0, "node capacity in gigabytes (overrides config; wins over -capacity)")
 	insecureTLS := flag.Bool("insecure", false, "skip TLS certificate verification for HTTPS control plane")
 	flag.Parse()
 
-	if err := run(*agentDir, *serverAddr, *port, *weedBin, *storageDir, *capacityMB, *insecureTLS); err != nil {
+	if err := run(*agentDir, *serverAddr, *port, *weedBin, *storageDir, *capacityMB, *capacityGB, *insecureTLS); err != nil {
 		fmt.Fprintf(os.Stderr, "agent: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(agentDir, serverOverride string, portOverride int, weedOverride, storageOverride string, capacityOverrideMB int64, insecureTLS bool) error {
+func run(agentDir, serverOverride string, portOverride int, weedOverride, storageOverride string, capacityOverrideMB, capacityOverrideGB int64, insecureTLS bool) error {
 	agentDir = abs(agentDir)
 
 	cfg, err := config.Load(agentDir)
@@ -56,7 +57,12 @@ func run(agentDir, serverOverride string, portOverride int, weedOverride, storag
 	if storageOverride != "" {
 		cfg.DataDir = storageOverride
 	}
-	if capacityOverrideMB > 0 {
+	// GB wins over MB so the unit file can migrate to gigabytes (-capacityGB)
+	// while the old -capacity flag keeps working for existing installs.
+	switch {
+	case capacityOverrideGB > 0:
+		cfg.CapacityBytes = capacityOverrideGB * 1024 * 1024 * 1024
+	case capacityOverrideMB > 0:
 		cfg.CapacityBytes = capacityOverrideMB * 1024 * 1024
 	}
 
