@@ -693,7 +693,7 @@ func (s *AdminServer) CreateS3BucketWithQuota(bucketName string, quotaBytes int6
 
 // CreateS3BucketWithObjectLock creates a new S3 bucket with quota, versioning, object lock settings, and owner
 func (s *AdminServer) CreateS3BucketWithObjectLock(bucketName string, quotaBytes int64, quotaEnabled, versioningEnabled, objectLockEnabled bool, objectLockMode string, setDefaultRetention bool, objectLockDuration int32, owner string) error {
-	return s.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+	err := s.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
 		// First ensure /buckets directory exists
 		_, err := client.CreateEntry(context.Background(), &filer_pb.CreateEntryRequest{
 			Directory: "/",
@@ -800,4 +800,10 @@ func (s *AdminServer) CreateS3BucketWithObjectLock(bucketName string, quotaBytes
 
 		return nil
 	})
+	if err == nil {
+		// Refresh the cached collection stats so the new bucket shows up on
+		// the buckets page immediately rather than after the cache TTL.
+		s.InvalidateCache()
+	}
+	return err
 }

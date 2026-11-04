@@ -1234,7 +1234,7 @@ func (s *AdminServer) DeleteS3Bucket(bucketName string) error {
 
 	// Then delete bucket directory recursively from filer
 	// Use same parameters as s3.bucket.delete shell command and S3 API
-	return s.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+	err = s.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
 		// The collection is already gone, so this only has to drop the metadata.
 		if err := filer_pb.DoRemove(ctx, client, filerConfig.BucketsPath, bucketName, false, true, true, false, nil); err != nil {
 			return fmt.Errorf("failed to delete bucket: %w", err)
@@ -1242,6 +1242,14 @@ func (s *AdminServer) DeleteS3Bucket(bucketName string) error {
 
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+
+	// Drop the cached collection stats so the buckets page reflects the
+	// deletion immediately instead of for up to collectionStatsCacheThreshold.
+	s.InvalidateCache()
+	return nil
 }
 
 // IsStaticUser checks if a user is a static identity by loading the
