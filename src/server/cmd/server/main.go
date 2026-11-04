@@ -65,6 +65,13 @@ type server struct {
 	// single-copy data that cannot be encoded yet.
 	minWriteNodes int
 
+	// Dashboard fsck button: the weed binary to run 'weed shell volume.fsck'
+	// with, the run's wall-clock cap, and the single-flight flag guarding
+	// against double clicks while a minutes-long scan is in progress.
+	weedBin     string
+	fsckTimeout time.Duration
+	fsckRunning atomic.Bool
+
 	// Agent version tracking: the newest agent version seen in any heartbeat.
 	// Nodes reporting an older version are highlighted on the dashboard.
 	agentVerMu sync.Mutex
@@ -110,6 +117,8 @@ func main() {
 	portBase := flag.Int("portBase", 8080, "starting port for agent volume servers")
 	stateFile := flag.String("stateFile", "", "JSON file persisting operator node flags (preferred replica targets) across restarts")
 	preferredNodesFile := flag.String("preferredNodesFile", "", "File where the preferred volume server address list (\"ip:port\" per line) is published for the master's -preferredNodesFile")
+	weedBin := flag.String("weedBin", "/usr/bin/weed", "path to the weed binary; the dashboard fsck button runs 'weed shell volume.fsck' with it")
+	fsckTimeout := flag.Duration("fsckTimeout", 10*time.Minute, "wall-clock cap on a dashboard-triggered volume.fsck run")
 	flag.Parse()
 
 	reg := store.NewRegistry(*portBase, time.Duration(*hbTTL)*time.Second)
@@ -134,6 +143,8 @@ func main() {
 			PortBase:   *portBase,
 		},
 		minWriteNodes: *minWriteNodes,
+		weedBin:       *weedBin,
+		fsckTimeout:   *fsckTimeout,
 	}
 	srv.lastReports.Store([]*redundancy.Report{})
 	srv.histVolumes = []*redundancy.Volume{}
@@ -163,6 +174,7 @@ func main() {
 	mux.HandleFunc("/api/v1/dashboard", srv.dashboardAPI)
 	mux.HandleFunc("/api/v1/orphans", srv.handleOrphansList)
 	mux.HandleFunc("/api/v1/orphans/cleanup", srv.handleOrphansCleanup)
+	mux.HandleFunc("/api/v1/fsck", srv.handleFsck)
 	mux.HandleFunc("/", srv.handleDashboard)
 	mux.HandleFunc("/metrics", srv.handleMetrics)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -671,8 +683,12 @@ func (s *server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 		"min_write_nodes": s.minWriteNodes,
 		"writable":        clusterWritable(activeNodes, s.minWriteNodes),
 		"ec_volumes":      map[string]int{"ok": okC, "degraded": degC, "at_risk": riskC, "total": len(reports)},
-		"capacity":        map[string]int64{"total_bytes": totalCap, "used_bytes": usedCap},
-		"updated_at":      s.lastUpdate.Load().(time.Time),
+		"capacity": map[string]int64{
+			"total_bytes": totalCap,
+			"used_bytes":  usedCap,
+			"free_bytes":  totalCap - usedCap,
+		},
+		"updated_at": s.lastUpdate.Load().(time.Time),
 	})
 }
 

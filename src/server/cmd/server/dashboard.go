@@ -8,7 +8,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os/exec"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 
@@ -316,4 +318,91 @@ func (s *server) handleOrphansCleanup(w http.ResponseWriter, r *http.Request) {
 		"freed_bytes": freed,
 		"errors":      errs,
 	})
+}
+
+// fsckSummaryRegexp parses volume.fsck's final line:
+// "Total\t\tentries:<n>\torphan:<n>\t<pct>%\t<n>B".
+var fsckSummaryRegexp = regexp.MustCompile(`orphan:(\d+)\t[0-9.]+%\t(\d+)B`)
+
+// handleFsck runs "weed shell volume.fsck" on the server where the control
+// plane lives and returns its report: orphan chunks (data on the volume
+// servers that no filer entry references — e.g. an upload interrupted between
+// the chunk write and the metadata commit). Report-only unless the body is
+// {"purge":true}, which adds -forcePurging to delete the found chunks (the
+// disk space is reclaimed by the next vacuum compaction).
+//
+// A scan reads every volume index and the whole filer store, so it can run
+// for minutes: the run is single-flight (409 on a second click), capped by
+// -fsckTimeout, and the response carries the captured output for the
+// dashboard to show.
+func (s *server) handleFsck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+		return
+	}
+	// Single flight: a second click while a scan is running gets 409, the
+	// dashboard also disables its button.
+	if s.fsckRunning.Swap(true) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "fsck is already running"})
+		return
+	}
+	defer s.fsckRunning.Store(false)
+
+	var req struct {
+		Purge bool `json:"purge"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req)
+	}
+	command := "volume.fsck"
+	if req.Purge {
+		command = "volume.fsck -forcePurging"
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), s.fsckTimeout)
+	defer cancel()
+	start := time.Now()
+
+	// The shell needs the admin lock before a mutating/checking command;
+	// piped non-interactively the lock command runs first.
+	script := fmt.Sprintf("lock\n%s\n", command)
+	cmd := exec.CommandContext(ctx, s.weedBin, "shell",
+		"-master", s.volumeCfg.Master,
+		"-filer", s.filerAddr)
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+
+	resp := map[string]any{
+		"cmd":         command,
+		"duration_ms": time.Since(start).Milliseconds(),
+	}
+	if len(out) > 16*1024 {
+		out = out[len(out)-16*1024:] // keep the tail: the summary is at the end
+	}
+	resp["output"] = string(out)
+
+	switch {
+	case ctx.Err() == context.DeadlineExceeded:
+		resp["error"] = fmt.Sprintf("fsck did not finish within %s; try again or raise -fsckTimeout", s.fsckTimeout)
+	case err != nil:
+		resp["error"] = fmt.Sprintf("weed shell failed: %v", err)
+	}
+
+	// Summarize for the dashboard regardless of the exit status: the scan
+	// often completes and prints the Total line even when the shell then
+	// reports a benign error on exit.
+	if m := fsckSummaryRegexp.FindSubmatch(out); m != nil {
+		resp["orphan_chunks"] = json.Number(string(m[1]))
+		resp["orphan_bytes"] = json.Number(string(m[2]))
+	} else if strings.Contains(string(out), "no orphan data") {
+		resp["orphan_chunks"] = 0
+		resp["orphan_bytes"] = 0
+	}
+
+	status := http.StatusOK
+	if _, hasErr := resp["error"]; hasErr {
+		status = http.StatusBadGateway
+	}
+	log.Printf("fsck: cmd=%q purge=%v duration=%s err=%v", command, req.Purge, time.Since(start).Round(time.Second), err)
+	writeJSON(w, status, resp)
 }
