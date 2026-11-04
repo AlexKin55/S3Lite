@@ -44,6 +44,11 @@
   .node-row { cursor:pointer; }
   .node-row:hover td { background:#1a2740; }
   .chev { color:#64748b; font-size:11px; }
+  /* Nodes whose agent reports a version older than the newest one seen in
+     the cluster: yellow row tint plus a marker bar on the left edge. */
+  .node-row.outdated td { background:rgba(250,204,21,.07); }
+  .node-row.outdated:hover td { background:rgba(250,204,21,.13); }
+  .node-row.outdated td:first-child { box-shadow:inset 3px 0 0 #facc15; }
   button { background:#0ea5e9; color:#fff; border:0; border-radius:6px; padding:8px 14px; cursor:pointer; font-size:13px;}
   button.del { background:#7f1d1d; padding:4px 10px; }
   button.del:hover { background:#ef4444; }
@@ -123,6 +128,12 @@ async function load(){
   const j = await (await fetch('/api/v1/dashboard')).json();
   const ec = j.ec, cap = j.capacity, ns = j.node_status, nodes = j.nodes, health = j.health||'healthy';
   const dups = j.duplicates || [];
+  const latestAgent = j.agent_latest_version || '';
+  const outdated = (j.agents_outdated||0);
+  // Sort by node id so rows keep their position across auto-refreshes;
+  // otherwise a node "jumps" whenever any other one updates its heartbeat.
+  // Numeric-aware compare: node-2 sorts before node-10.
+  nodes.sort((a,b)=>String(a.node_id).localeCompare(String(b.node_id), undefined, {numeric:true}));
   const dupBanner = document.getElementById('dup-banner');
   if (dups.length) {
     dupBanner.hidden = false;
@@ -139,14 +150,17 @@ async function load(){
     '<div class="stat ok"><b>'+ns.online+'</b>online</div>'+
     '<div class="stat"><b>'+(ns.degraded||0)+'</b>degraded</div>'+
     '<div class="stat risk"><b>'+ns.offline+'</b>offline</div>'+
+    '<div class="stat'+(outdated?' ok':'')+'" title="Newest agent version seen in the cluster: '+(latestAgent?esc(latestAgent):'—')+'"><b>'+outdated+'</b>agent'+(outdated===1?'':'s')+' outdated</div>'+
     '<div class="stat"><b>'+ec.ok+'</b>EC ok</div>'+
     '<div class="stat risk"><b>'+ec.at_risk+'</b>EC at risk</div>'+
     '<div class="stat"><b>'+fmtBytes(cap.used_bytes)+'</b>used / '+fmtBytes(cap.total_bytes)+'</div>'+
     '<div class="stat ok"><b>'+fmtBytes(cap.free_bytes)+'</b>free</div>';
   const nt=nodes.map(n=>{
     const cl = n.status === 'online' ? 'ok' : 'offline';
+    const isOutdated = !!n.agent_outdated;
     const badge = '<span class="badge '+cl+'">'+n.status+'</span>'+
       (n.health==='degraded' ? ' <span class="badge warn">degraded</span>' : '')+
+      (isOutdated ? ' <span class="badge warn" title="Agent version '+esc(n.agent_version)+' is older than the newest one seen in the cluster ('+esc(latestAgent)+')">⚠ agent '+esc(n.agent_version)+' (latest '+esc(latestAgent)+')</span>' : '')+
       (dups.includes(n.node_id) ? ' <span class="badge warn" title="This node_id is seen from more than one machine">duplicate id</span>' : '');
     const os = [n.os, n.os_version].filter(Boolean).join(' ');
     const sub = [n.rack, n.zone, n.stability].filter(Boolean).join(' · ');
@@ -154,6 +168,7 @@ async function load(){
       (n.friendly_name ? '<div><b>Friendly name</b>'+esc(n.friendly_name)+'</div>' : '')+
       '<div><b>Registered at</b>'+ago(n.registered_at)+'</div>'+
       (n.agent_version ? '<div><b>Agent version</b>'+esc(n.agent_version)+
+        (n.agent_outdated ? ' <span class="badge warn">outdated — latest '+esc(latestAgent)+'</span>' : '')+
         '<button class="upd" data-upd="'+esc(n.node_id)+'" title="Reinstall the agent package on this node (configs preserved); the command is delivered with its next heartbeat">⟳ Update agent</button>'+
         (n.update_status ? '<span class="sub">update: '+esc(n.update_status)+
           (n.update_detail ? ' — '+esc(n.update_detail) : '')+
@@ -165,7 +180,7 @@ async function load(){
       (n.restarts_total ? '<div><b>Volume restarts</b>'+n.restarts_total+'</div>' : '')+
       (n.stats_age_sec ? '<div><b>Stats freshness</b>'+ago(new Date(Date.now()-n.stats_age_sec*1000).toISOString())+'</div>' : '');
     const isOpen = expanded.has(n.node_id);
-    return '<tr class="node-row" data-id="'+esc(n.node_id)+'">'+
+    return '<tr class="node-row'+(isOutdated?' outdated':'')+'" data-id="'+esc(n.node_id)+'">'+
       '<td class="chev">'+(isOpen?'▼':'▶')+'</td>'+
       '<td><b>'+esc(n.node_id)+'</b>'+(sub?'<span class="sub">'+esc(sub)+'</span>':'')+'</td>'+
       '<td>'+esc(n.ip)+':'+n.volume_port+'</td>'+

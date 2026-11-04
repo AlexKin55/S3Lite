@@ -65,6 +65,13 @@ type server struct {
 	// single-copy data that cannot be encoded yet.
 	minWriteNodes int
 
+	// Agent version tracking: the newest agent version seen in any heartbeat.
+	// Nodes reporting an older version are highlighted on the dashboard.
+	agentVerMu sync.Mutex
+	// newestAgentVersionSeen guards under agentVerMu; empty until the first
+	// heartbeat with a version string arrives.
+	newestAgentVersionSeen string
+
 	// Placement history: merged per-volume shard layout (see redundancy.Merge).
 	// Keeps nodes that dropped out of the master topology known to the advice
 	// engine so "which PCs to power back on" can name them. Entries that stop
@@ -578,6 +585,9 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request, nodeID 
 		http.Error(w, "unknown node", http.StatusNotFound)
 		return
 	}
+	// Track the newest agent version across the cluster: nodes reporting an
+	// older one are highlighted on the dashboard.
+	s.observeAgentVersion(req.AgentVersion)
 	resp := map[string]any{"ok": true}
 	// Deliver a pending agent-update command exactly once: the agent
 	// reinstalls its package (configs preserved) and restarts its service.
@@ -777,6 +787,11 @@ func (s *server) nodeView(n *store.Node) store.Node {
 	v := *n
 	v.Status = s.nodeStatus(n)
 	v.Alive = v.Status == "online"
+	// A node is flagged when its agent reports a version older than the
+	// newest one observed anywhere in the cluster (see observeAgentVersion).
+	if latest := s.newestAgentVersion(); latest != "" && n.AgentVersion != "" && versionLess(n.AgentVersion, latest) {
+		v.AgentOutdated = true
+	}
 	return v
 }
 

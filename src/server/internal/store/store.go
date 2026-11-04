@@ -54,8 +54,12 @@ type Node struct {
 	SourceIPs map[string]time.Time `json:"-"`
 
 	// Diagnostics reported by the agent in heartbeats (dashboard node details).
-	AgentVersion    string `json:"agent_version,omitempty"`
-	WeedVersion     string `json:"weed_version,omitempty"`
+	AgentVersion string `json:"agent_version,omitempty"`
+	WeedVersion  string `json:"weed_version,omitempty"`
+	// AgentOutdated is computed by the dashboard API (not stored): the node
+	// reports an agent version older than the newest one seen in any
+	// heartbeat cluster-wide. The dashboard highlights such nodes yellow.
+	AgentOutdated   bool   `json:"agent_outdated,omitempty"`
 	AgentUptimeSec  int64  `json:"agent_uptime_sec,omitempty"`
 	VolumeUptimeSec int64  `json:"volume_uptime_sec,omitempty"`
 	RestartsTotal   int    `json:"restarts_total,omitempty"`

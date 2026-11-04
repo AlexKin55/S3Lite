@@ -22,6 +22,67 @@ import (
 //go:embed dashboard.html
 var dashboardHTML string
 
+// observeAgentVersion records an agent version reported by a heartbeat,
+// keeping the highest one seen so far (numeric dotted comparison). The
+// dashboard flags nodes whose agent reports an older version.
+func (s *server) observeAgentVersion(v string) {
+	if v == "" {
+		return
+	}
+	s.agentVerMu.Lock()
+	defer s.agentVerMu.Unlock()
+	if s.newestAgentVersionSeen == "" || versionLess(s.newestAgentVersionSeen, v) {
+		s.newestAgentVersionSeen = v
+	}
+}
+
+// newestAgentVersion returns the highest agent version reported by any
+// heartbeat since server start ("" when none was reported yet).
+func (s *server) newestAgentVersion() string {
+	s.agentVerMu.Lock()
+	defer s.agentVerMu.Unlock()
+	return s.newestAgentVersionSeen
+}
+
+// versionLess compares dotted version strings ("0.0.4" < "0.0.10").
+// Segments are compared numerically; non-numeric tails (e.g. "-rc1") are
+// ignored and missing segments count as 0.
+func versionLess(a, b string) bool {
+	if i := strings.IndexByte(a, '-'); i >= 0 {
+		a = a[:i]
+	}
+	if i := strings.IndexByte(b, '-'); i >= 0 {
+		b = b[:i]
+	}
+	pa, pb := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(pa) || i < len(pb); i++ {
+		var ai, bi int
+		if i < len(pa) {
+			ai = versionSeg(pa[i])
+		}
+		if i < len(pb) {
+			bi = versionSeg(pb[i])
+		}
+		if ai != bi {
+			return ai < bi
+		}
+	}
+	return false
+}
+
+// versionSeg parses the leading decimal digits of a version segment; a
+// segment without digits (or an empty one) counts as 0.
+func versionSeg(seg string) int {
+	n := 0
+	for _, c := range seg {
+		if c < '0' || c > '9' {
+			break
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
+}
+
 // handleDashboard serves a self-contained browser dashboard for operators.
 // It polls /api/v1/dashboard and renders the cluster health, EC volume states
 // and the registered nodes with their online/offline state. The nodes table
@@ -90,10 +151,20 @@ func (s *server) dashboardAPI(w http.ResponseWriter, r *http.Request) {
 	case offlineC > 0 || degradedC > 0 || degC > 0:
 		health = "degraded"
 	}
+	outdatedC := 0
+	for i := range nodes {
+		if nodes[i].AgentOutdated {
+			outdatedC++
+		}
+	}
 	payload := map[string]any{
 		"nodes":      nodes,
 		"health":     health,
 		"duplicates": dupNodeIDs,
+		// Newest agent version seen in any heartbeat; nodes reporting an
+		// older version carry agent_outdated=true and are highlighted.
+		"agent_latest_version": s.newestAgentVersion(),
+		"agents_outdated":      outdatedC,
 		"node_status": map[string]int{
 			"online":   onlineC,
 			"degraded": degradedC,
