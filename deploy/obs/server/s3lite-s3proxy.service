@@ -6,6 +6,9 @@ Wants=network-online.target s3lite-s3.service
 # The external S3 endpoint (:8333) in front of the gateway (:8332):
 #   - refuses writes (503 S3LiteClusterReadOnly) while fewer than
 #     -minWriteNodes storage nodes are online (control plane policy);
+#   - refuses upfront (507 S3LiteInsufficientCapacity) writes whose declared
+#     size cannot fit the cluster's free space, counting the replication+EC
+#     write amplification (-writeFactor);
 #   - turns failed downloads into an S3 error that names the PCs to power on.
 # Fails open when the control plane is unreachable (beyond the 5s state TTL).
 
@@ -15,10 +18,15 @@ User=s3lite
 Environment=S3PROXY_LISTEN=:8333
 Environment=S3PROXY_UPSTREAM=http://127.0.0.1:8332
 Environment=S3PROXY_CONTROL=http://127.0.0.1:8099
+# Raw bytes of cluster space consumed per byte written: replication copies
+# (DEFAULT_REPLICATION=020 -> 3) x EC 10/6 overhead = 5. Update together with
+# the replication config or the EC scheme.
+Environment=S3PROXY_WRITEFACTOR=5
 ExecStart=/usr/bin/s3proxy \
     -listen=${S3PROXY_LISTEN} \
     -upstream=${S3PROXY_UPSTREAM} \
-    -control=${S3PROXY_CONTROL}
+    -control=${S3PROXY_CONTROL} \
+    -writeFactor=${S3PROXY_WRITEFACTOR}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536

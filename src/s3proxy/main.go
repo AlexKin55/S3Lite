@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,7 +21,14 @@ import (
 //     power on;
 //   - writes (PUT/POST/DELETE/PATCH) are refused with 503 while the control
 //     plane reports the cluster read-only (fewer active volume servers than
-//     min_write_nodes, e.g. the 6+4 EC scheme needs 10).
+//     min_write_nodes, e.g. the 6+4 EC scheme needs 10);
+//   - writes with a declared size that cannot fit the cluster's free space
+//     are refused upfront with 507 and a clear "won't fit" message (also
+//     logged), instead of dying mid-upload with a generic 503 "temporarily
+//     unavailable". The space an in-flight write consumes is reserved for the
+//     request's duration (released by defer on any exit path — completion,
+//     upstream error or client cancel), so two simultaneous uploads cannot
+//     both pass the check against the same cached numbers and then collide.
 //
 // If the control plane is unreachable the proxy fails OPEN: the last known
 // verdict applies within its TTL, then writes pass through again — losing the
@@ -35,47 +43,118 @@ func main() {
 	listen := flag.String("listen", ":8333", "external S3 listener")
 	upstream := flag.String("upstream", "http://127.0.0.1:8332", "SeaweedFS S3 gateway address")
 	control := flag.String("control", "http://192.168.1.9:8099", "S3Lite control plane address")
+	// writeFactor: how many bytes of raw node capacity one byte of user data
+	// ultimately consumes — replication copies × (data+parity)/data shards.
+	// 5 for the s3lite default (3× replication via DEFAULT_REPLICATION=020,
+	// 6+4 EC): a 4 GiB object needs 20 GiB of raw space. Must be updated
+	// together with the replication config or the EC scheme.
+	writeFactor := flag.Int64("writeFactor", 5, "raw bytes of cluster space consumed per byte written (replication × EC overhead)")
 	flag.Parse()
 
 	proxy := &proxy{
-		upstream:   *upstream,
-		controlURL: *control,
-		client:     &http.Client{Timeout: 60 * time.Second},
-		stateTTL:   clusterStateTTL,
+		upstream:    *upstream,
+		controlURL:  *control,
+		client:      &http.Client{Timeout: 60 * time.Second},
+		stateTTL:    clusterStateTTL,
+		writeFactor: *writeFactor,
 	}
 
-	log.Printf("s3proxy on %s -> %s (control %s)", *listen, *upstream, *control)
+	log.Printf("s3proxy on %s -> %s (control %s, writeFactor %d)", *listen, *upstream, *control, *writeFactor)
 	if err := http.ListenAndServe(*listen, proxy); err != nil {
 		log.Fatal(err)
 	}
 }
 
 type proxy struct {
-	upstream   string
-	controlURL string
-	client     *http.Client
-	stateTTL   time.Duration
+	upstream    string
+	controlURL  string
+	client      *http.Client
+	stateTTL    time.Duration
+	writeFactor int64
 
 	mu          sync.Mutex
 	cachedState *clusterState
 	cachedAt    time.Time
+	reserved    int64 // usable bytes booked by in-flight writes (see reserve)
 }
 
 // clusterState is the subset of the control plane's /api/v1/cluster/status
-// that drives the write guard.
+// that drives the write guards.
 type clusterState struct {
 	Writable      bool `json:"writable"`
 	ActiveNodes   int  `json:"active_nodes"`
 	MinWriteNodes int  `json:"min_write_nodes"`
+	// FreeBytes is the raw free node capacity reported by the control plane
+	// (sum of the nodes' STORAGE_SIZE quotas minus their actual usage).
+	// A pointer on purpose: nil means the field was absent (an older control
+	// plane) and the size check fails open; an explicit 0 or negative value
+	// means the control plane reports the cluster as full and the check
+	// refuses writes.
+	FreeBytes *int64 `json:"free_bytes"`
+}
+
+// capacityReported reports whether the control plane answered with a raw
+// capacity number at all.
+func (st *clusterState) capacityReported() bool {
+	return st.FreeBytes != nil
+}
+
+// rawFree returns the reported raw free space (0 when absent or negative).
+func (st *clusterState) rawFree() int64 {
+	if st.FreeBytes == nil || *st.FreeBytes < 0 {
+		return 0
+	}
+	return *st.FreeBytes
+}
+
+// usableFree returns the space a new object may claim: raw free space
+// divided by the write amplification factor.
+func (st *clusterState) usableFree(factor int64) int64 {
+	if factor <= 0 {
+		factor = 1
+	}
+	free := st.rawFree()
+	if free <= 0 {
+		return 0
+	}
+	return free / factor
+}
+
+// fits reports whether a write of n bytes fits the usable space, counting
+// the bytes already reserved by in-flight writes. Without a capacity report
+// it always returns true: the check must never block writes when the control
+// plane does not report numbers.
+func (st *clusterState) fits(n, reserved, factor int64) bool {
+	if n <= 0 || !st.capacityReported() {
+		return true
+	}
+	limit := st.usableFree(factor)
+	return n+reserved <= limit
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Refuse writes while the cluster is read-only. Reads always pass:
-	// a degraded cluster can still serve whatever shards remain available.
+	// Refuse writes while the cluster is read-only, and writes whose declared
+	// size cannot fit the free space. Reads always pass: a degraded cluster
+	// can still serve whatever shards remain available.
 	if isWriteMethod(r.Method) {
-		if st := p.clusterState(); st != nil && !st.Writable {
-			writeReadOnlyError(w, st)
-			return
+		if st := p.clusterState(); st != nil {
+			if !st.Writable {
+				writeReadOnlyError(w, st)
+				return
+			}
+			if size := declaredWriteSize(r); size > 0 && st.capacityReported() {
+				p.mu.Lock()
+				reserved := p.reserved
+				p.mu.Unlock()
+				if !st.fits(size, reserved, p.writeFactor) {
+					log.Printf("s3proxy: refusing %s %s: %d bytes do not fit (%d usable, %d raw free, %d reserved by in-flight writes)",
+						r.Method, r.URL.Path, size, st.usableFree(p.writeFactor), st.rawFree(), reserved)
+					writeCapacityError(w, st, size, p.writeFactor)
+					return
+				}
+				p.addReserved(size)
+				defer p.release(size)
+			}
 		}
 	}
 
@@ -177,6 +256,44 @@ func writeReadOnlyError(w http.ResponseWriter, st *clusterState) {
 	writeS3Error(w, "S3LiteClusterReadOnly", msg)
 }
 
+// declaredWriteSize returns how many bytes this write is going to store.
+// SigV4 streaming uploads (aws-cli) sign a chunked wrapper, so the real
+// payload size is in x-amz-decoded-content-length, not in Content-Length.
+// A zero result means the size is unknown (chunked, empty or not applicable)
+// and the size check is skipped.
+func declaredWriteSize(r *http.Request) int64 {
+	if v := r.Header.Get("X-Amz-Decoded-Content-Length"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	if r.ContentLength > 0 {
+		return r.ContentLength
+	}
+	return 0
+}
+
+// addReserved books n bytes for an in-flight write that passed the size check,
+// so concurrent uploads are checked against each other and not only against
+// the (cached, up to stateTTL old) control plane numbers.
+func (p *proxy) addReserved(n int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reserved += n
+}
+
+// release gives back the reservation made by a finished (or failed) write.
+// It runs via defer on every exit path of ServeHTTP, so a cancelled or
+// errored upload frees its space immediately.
+func (p *proxy) release(n int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reserved -= n
+	if p.reserved < 0 {
+		p.reserved = 0
+	}
+}
+
 // looksLikeObjectPath avoids intercepting the S3 service endpoints (/, /api,
 // bucket listing) where 5xx has different meaning.
 func looksLikeObjectPath(path string) bool {
@@ -223,6 +340,18 @@ func (p *proxy) fetchAdvice() []string {
 	return out
 }
 
+// writeCapacityError refuses a write whose declared size cannot fit the
+// cluster's usable (replication- and EC-adjusted) free space. The refusal
+// goes to the S3 client as 507 and to the s3proxy log (see ServeHTTP).
+func writeCapacityError(w http.ResponseWriter, st *clusterState, size, factor int64) {
+	msg := fmt.Sprintf(
+		"Object of %d bytes will not fit: only %d bytes of usable storage left "+
+			"(%d raw free across %d nodes; every stored byte needs replication+EC overhead). "+
+			"Delete objects or add nodes, then retry.",
+		size, st.usableFree(factor), st.rawFree(), st.ActiveNodes)
+	writeS3ErrorStatus(w, "S3LiteInsufficientCapacity", msg, http.StatusInsufficientStorage)
+}
+
 // writeS3Failure returns an S3-compatible error body (like MinIO/SeaweedFS do)
 // with a human-readable recovery hint.
 func writeS3Failure(w http.ResponseWriter, advice []string) {
@@ -232,6 +361,10 @@ func writeS3Failure(w http.ResponseWriter, advice []string) {
 }
 
 func writeS3Error(w http.ResponseWriter, code, msg string) {
+	writeS3ErrorStatus(w, code, msg, http.StatusServiceUnavailable)
+}
+
+func writeS3ErrorStatus(w http.ResponseWriter, code, msg string, status int) {
 	body := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <Error>
   <Code>%s</Code>
@@ -241,7 +374,7 @@ func writeS3Error(w http.ResponseWriter, code, msg string) {
 
 	w.Header().Set("Content-Type", "application/xml")
 	w.Header().Set("x-amz-request-id", "s3lite")
-	w.WriteHeader(http.StatusServiceUnavailable)
+	w.WriteHeader(status)
 	_, _ = io.WriteString(w, body)
 }
 
