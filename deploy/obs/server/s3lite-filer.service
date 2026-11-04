@@ -6,20 +6,19 @@ Wants=network-online.target s3lite-master.service
 # The filer owns the file-name -> volume mapping (filer store in
 # /var/lib/s3lite/filer) and is the backend of the S3 gateway.
 #
-# DEFAULT_REPLICATION controls the replica placement of NEW volumes before
-# they get erasure-coded (the EC worker converts full volumes to 6+4
-# automatically). "000" = single copy (small storage footprint, data is
-# protected only after EC encoding); "010" = two copies on different racks
-# (recommended when nodes can disappear for hours).
+# The default replication of NEW volumes (before the EC worker converts them
+# to 6+4) is NOT set here: with -defaultReplicaPlacement empty the filer asks
+# the master for its setting, so -defaultReplication from s3lite-master
+# (VOLUME_SIZE_LIMIT_MB / DEFAULT_REPLICATION in /etc/s3lite/server.env) is
+# the single source of truth. An explicit "000" here would silently override
+# the master and create single-copy volumes that all land on one node.
 
 [Service]
 Type=simple
 User=s3lite
-Environment=DEFAULT_REPLICATION=000
 ExecStart=/usr/bin/weed filer \
     -port=8888 \
     -master=127.0.0.1:9333 \
-    -defaultReplicaPlacement=${DEFAULT_REPLICATION} \
     -defaultStoreDir=/var/lib/s3lite/filer
 Restart=on-failure
 RestartSec=5

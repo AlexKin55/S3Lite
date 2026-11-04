@@ -54,7 +54,11 @@ NODE_IP="${NODE_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
 NODE_IP="${NODE_IP:-127.0.0.1}"
 
 # Volume size limit on master (MB). Node capacity = max * volumeSizeLimitMB.
-VOLUME_SIZE_LIMIT_MB=100
+# Single source of truth: deploy/obs/env/s3lite-server.env — the same variable
+# the packaged s3lite-master.service consumes via /etc/s3lite/server.env.
+VOLUME_SIZE_LIMIT_MB="$(sed -n 's/^VOLUME_SIZE_LIMIT_MB=//p' \
+  "${PROJECT_ROOT}/deploy/obs/env/s3lite-server.env" | tail -n1)"
+VOLUME_SIZE_LIMIT_MB="${VOLUME_SIZE_LIMIT_MB:-100}"
 
 mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${PID_DIR}"
 

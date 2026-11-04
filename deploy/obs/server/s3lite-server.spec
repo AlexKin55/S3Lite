@@ -202,7 +202,13 @@ exit 0
 * Wed Nov 04 2026 S3Lite <dev@s3lite.dev> - 0.0.5-0
 - Continuous fault tolerance: master defaults to -defaultReplication=020
   (3 replicas on 3 different racks/PCs) and -volumeSizeLimitMB=500 so EC
-  coding starts soon after writes; both overridable via /etc/s3lite/server.env
+  coding starts soon after writes; both are set (uncommented) in
+  /etc/s3lite/server.env — the single place to tune them (unit files keep a
+  fallback for older env copies)
+- Filer no longer passes -defaultReplicaPlacement=000, which silently
+  overrode the master's defaultReplication and created single-copy volumes
+  (all data on one node until EC); with the flag unset the filer inherits
+  the master setting (server.env)
 - Declarative maintenance policy /etc/s3lite/admin.toml (installed from
   s3lite-admin.toml): EC quiet period 300s, fullness ratio 0.04, scan every
   300s — weed admin applies it at every startup, overriding UI edits
