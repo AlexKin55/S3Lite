@@ -98,7 +98,14 @@ func init() {
 	m.volumePreallocate = cmdMaster.Flag.Bool("volumePreallocate", false, "Preallocate disk space for volumes.")
 	m.maxParallelVacuumPerServer = cmdMaster.Flag.Int("maxParallelVacuumPerServer", 1, "maximum number of volumes to vacuum in parallel per volume server")
 	m.vacuumIntervalSeconds = cmdMaster.Flag.Int("vacuumIntervalSeconds", 840, "seconds between automatic vacuum sweeps")
-	m.vacuumDeleteEmptyAfterSeconds = cmdMaster.Flag.Int("vacuumDeleteEmptyAfterSeconds", 0, "automatic sweep deletes volume copies that stay empty this many seconds; 0 disables")
+	// s3lite: enabled by default (upstream default is 0 = disabled). Empty
+	// volumes hold their per-node volume slots (maxVolumes = STORAGE_SIZE /
+	// volumeSizeLimitMB) forever, which deadlocks capacity once the slots run
+	// out — the cluster then refuses writes ("no writable volumes") even
+	// though the disks are nearly empty. The sweep deletes a replica only
+	// when every copy is empty and untouched for this many seconds, so
+	// freshly grown writable volumes are safe.
+	m.vacuumDeleteEmptyAfterSeconds = cmdMaster.Flag.Int("vacuumDeleteEmptyAfterSeconds", 3600, "automatic sweep deletes volume copies that stay empty this many seconds; 0 disables")
 	// m.pulseSeconds = cmdMaster.Flag.Int("pulseSeconds", 5, "number of seconds between heartbeats")
 	m.defaultReplication = cmdMaster.Flag.String("defaultReplication", "", "Default replication type if not specified.")
 	m.preferredNodesFile = cmdMaster.Flag.String("preferredNodesFile", "", "Path to a file listing preferred volume servers (\"ip:port\" per line, # comments) that should receive new volume replicas first; re-read periodically.")
