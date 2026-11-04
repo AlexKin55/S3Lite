@@ -55,6 +55,9 @@
   button.upd { background:#b45309; padding:3px 9px; font-size:11px; margin-left:8px; vertical-align:middle; }
   button.upd:hover { background:#f59e0b; }
   button.upd:disabled { background:#475569; cursor:wait; }
+  button.warn { background:#7f1d1d; }
+  button.warn:hover { background:#ef4444; }
+  button.warn:disabled { background:#475569; cursor:wait; }
   .result { margin-top:8px; font-size:13px; color:#94a3b8; min-height:16px; }
   .banner { background:#450a0a; color:#fecaca; border:1px solid #7f1d1d; border-radius:8px;
             padding:10px 14px; margin:10px 0; font-size:13.5px; line-height:1.5; }
@@ -91,6 +94,8 @@
 <div class="card">
   <button onclick="testNotify()">Test notification</button>
   <span id="notify-result"></span>
+  <button class="warn" onclick="cleanOrphans()" title="Deletes collections that hold volume data on the nodes but have no bucket on the filer (unreachable through S3, e.g. after a filer metadata reset)">🧹 Clean orphaned data</button>
+  <span id="orphans-result"></span>
 </div>
 
 <script>
@@ -210,6 +215,33 @@ document.querySelector('#nodes tbody').addEventListener('click', async (e)=>{
 async function testNotify(){
   const r = await fetch('/api/v1/admin/notify/test', {method:'POST'});
   document.getElementById('notify-result').textContent = r.ok ? 'sent ✓' : 'failed';
+}
+// "Clean orphaned data" button: shows the orphaned collections (volume data
+// with no bucket on the filer — unreachable through S3), asks for a
+// confirmation, then deletes them via the master admin API.
+async function cleanOrphans(){
+  const out = document.getElementById('orphans-result');
+  out.textContent = 'checking…';
+  let info;
+  try { info = await (await fetch('/api/v1/orphans')).json(); }
+  catch(e) { out.textContent = 'orphan check failed'; return; }
+  if(info.error){ out.textContent = 'orphan check failed: '+esc(info.error); return; }
+  const orphans = info.orphans || [];
+  if(!orphans.length){ out.textContent = 'no orphaned data found ✓'; return; }
+  const lines = orphans.map(o=>'  • '+o.name+': '+fmtBytes(o.size)+' ('+o.files+' files, '+o.volumes+' volumes'+
+    (o.ec_shards ? ', '+o.ec_shards+' EC shards' : '')+')').join('\n');
+  if(!confirm('These collections hold volume data on the nodes but have no bucket on the filer, so they cannot be reached through S3 (typically after a filer metadata reset).\n\n'+lines+
+    '\n\nTotal: '+fmtBytes(info.total_bytes)+
+    '\n\nDelete them permanently? This cannot be undone.')) { out.textContent = 'cancelled'; return; }
+  out.textContent = 'deleting…';
+  let r;
+  try { r = await fetch('/api/v1/orphans/cleanup', {method:'POST'}); }
+  catch(e) { out.textContent = 'cleanup request failed'; return; }
+  if(!r.ok){ out.textContent = 'cleanup failed (HTTP '+r.status+')'; return; }
+  const j = await r.json();
+  out.textContent = 'deleted '+(j.deleted||[]).length+' collection(s), freed '+fmtBytes(j.freed_bytes||0)+
+    ((j.errors||[]).length ? ' — errors: '+j.errors.join('; ') : '')+' ✓';
+  load();
 }
 // "Update agent" button (in the Agent version cell): schedule an agent
 // self-update. The command is delivered to the agent with its next

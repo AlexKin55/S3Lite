@@ -28,6 +28,12 @@ type server struct {
 	master   *masterapi.Client
 	notifier *notify.Notifier
 
+	// Filer HTTP address, used to list the existing S3 buckets (/buckets/).
+	// The "clean orphaned data" action refuses to run when the filer cannot
+	// confirm the bucket list (fail-safe: no guessing which collections are
+	// orphans).
+	filerAddr string
+
 	// Fixed volume parameters handed to agents at registration.
 	volumeCfg VolumeTemplate
 
@@ -85,6 +91,7 @@ func main() {
 	tlsCert := flag.String("tlsCert", "", "TLS certificate file (PEM). Empty = plain HTTP")
 	tlsKey := flag.String("tlsKey", "", "TLS private key file (PEM)")
 	masterHTTP := flag.String("master", "192.168.1.9:9333", "SeaweedFS master HTTP address")
+	filerHTTP := flag.String("filer", "127.0.0.1:8888", "SeaweedFS filer HTTP address (used to list existing S3 buckets)")
 	pollSec := flag.Int("poll", 15, "redundancy poll interval (seconds)")
 	hbTTL := flag.Int("heartbeatTTL", 60, "agent heartbeat TTL (seconds)")
 	minWriteNodes := flag.Int("minWriteNodes", 10, "refuse S3 writes when fewer volume servers are online than this (cluster read-only); 0 disables the guard. Set >= dataShards+parityShards of the EC scheme")
@@ -106,10 +113,11 @@ func main() {
 	}
 
 	srv := &server{
-		reg:      reg,
-		master:   masterapi.New(*masterHTTP, 10*time.Second),
-		notifier: notifier,
-		hbTTL:    time.Duration(*hbTTL) * time.Second,
+		reg:       reg,
+		master:    masterapi.New(*masterHTTP, 10*time.Second),
+		notifier:  notifier,
+		filerAddr: *filerHTTP,
+		hbTTL:     time.Duration(*hbTTL) * time.Second,
 		volumeCfg: VolumeTemplate{
 			Master:     *masterHTTP,
 			DataCenter: *dc,
@@ -146,6 +154,8 @@ func main() {
 	mux.HandleFunc("/api/v1/volumes/risk", srv.handleVolumesRisk)
 	mux.HandleFunc("/api/v1/admin/notify/test", srv.handleNotifyTest)
 	mux.HandleFunc("/api/v1/dashboard", srv.dashboardAPI)
+	mux.HandleFunc("/api/v1/orphans", srv.handleOrphansList)
+	mux.HandleFunc("/api/v1/orphans/cleanup", srv.handleOrphansCleanup)
 	mux.HandleFunc("/", srv.handleDashboard)
 	mux.HandleFunc("/metrics", srv.handleMetrics)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {

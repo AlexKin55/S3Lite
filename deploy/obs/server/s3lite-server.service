@@ -8,6 +8,7 @@ Type=simple
 User=s3lite
 Environment=LISTEN=:8099
 Environment=MASTER=127.0.0.1:9333
+Environment=FILER=127.0.0.1:8888
 Environment=TLS_CERT=
 Environment=TLS_KEY=
 Environment=WEBHOOK=
@@ -17,6 +18,7 @@ EnvironmentFile=-/etc/s3lite/server.env
 ExecStart=/usr/bin/s3lite-server \
     -listen=${LISTEN} \
     -master=${MASTER} \
+    -filer=${FILER} \
     -tlsCert=${TLS_CERT} \
     -tlsKey=${TLS_KEY} \
     -webhook=${WEBHOOK} \
