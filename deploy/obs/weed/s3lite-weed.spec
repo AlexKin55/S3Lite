@@ -18,7 +18,7 @@
 #   spec must match it (the check in %prep fails the build otherwise).
 #
 Name:           s3lite-weed
-Version:        0.0.3
+Version:        0.0.4
 Release:        0
 Summary:        S3Lite distributed S3 storage - bundled SeaweedFS binaries
 License:        Apache-2.0
@@ -88,6 +88,14 @@ install -D -m 0644 README.md %{buildroot}%{_defaultdocdir}/s3lite-weed/README.md
 %doc README.md
 
 %changelog
+* Wed Nov 04 2026 S3Lite <dev@s3lite.dev> - 0.0.4-0
+- SeaweedFS core: operator-preferred volume servers — the master places new
+  raw volume replicas on preferred ("reliable") nodes first and falls back to
+  regular nodes when they run out of free slots; the preference is fed via
+  weed master -preferredNodesFile (written by s3lite-server, applied without
+  a master restart)
+- Admin dash: invalidate the collection stats cache right after a bucket
+  deletion so the buckets page reflects it immediately
 * Tue Oct 27 2026 S3Lite <dev@s3lite.dev> - 0.0.2-0
 - Split the bundled SeaweedFS binaries into their own package so s3lite-server
   does not have to depend on the node agent

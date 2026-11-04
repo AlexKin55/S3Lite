@@ -18,7 +18,7 @@
 #   spec must match it (the check in %prep fails the build otherwise).
 #
 Name:           s3lite-server
-Version:        0.0.4
+Version:        0.0.5
 Release:        0
 Summary:        S3Lite distributed S3 storage - control plane server
 License:        Apache-2.0
@@ -199,6 +199,17 @@ exit 0
 %doc s3lite-src/README.md
 
 %changelog
+* Wed Nov 04 2026 S3Lite <dev@s3lite.dev> - 0.0.5-0
+- Continuous fault tolerance: master defaults to -defaultReplication=020
+  (3 replicas on 3 different racks/PCs) and -volumeSizeLimitMB=500 so EC
+  coding starts soon after writes; both overridable via /etc/s3lite/server.env
+- Declarative maintenance policy /etc/s3lite/admin.toml (installed from
+  s3lite-admin.toml): EC quiet period 300s, fullness ratio 0.04, scan every
+  300s — weed admin applies it at every startup, overriding UI edits
+- Control plane: "preferred replica target" toggle per node (dashboard star
+  column, POST /api/v1/nodes/{id}/preferred); the flag list is published to
+  weed master -preferredNodesFile and applied without a master restart;
+  preferred flags persist in /var/lib/s3lite/server-state.json
 * Tue Nov 03 2026 S3Lite <dev@s3lite.dev> - 0.0.4-0
 - Install-and-run cluster: ship and auto-start filer, S3 gateway, maintenance
   admin (EC task config UI) and EC worker (automatic 6+4 erasure coding)
