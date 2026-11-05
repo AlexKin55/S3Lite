@@ -53,9 +53,10 @@ EC_SCAN_INTERVAL_SECONDS=300
 NODE_IP="${NODE_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
 NODE_IP="${NODE_IP:-127.0.0.1}"
 
-# The volume size limit is the compiled-in weed default (500 MB, see
-# src/thirdparty/seaweedfs/weed/util/volume_size.go) — the same default the
-# packaged master uses; the flag is not passed at all.
+# Volume size limit and node capacity (mirrors deploy/obs/env/s3lite-agent.env)
+VOLUME_SIZE_LIMIT_MB=1024  # 1 GB per volume
+STORAGE_SIZE_GB=1           # 1 GB per node
+MAX_VOLUMES_PER_NODE=2      # STORAGE_SIZE_GB / (VOLUME_SIZE_LIMIT_MB / 1024)
 
 mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${PID_DIR}"
 
@@ -87,12 +88,13 @@ start() {
   # -preferredNodesFile is the preferred-replica list; in production the
   # control plane (s3lite-server dashboard ★ toggle) writes it and the
   # master re-reads it periodically. Locally it can be edited by hand.
-  : >"${CLUSTER_DIR}/preferred-nodes.txt"
+  # Temporarily disabled -preferredNodesFile for local testing
+  # : >"${CLUSTER_DIR}/preferred-nodes.txt"
   run_bg master "${WEED}" master \
     -port="${MASTER_PORT}" \
     -mdir="${DATA_DIR}/master" \
     -defaultReplication="${DEFAULT_REPLICATION}" \
-    -preferredNodesFile="${CLUSTER_DIR}/preferred-nodes.txt"
+    -volumeSizeLimitMB="${VOLUME_SIZE_LIMIT_MB}"
 
   sleep 1
   for i in $(seq 1 "${count}"); do
@@ -104,7 +106,9 @@ start() {
       -dir="${DATA_DIR}/v${i}" \
       -master="127.0.0.1:${MASTER_PORT}" \
       -dataCenter=dc1 \
-      -rack="rack${i}"
+      -rack="rack${i}" \
+      -max="${MAX_VOLUMES_PER_NODE}" \
+      -storageSizeGB="${STORAGE_SIZE_GB}"
     # Brief pause so each node registers with the master before the next starts.
     sleep 0.3
   done

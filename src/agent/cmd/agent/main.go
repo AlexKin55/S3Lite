@@ -109,6 +109,7 @@ func run(agentDir, serverOverride string, portOverride int, weedOverride, storag
 		Rack:       pickRack(cfg.Rack, volCfg.Rack),
 		MaxVolumes: pickMax(cfg.MaxVolumes, volCfg.MaxVolumes),
 		DiskType:   pickDisk(cfg.DiskType, volCfg.DiskType),
+		StorageGB:  int(cfg.CapacityBytes / (1024 * 1024 * 1024)),
 		LogPath:    logPath,
 	})
 

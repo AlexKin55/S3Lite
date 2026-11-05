@@ -249,6 +249,7 @@ var (
 	volumeWhiteListOption = cmdVolume.Flag.String("whiteList", "", "comma separated Ip addresses having write permission. No limit if empty.")
 	minFreeSpacePercent   = cmdVolume.Flag.String("minFreeSpacePercent", "1", "minimum free disk space (default to 1%). Low disk space will mark all volumes as ReadOnly (deprecated, use minFreeSpace instead).")
 	minFreeSpace          = cmdVolume.Flag.String("minFreeSpace", "", "min free disk space (value<=100 as percentage like 1, other as human readable bytes, like 10GiB). Low disk space will mark all volumes as ReadOnly.")
+	storageSizeGB         = cmdVolume.Flag.Int("storageSizeGB", 0, "maximum storage size in GB this node contributes to the cluster (0 = unlimited)")
 )
 
 func runVolume(cmd *Command, args []string) bool {
@@ -461,6 +462,12 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 		*v.allowUntrustedRemoteEndpoints,
 		diskProbeConfig,
 	)
+
+	// Apply hard storage size limit (STORAGE_SIZE) if configured
+	if *storageSizeGB > 0 {
+		volumeServer.SetStorageSizeBytes(uint64(*storageSizeGB) * 1024 * 1024 * 1024)
+		glog.V(0).Infof("Storage size limit set: %d GB", *storageSizeGB)
+	}
 	// starting grpc server
 	grpcS := v.startGrpcService(volumeServer)
 

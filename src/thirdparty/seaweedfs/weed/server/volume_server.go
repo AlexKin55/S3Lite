@@ -186,6 +186,13 @@ func (vs *VolumeServer) SetStopping() {
 	vs.store.SetStopping()
 }
 
+// SetStorageSizeBytes sets the hard storage size limit for this volume server.
+// When set, new volume creation is refused once stored bytes meet or exceed the limit.
+// 0 means unlimited.
+func (vs *VolumeServer) SetStorageSizeBytes(bytes uint64) {
+	vs.store.SetStorageSizeBytes(bytes)
+}
+
 func (vs *VolumeServer) LoadNewVolumes() {
 	glog.V(0).Infoln(" Loading new volume ids ...")
 	vs.store.LoadNewVolumes()

@@ -26,6 +26,7 @@ type VolumeArgs struct {
 	Rack       string // -rack
 	MaxVolumes int    // -max (0 = SeaweedFS default)
 	DiskType   string // -disk
+	StorageGB  int    // -storageSizeGB (0 = unlimited)
 	LogPath    string // process log file (empty = discard)
 }
 
@@ -88,6 +89,9 @@ func (s *Supervisor) startLocked(restartDelay time.Duration) error {
 	}
 	if s.args.DiskType != "" {
 		args = append(args, "-disk="+s.args.DiskType)
+	}
+	if s.args.StorageGB > 0 {
+		args = append(args, "-storageSizeGB="+strconv.Itoa(s.args.StorageGB))
 	}
 
 	cmd := exec.Command(s.args.WeedBin, args...)

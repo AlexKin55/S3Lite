@@ -249,6 +249,11 @@ func (v *Volume) datAllocatedSize() uint64 {
 	return allocatedSize(fi)
 }
 
+// DataAllocatedSize returns the disk space held by the .dat file, or 0 when it is unknown.
+func (v *Volume) DataAllocatedSize() uint64 {
+	return v.datAllocatedSize()
+}
+
 func (v *Volume) ContentSize() uint64 {
 	v.dataFileAccessLock.RLock()
 	defer v.dataFileAccessLock.RUnlock()

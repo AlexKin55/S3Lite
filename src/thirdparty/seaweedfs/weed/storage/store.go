@@ -80,6 +80,7 @@ type Store struct {
 	MasterFn            func() pb.ServerAddress
 	grpcDialOption      grpc.DialOption
 	volumeSizeLimit     atomic.Uint64 // read from the master
+	storageSizeBytes    atomic.Uint64 // hard limit on total stored bytes per node (0 = unlimited)
 	preallocate         atomic.Bool   // read from the master
 	Ip                  string
 	Port                int
@@ -397,8 +398,14 @@ func (s *Store) hasFreeDiskLocation(location *DiskLocation) bool {
 		return false
 	}
 
-	// Check if disk is available
+	// Check if disk is unavailable
 	if location.isDiskUnavailable.Load() {
+		return false
+	}
+
+	// Hard storage size limit (STORAGE_SIZE): refuse new volumes when stored
+	// bytes (regular volumes + EC shards) meet or exceed the limit.
+	if s.storageSizeExceeded(location) {
 		return false
 	}
 
@@ -409,6 +416,31 @@ func (s *Store) hasFreeDiskLocation(location *DiskLocation) bool {
 
 	// Check if current volume count is below the maximum
 	return int64(location.VolumesLen()) < int64(location.MaxVolumeCount)
+}
+
+// storageSizeExceeded returns true when the total stored bytes on this disk
+// location (regular volumes + EC shards) meet or exceed the hard storage size limit.
+func (s *Store) storageSizeExceeded(location *DiskLocation) bool {
+	limit := s.GetStorageSizeBytes()
+	if limit == 0 {
+		return false
+	}
+
+	var total uint64
+
+	location.volumesLock.RLock()
+	for _, v := range location.volumes {
+		total += v.DataAllocatedSize()
+	}
+	location.volumesLock.RUnlock()
+
+	location.ecVolumesLock.RLock()
+	for _, ev := range location.ecVolumes {
+		total += ev.Size()
+	}
+	location.ecVolumesLock.RUnlock()
+
+	return total >= limit
 }
 
 func (s *Store) VolumeInfos() (allStats []*VolumeInfo) {
@@ -1360,6 +1392,14 @@ func (s *Store) SetVolumeSizeLimit(x uint64) {
 
 func (s *Store) GetVolumeSizeLimit() uint64 {
 	return s.volumeSizeLimit.Load()
+}
+
+func (s *Store) SetStorageSizeBytes(x uint64) {
+	s.storageSizeBytes.Store(x)
+}
+
+func (s *Store) GetStorageSizeBytes() uint64 {
+	return s.storageSizeBytes.Load()
 }
 
 func (s *Store) SetPreallocate(x bool) {
