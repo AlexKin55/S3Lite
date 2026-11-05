@@ -54,9 +54,10 @@ NODE_IP="${NODE_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
 NODE_IP="${NODE_IP:-127.0.0.1}"
 
 # Volume size limit and node capacity (mirrors deploy/obs/env/s3lite-agent.env)
-VOLUME_SIZE_LIMIT_MB=1024  # 1 GB per volume
 STORAGE_SIZE_GB=1           # 1 GB per node
-MAX_VOLUMES_PER_NODE=2      # STORAGE_SIZE_GB / (VOLUME_SIZE_LIMIT_MB / 1024)
+MAX_VOLUMES_PER_NODE=2      # max volumes per node
+# Volume size limit derived so that full slots never exceed STORAGE_SIZE:
+VOLUME_SIZE_LIMIT_MB=$((STORAGE_SIZE_GB * 1024 / MAX_VOLUMES_PER_NODE))  # MB per volume
 
 mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${PID_DIR}"
 
