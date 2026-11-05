@@ -106,10 +106,8 @@ func ProcessEcEncodeBatch(env *Env, writer io.Writer, volumeIds []needle.VolumeI
 	if err != nil {
 		return fmt.Errorf("ec encode for volumes %v: %w", volumeIds, err)
 	}
-	// Mounting the new shards notifies the master asynchronously, and EcBalance
-	// plans from a fresh topology snapshot: one taken before the mounts land
-	// shows no shards for these volumes, so the balance plans no moves and
-	// silently leaves every shard on the generation host.
+	// Mounting the new shards notifies the master asynchronously. Wait for the
+	// mounts to land before verifying recoverability.
 	totalShardsPerVolume := 0 // 0 = standard scheme (erasure_coding.TotalShardsCount)
 	if dataShards > 0 && parityShards > 0 {
 		totalShardsPerVolume = dataShards + parityShards
@@ -117,23 +115,36 @@ func ProcessEcEncodeBatch(env *Env, writer io.Writer, volumeIds []needle.VolumeI
 	if err := waitForEcShardsToRegister(env, volumeIds, totalShardsPerVolume); err != nil {
 		return fmt.Errorf("wait for ec shards to register with the master: %w", err)
 	}
+
+	// Verify EC shards are recoverable BEFORE touching the source replicas.
+	// expectSpread=false because shards are still all on the generation host;
+	// the post-delete EcBalance will spread them across all nodes.
+	if err := verifyEcShardsBeforeDelete(env, volumeIds, diskType, false); err != nil {
+		return fmt.Errorf("verify EC shards before deleting originals: %w", err)
+	}
+
+	// Past verify the EC copy is recoverable; a delete or balance failure below
+	// must not tear the shards down.
+	committed = true
+
+	// Delete the original replicas FIRST so their volume slots are freed on
+	// every node (including priority nodes). Only then rebalance EC shards,
+	// otherwise a balance planned while replicas still occupy slots cannot
+	// place shards on priority nodes and the 6+4 spread across all nodes
+	// collapses to whatever non-priority nodes had free slots.
+	fmt.Printf("Deleting original volumes after EC encoding...\n")
+	if err := doDeleteVolumesWithLocations(env, volumeIds, volumeLocationsMap, maxParallelization); err != nil {
+		return fmt.Errorf("delete original volumes after EC encoding: %w", err)
+	}
+
 	// EcBalance works at collection scope. In batch mode this intentionally
 	// rebalances each collection after every batch so source volumes can be
 	// safely verified and deleted without waiting for all batches to finish.
 	// skippedNodes are excluded so a recovered node's stale orphan is never
-	// paired with a new-generation shard.
+	// paired with a new-generation shard. Replicas are already deleted, so all
+	// nodes report free EC slots and shards can spread to every node.
 	if err := EcBalance(env, balanceCollections, "", rp, diskType, maxParallelization, 0, applyBalancing, skippedNodes, nil, volumeIds); err != nil {
 		return fmt.Errorf("re-balance ec shards for collection(s) %v: %w", balanceCollections, err)
-	}
-	if err := verifyEcShardsBeforeDelete(env, volumeIds, diskType, applyBalancing); err != nil {
-		return fmt.Errorf("verify EC shards before deleting originals: %w", err)
-	}
-	// Past verify the EC copy is recoverable; a delete failure below must not
-	// tear the shards down.
-	committed = true
-	fmt.Printf("Deleting original volumes after EC encoding...\n")
-	if err := doDeleteVolumesWithLocations(env, volumeIds, volumeLocationsMap, maxParallelization); err != nil {
-		return fmt.Errorf("delete original volumes after EC encoding: %w", err)
 	}
 	fmt.Printf("Successfully completed EC encoding for %d volumes\n", len(volumeIds))
 	return nil
