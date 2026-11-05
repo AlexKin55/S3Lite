@@ -436,13 +436,14 @@ func (s *server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"node_id": n.NodeID,
 		"volume": map[string]any{
-			"master":      s.volumeCfg.Master,
-			"data_center": s.volumeCfg.DataCenter,
-			"rack":        n.Rack,
-			"max_volumes": maxVol,
-			"disk_type":   s.volumeCfg.DiskType,
-			"weed_url":    "",
-			"volume_port": n.VolumePort,
+			"master":            s.volumeCfg.Master,
+			"data_center":       s.volumeCfg.DataCenter,
+			"rack":              n.Rack,
+			"max_volumes":       maxVol,
+			"volume_size_limit_mb": s.volSizeLimitMB,
+			"disk_type":         s.volumeCfg.DiskType,
+			"weed_url":          "",
+			"volume_port":       n.VolumePort,
 		},
 	})
 }

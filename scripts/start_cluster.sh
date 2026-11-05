@@ -54,10 +54,9 @@ NODE_IP="${NODE_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
 NODE_IP="${NODE_IP:-127.0.0.1}"
 
 # Volume size limit and node capacity (mirrors deploy/obs/env/s3lite-agent.env)
+VOLUME_SIZE_LIMIT_MB=1024   # 1 GB per volume (from server config in production)
 STORAGE_SIZE_GB=1           # 1 GB per node
-MAX_VOLUMES_PER_NODE=2      # max volumes per node
-# Volume size limit derived so that full slots never exceed STORAGE_SIZE:
-VOLUME_SIZE_LIMIT_MB=$((STORAGE_SIZE_GB * 1024 / MAX_VOLUMES_PER_NODE))  # MB per volume
+MAX_VOLUMES_PER_NODE=2      # max volumes per node (STORAGE_SIZE / (VOLUME_SIZE_LIMIT_MB/1024))
 
 mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${PID_DIR}"
 
@@ -108,8 +107,9 @@ start() {
       -master="127.0.0.1:${MASTER_PORT}" \
       -dataCenter=dc1 \
       -rack="rack${i}" \
-      -max="${MAX_VOLUMES_PER_NODE}" \
-      -storageSizeGB="${STORAGE_SIZE_GB}"
+    -max="${MAX_VOLUMES_PER_NODE}" \
+    -volumeSizeLimitMB="${VOLUME_SIZE_LIMIT_MB}" \
+    -storageSizeGB="${STORAGE_SIZE_GB}"
     # Brief pause so each node registers with the master before the next starts.
     sleep 0.3
   done

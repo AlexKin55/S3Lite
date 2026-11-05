@@ -44,13 +44,14 @@ type RegisterRequest struct {
 
 // VolumeConfig is the volume server configuration returned by the server.
 type VolumeConfig struct {
-	Master     string `json:"master"` // master address, e.g. "192.168.1.9:9333"
-	DataCenter string `json:"data_center"`
-	Rack       string `json:"rack"`
-	MaxVolumes int    `json:"max_volumes"`
-	DiskType   string `json:"disk_type"`
-	WeedURL    string `json:"weed_url"` // binary URL; empty = use the local binary
-	VolumePort int    `json:"volume_port"`
+	Master            string `json:"master"`
+	DataCenter        string `json:"data_center"`
+	Rack              string `json:"rack"`
+	MaxVolumes        int    `json:"max_volumes"`
+	VolumeSizeLimitMB int    `json:"volume_size_limit_mb"`
+	DiskType          string `json:"disk_type"`
+	WeedURL           string `json:"weed_url"`
+	VolumePort        int    `json:"volume_port"`
 }
 
 // RegisterResponse is the POST /api/v1/nodes response.

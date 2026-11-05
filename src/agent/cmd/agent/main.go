@@ -99,6 +99,20 @@ func run(agentDir, serverOverride string, portOverride int, weedOverride, storag
 	}
 
 	volumePort := pickPort(volCfg.VolumePort, cfg.Port)
+
+	// Derive max volumes from node capacity and the volume size limit
+	// advertised by the server: slots = STORAGE_SIZE / volumeSizeLimitMB.
+	maxVolumes := pickMax(cfg.MaxVolumes, volCfg.MaxVolumes)
+	if volCfg.VolumeSizeLimitMB > 0 && cfg.CapacityBytes > 0 {
+		if n := int(cfg.CapacityBytes / (int64(volCfg.VolumeSizeLimitMB) * 1024 * 1024)); n > 0 {
+			maxVolumes = n
+		} else {
+			maxVolumes = 1
+			fmt.Printf("agent: capacity %d bytes is below one volume (%d MB); granting 1 volume slot\n",
+				cfg.CapacityBytes, volCfg.VolumeSizeLimitMB)
+		}
+	}
+
 	sup := supervisor.New(supervisor.VolumeArgs{
 		WeedBin:    cfg.WeedBin,
 		IP:         ip,
@@ -107,7 +121,7 @@ func run(agentDir, serverOverride string, portOverride int, weedOverride, storag
 		Dir:        dataDir,
 		DataCenter: volCfg.DataCenter,
 		Rack:       pickRack(cfg.Rack, volCfg.Rack),
-		MaxVolumes: pickMax(cfg.MaxVolumes, volCfg.MaxVolumes),
+		MaxVolumes: maxVolumes,
 		DiskType:   pickDisk(cfg.DiskType, volCfg.DiskType),
 		StorageGB:  int(cfg.CapacityBytes / (1024 * 1024 * 1024)),
 		LogPath:    logPath,
