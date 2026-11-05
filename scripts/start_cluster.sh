@@ -85,16 +85,22 @@ start() {
 
   echo "==> Starting SeaweedFS cluster: master:${MASTER_PORT}, volume x${count} (${VOLUME_BASE_PORT}..$((VOLUME_BASE_PORT + count - 1))), filer:${FILER_PORT}, s3:${S3_PORT}, admin:${ADMIN_PORT} (EC ${EC_DATA_SHARDS}+${EC_PARITY_SHARDS})"
 
-  # -preferredNodesFile is the preferred-replica list; in production the
-  # control plane (s3lite-server dashboard ★ toggle) writes it and the
-  # master re-reads it periodically. Locally it can be edited by hand.
-  # Temporarily disabled -preferredNodesFile for local testing
-  # : >"${CLUSTER_DIR}/preferred-nodes.txt"
-  run_bg master "${WEED}" master \
-    -port="${MASTER_PORT}" \
-    -mdir="${DATA_DIR}/master" \
-    -defaultReplication="${DEFAULT_REPLICATION}" \
-    -volumeSizeLimitMB="${VOLUME_SIZE_LIMIT_MB}"
+# -preferredNodesFile lists priority volume servers that get replicas first.
+# In production the control plane writes it; locally we enable it for the
+# priority-node EC test (3 priority nodes, 7 fallback nodes).
+PREFERRED_NODES_FILE="${CLUSTER_DIR}/preferred-nodes.txt"
+# Mark first 3 volume servers as preferred replica targets.
+printf '%s\n' \
+  "${NODE_IP}:$((VOLUME_BASE_PORT + 0))" \
+  "${NODE_IP}:$((VOLUME_BASE_PORT + 1))" \
+  "${NODE_IP}:$((VOLUME_BASE_PORT + 2))" \
+  > "${PREFERRED_NODES_FILE}"
+run_bg master "${WEED}" master \
+  -port="${MASTER_PORT}" \
+  -mdir="${DATA_DIR}/master" \
+  -defaultReplication="${DEFAULT_REPLICATION}" \
+  -volumeSizeLimitMB="${VOLUME_SIZE_LIMIT_MB}" \
+  -preferredNodesFile="${PREFERRED_NODES_FILE}"
 
   sleep 1
   for i in $(seq 1 "${count}"); do
