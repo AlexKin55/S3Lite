@@ -107,9 +107,9 @@ start() {
       -master="127.0.0.1:${MASTER_PORT}" \
       -dataCenter=dc1 \
       -rack="rack${i}" \
-    -max="${MAX_VOLUMES_PER_NODE}" \
-    -volumeSizeLimitMB="${VOLUME_SIZE_LIMIT_MB}" \
-    -storageSizeGB="${STORAGE_SIZE_GB}"
+      -max="${MAX_VOLUMES_PER_NODE}" \
+      -volumeSizeLimitMB="${VOLUME_SIZE_LIMIT_MB}" \
+      -storageSizeGB="${STORAGE_SIZE_GB}"
     # Brief pause so each node registers with the master before the next starts.
     sleep 0.3
   done
