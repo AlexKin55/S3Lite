@@ -124,12 +124,29 @@ wipe_data() {
     log "Локальные данные и тома кластера удалены."
 }
 
+resume_volume_growth() {
+    log "=== Возобновление роста томов на мастере ==="
+    # После полной очистки /var/lib/s3lite/master мастер теряет состояние
+    # роста томов и замораживает его (volume growth frozen). Нужно явно
+    # возобновить рост, иначе запись в кластер будет недоступна.
+    if command -v weed >/dev/null 2>&1; then
+        printf 'lock\nvolume.growth.resume\nquit\n' | \
+            weed shell -master="${MASTER_ADDR}" -filer="127.0.0.1:8888" 2>&1 \
+            | grep -q 'volume growth resumed' \
+            && log "Рост томов возобновлён" \
+            || log "Рост томов уже активен или возобновить не удалось (см. выше)"
+    else
+        log "weed не найден в PATH, пропуск возобновления роста томов"
+    fi
+}
+
 case "${1:-}" in
     --restart)
         delete_collections
         stop_services
         wipe_data
         start_services
+        resume_volume_growth
         ;;
     "")
         delete_collections
