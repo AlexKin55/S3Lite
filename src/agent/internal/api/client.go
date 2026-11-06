@@ -147,7 +147,7 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("%s %s: %w", method, path, err)
+		return fmt.Errorf("%s %s: %s", method, path, explainConnErr(err, c.baseURL))
 	}
 	defer resp.Body.Close()
 
@@ -171,4 +171,43 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// explainConnErr converts low-level net/http connection errors into
+// actionable hints: wrong URL scheme (HTTP vs HTTPS), server down, bad host,
+// or network timeout.
+func explainConnErr(err error, baseURL string) string {
+	msg := err.Error()
+
+	// The agent used https:// but the control plane speaks plain HTTP.
+	if strings.Contains(msg, "server gave HTTP response to HTTPS client") {
+		scheme := "http"
+		if strings.HasPrefix(baseURL, "http://") {
+			scheme = "https"
+		}
+		return fmt.Sprintf("control plane %s speaks %s, not %s: check CONTROL_PLANE scheme in %s",
+			baseURL, scheme, strings.TrimPrefix(baseURL, "://"), configPathHint())
+	}
+
+	// Connection refused: nothing is listening on that address.
+	if strings.Contains(msg, "connection refused") {
+		return fmt.Sprintf("control plane %s is not accepting connections: is the server running and listening?", baseURL)
+	}
+
+	// No such host: DNS resolution failed or the hostname is wrong.
+	if strings.Contains(msg, "no such host") {
+		return fmt.Sprintf("control plane host %s cannot be resolved: check CONTROL_PLANE hostname", baseURL)
+	}
+
+	// i/o timeout: the host exists but does not respond (firewall, wrong port).
+	if strings.Contains(msg, "i/o timeout") || strings.Contains(msg, "timeout") {
+		return fmt.Sprintf("control plane %s is not responding: check network, firewall, and port", baseURL)
+	}
+
+	return msg
+}
+
+// configPathHint returns a short hint about where CONTROL_PLANE is configured.
+func configPathHint() string {
+	return "/etc/s3lite/agent.env (CONTROL_PLANE) or the -server flag"
 }
