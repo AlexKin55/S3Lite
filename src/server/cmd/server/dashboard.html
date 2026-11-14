@@ -105,19 +105,6 @@
  <div id="del-result" class="result"></div>
 </div>
 
-<h2>EC volumes</h2>
-<div class="filter-row">
-  <input id="ecFilter" placeholder="Filter by Collection…" />
-</div>
-<div class="card scroll">
- <table id="volumes">
-   <thead><tr>
-     <th>Collection</th><th>Volume</th><th>Config</th><th>State</th><th>Shards</th><th>Offline nodes</th><th>Power on to restore</th>
-   </tr></thead>
-   <tbody></tbody>
- </table>
-</div>
-
 <script>
 function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function fmtBytes(b){ if(!b) return '0 B'; const u=['B','KB','MB','GB','TB']; const i=Math.min(u.length-1,Math.floor(Math.log(b)/Math.log(1024)));
@@ -139,10 +126,10 @@ function diskBar(used, cap){
 // Node ids expanded by the user; re-applied on every auto-refresh so the
 // details row doesn't collapse when the table is re-rendered.
 const expanded = new Set();
-let nodeFilter = '', ecFilter = '';
+let nodeFilter = '';
 async function load(){
   const j = await (await fetch('/api/v1/dashboard')).json();
-  const ec = j.ec, cap = j.capacity, ns = j.node_status, nodes = j.nodes, health = j.health||'healthy';
+  const cap = j.capacity, ns = j.node_status, nodes = j.nodes, health = j.health||'healthy';
   const dups = j.duplicates || [];
   const latestAgent = j.agent_latest_version || '';
   const outdated = (j.agents_outdated||0);
@@ -168,8 +155,6 @@ async function load(){
     '<div class="stat"><b>'+(ns.degraded||0)+'</b>degraded</div>'+
     '<div class="stat risk"><b>'+ns.offline+'</b>offline</div>'+
     '<div class="stat'+(outdated?' ok':'')+'" title="Newest agent version seen in the cluster: '+(latestAgent?esc(latestAgent):'—')+'"><b>'+outdated+'</b>agent'+(outdated===1?'':'s')+' outdated</div>'+
-    '<div class="stat"><b>'+ec.ok+'</b>EC ok</div>'+
-    '<div class="stat risk"><b>'+ec.at_risk+'</b>EC at risk</div>'+
     '<div class="stat"><b>'+fmtBytes(cap.used_bytes)+'</b>used / '+fmtBytes(cap.total_bytes)+'</div>'+
     '<div class="stat ok"><b>'+fmtBytes(cap.free_bytes)+'</b>free</div>';
   const nt=nodes.map(n=>{
@@ -212,14 +197,6 @@ async function load(){
         (n.log_tail ? '<div class="logtail">'+esc(n.log_tail)+'</div>' : '')+'</td></tr>' : '');
   }).join('');
   document.querySelector('#nodes tbody').innerHTML = nt || '<tr><td colspan=11>— no nodes registered —</td></tr>';
-  const vols = ecFilter ? j.volumes.filter(v => String(v.collection).toLowerCase().includes(ecFilter)) : j.volumes;
-  const vt=vols.map(v=>'<tr><td>'+esc(v.collection)+'</td><td>'+v.volume_id+'</td>'+
-    '<td>'+(v.data_shards?+(v.data_shards)+'+'+(v.parity_shards||0):'—')+'</td>'+
-    '<td class="'+v.state.toLowerCase()+'">'+v.state+'</td>'+
-    '<td>'+v.available_shards+'/'+v.total_shards+'</td>'+
-    '<td>'+esc((v.offline_nodes||[]).join(', '))+'</td>'+
-    '<td>'+esc((v.nodes_to_start||[]).join(', '))+'</td></tr>').join('');
-  document.querySelector('#volumes tbody').innerHTML = vt || '<tr><td colspan=7>— no EC volumes —</td></tr>';
 }
 // Click a node row to expand/collapse its details row (the delete button
 // keeps its own handler, so clicks on it do not toggle the accordion).
@@ -343,7 +320,6 @@ document.querySelector('#nodes tbody').addEventListener('click', async (e)=>{
 });
 setInterval(load, 5000); load();
 document.getElementById('nodeFilter').addEventListener('input', (e)=>{ nodeFilter = e.target.value.toLowerCase(); load(); });
-document.getElementById('ecFilter').addEventListener('input', (e)=>{ ecFilter = e.target.value.toLowerCase(); load(); });
 
 // "Redistribute data" button: triggers immediate EC encoding + shard
 // distribution via the admin's plugin API (detect + run for erasure_coding).

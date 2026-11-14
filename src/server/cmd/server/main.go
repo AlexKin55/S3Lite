@@ -20,7 +20,6 @@ import (
 
 	"s3lite.dev/server/internal/masterapi"
 	"s3lite.dev/server/internal/notify"
-	"s3lite.dev/server/internal/redundancy"
 	"s3lite.dev/server/internal/store"
 )
 
@@ -59,10 +58,6 @@ type server struct {
 	// dashboard: a node is online while its heartbeat is fresher than this.
 	hbTTL time.Duration
 
-	// Latest redundancy evaluation snapshot.
-	lastReports atomic.Value // []redundancy.Report
-	lastUpdate  atomic.Value // time.Time
-	lastTopoEC  atomic.Int64 // number of EC volumes in the last snapshot
 	// Volume servers currently listed by the master; drives the cluster-wide
 	// read-only policy (minWriteNodes) consumed by s3proxy.
 	lastActiveNodes atomic.Int64
@@ -87,16 +82,6 @@ type server struct {
 	// newestAgentVersionSeen guards under agentVerMu; empty until the first
 	// heartbeat with a version string arrives.
 	newestAgentVersionSeen string
-
-	// Placement history: merged per-volume shard layout (see redundancy.Merge).
-	// Keeps nodes that dropped out of the master topology known to the advice
-	// engine so "which PCs to power back on" can name them. Entries that stop
-	// being confirmed by fresh snapshots are aged out, so a re-used volume id
-	// (e.g. after a master restart) is not reported as a phantom EC volume.
-	histMu      sync.Mutex
-	histVolumes []*redundancy.Volume
-	histMiss    map[redundancy.VolumeKey]int
-	histMaxMiss int // evict after this many unconfirmed polls
 }
 
 // VolumeTemplate is the static part of the volume config sent to agents.
@@ -115,7 +100,7 @@ func main() {
 	tlsKey := flag.String("tlsKey", "", "TLS private key file (PEM)")
 	masterHTTP := flag.String("master", "192.168.1.9:9333", "SeaweedFS master HTTP address")
 	filerHTTP := flag.String("filer", "127.0.0.1:8888", "SeaweedFS filer HTTP address (used to list existing S3 buckets)")
-	pollSec := flag.Int("poll", 15, "redundancy poll interval (seconds)")
+	pollSec := flag.Int("poll", 15, "topology poll interval (seconds)")
 	hbTTL := flag.Int("heartbeatTTL", 60, "agent heartbeat TTL (seconds)")
 	minWriteNodes := flag.Int("minWriteNodes", 10, "refuse S3 writes when fewer volume servers are online than this (cluster read-only); 0 disables the guard. Set >= dataShards+parityShards of the EC scheme")
 	webhookURL := flag.String("webhook", "", "webhook URL for notifications (empty = log only)")
@@ -157,11 +142,6 @@ func main() {
 		weedBin:       *weedBin,
 		fsckTimeout:   *fsckTimeout,
 	}
-	srv.lastReports.Store([]*redundancy.Report{})
-	srv.histVolumes = []*redundancy.Volume{}
-	srv.histMiss = make(map[redundancy.VolumeKey]int)
-	srv.histMaxMiss = 10 // ~10 polls before a phantom volume is forgotten
-	srv.lastUpdate.Store(time.Time{})
 	srv.preferredNodesFile = *preferredNodesFile
 	srv.preferredPolicyFile = *preferredPolicyFile
 	srv.adminURL = *adminURL
@@ -188,7 +168,6 @@ func main() {
 	mux.HandleFunc("/api/v1/nodes/preferred", srv.handleNodesPreferred)
 	mux.HandleFunc("/api/v1/nodes/", srv.handleNodePath)
 	mux.HandleFunc("/api/v1/cluster/status", srv.handleClusterStatus)
-	mux.HandleFunc("/api/v1/volumes/risk", srv.handleVolumesRisk)
 	mux.HandleFunc("/api/v1/admin/notify/test", srv.handleNotifyTest)
 	mux.HandleFunc("/api/v1/maintenance/encode", srv.handleMaintenanceEncode)
 	mux.HandleFunc("/api/v1/dashboard", srv.dashboardAPI)
@@ -219,7 +198,7 @@ func main() {
 	}
 }
 
-// monitorLoop polls the master topology and evaluates redundancy.
+// monitorLoop polls the master topology and updates the writable/read-only state.
 func (s *server) monitorLoop(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(time.Second) // first run immediately
 	defer ticker.Stop()
@@ -244,73 +223,6 @@ func (s *server) evaluate(ctx context.Context) {
 	activeNodes := countTopologyNodes(topo)
 	s.lastActiveNodes.Store(int64(activeNodes))
 	s.notifyWritableChange(activeNodes)
-	online := s.buildOnline(topo)
-	fresh := redundancy.Collect(topo)
-	// Merge the fresh snapshot into the placement history: shard layouts of
-	// volumes whose nodes vanished from the topology survive, so offline nodes
-	// (and the shards they hold) stay visible to the classifier and set cover.
-	// Volumes that stop appearing in fresh snapshots age out (histMaxMiss),
-	// which prevents phantom EC reports for re-used volume ids.
-	s.histMu.Lock()
-	history := append([]*redundancy.Volume(nil), s.histVolumes...)
-	merged := redundancy.Merge(history, fresh)
-	inFresh := make(map[redundancy.VolumeKey]bool, len(fresh))
-	for _, v := range fresh {
-		inFresh[v.Key()] = true
-	}
-	for _, v := range merged {
-		k := v.Key()
-		if inFresh[k] {
-			s.histMiss[k] = 0
-		} else {
-			s.histMiss[k]++
-		}
-	}
-	kept := merged[:0]
-	for _, v := range merged {
-		if s.histMiss[v.Key()] <= s.histMaxMiss {
-			kept = append(kept, v)
-		}
-	}
-	s.histVolumes = kept
-	s.histMu.Unlock()
-	reports := redundancy.Evaluate(kept, func(addr string) bool { return online[addr] })
-
-	prev := s.lastReports.Load().([]*redundancy.Report)
-	s.lastReports.Store(reports)
-	s.lastUpdate.Store(time.Now())
-	s.lastTopoEC.Store(int64(len(kept)))
-
-	// Notify on AT_RISK transitions and on changed recommendation sets.
-	for i := range reports {
-		r := reports[i]
-		if r.State != redundancy.StateAtRisk {
-			continue
-		}
-		var prevState string
-		var prevNodes []string
-		prevState = ""
-		for j := range prev {
-			if prev[j].Collection == r.Collection && prev[j].VolumeID == r.VolumeID {
-				prevState = prev[j].State
-				prevNodes = prev[j].NodesToStart
-			}
-		}
-		changed := prevState != redundancy.StateAtRisk ||
-			!sameStrings(prevNodes, r.NodesToStart)
-		if !changed {
-			continue
-		}
-		key := fmt.Sprintf("%s/%d/atrisk", r.Collection, r.VolumeID)
-		s.notifier.Notify(key, notify.Event{
-			Kind: "volume_at_risk",
-			Summary: fmt.Sprintf("Volume %d (%s) AT_RISK: %d/%d shards available",
-				r.VolumeID, r.Collection, r.Available, r.Total),
-			Detail: fmt.Sprintf("Data is unrecoverable right now. Restore by turning on: %v",
-				r.NodesToStart),
-			At: time.Now(),
-		})
-	}
 }
 
 // countTopologyNodes returns how many volume servers the master currently lists.
@@ -354,40 +266,6 @@ func (s *server) notifyWritableChange(activeNodes int) {
 			At: time.Now(),
 		})
 	}
-}
-
-// buildOnline returns node address -> online judgment. Store nodes are judged
-// by their agent heartbeat (fresh and alive); topology-only nodes (running
-// without an agent) are considered online while the master lists them.
-func (s *server) buildOnline(topo *master_pb.TopologyInfo) map[string]bool {
-	// Node addresses present in the topology.
-	inTopo := make(map[string]bool)
-	for _, dci := range topo.GetDataCenterInfos() {
-		for _, rack := range dci.GetRackInfos() {
-			for _, dn := range rack.GetDataNodeInfos() {
-				addr := dn.GetId()
-				if addr == "" {
-					addr = dn.GetAddress()
-				}
-				inTopo[addr] = true
-			}
-		}
-	}
-
-	online := make(map[string]bool)
-	for _, n := range s.reg.All() {
-		addr := fmt.Sprintf("%s:%d", n.IP, n.VolumePort)
-		if s.nodeStatus(n) == "online" {
-			online[addr] = true
-		}
-	}
-	// Topology-only nodes are treated as online.
-	for addr := range inTopo {
-		if _, known := online[addr]; !known {
-			online[addr] = true
-		}
-	}
-	return online
 }
 
 // ---- HTTP handlers ----
@@ -747,22 +625,10 @@ func (s *server) handleNodeDelete(w http.ResponseWriter, r *http.Request, nodeID
 
 // GET /api/v1/cluster/status.
 func (s *server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
-	reports := s.lastReports.Load().([]*redundancy.Report)
-	var okC, degC, riskC int
 	totalCap, usedCap := int64(0), int64(0)
 	for _, n := range s.reg.All() {
 		totalCap += n.CapacityBytes
 		usedCap += n.DiskUsed
-	}
-	for _, rep := range reports {
-		switch rep.State {
-		case redundancy.StateOK:
-			okC++
-		case redundancy.StateDegraded:
-			degC++
-		case redundancy.StateAtRisk:
-			riskC++
-		}
 	}
 	activeNodes := int(s.lastActiveNodes.Load())
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -770,20 +636,12 @@ func (s *server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 		"active_nodes":    activeNodes,
 		"min_write_nodes": s.minWriteNodes,
 		"writable":        clusterWritable(activeNodes, s.minWriteNodes),
-		"ec_volumes":      map[string]int{"ok": okC, "degraded": degC, "at_risk": riskC, "total": len(reports)},
 		"capacity": map[string]int64{
 			"total_bytes": totalCap,
 			"used_bytes":  usedCap,
 			"free_bytes":  totalCap - usedCap,
 		},
-		"updated_at": s.lastUpdate.Load().(time.Time),
 	})
-}
-
-// GET /api/v1/volumes/risk — classified volumes with nodes_to_start.
-func (s *server) handleVolumesRisk(w http.ResponseWriter, r *http.Request) {
-	reports := s.lastReports.Load().([]*redundancy.Report)
-	writeJSON(w, http.StatusOK, map[string]any{"volumes": reports})
 }
 
 // POST /api/v1/admin/notify/test.
@@ -803,18 +661,6 @@ func (s *server) handleNotifyTest(w http.ResponseWriter, r *http.Request) {
 
 // GET /metrics — lightweight text metrics.
 func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	reports := s.lastReports.Load().([]*redundancy.Report)
-	risk, deg, okc := 0, 0, 0
-	for _, rep := range reports {
-		switch rep.State {
-		case redundancy.StateOK:
-			okc++
-		case redundancy.StateDegraded:
-			deg++
-		case redundancy.StateAtRisk:
-			risk++
-		}
-	}
 	activeNodes := int(s.lastActiveNodes.Load())
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	fmt.Fprintf(w, "# HELP s3lite_nodes_registered Registered nodes in the control plane.\n")
@@ -830,10 +676,6 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	} else {
 		fmt.Fprintf(w, "s3lite_cluster_writable 0\n")
 	}
-	fmt.Fprintf(w, "# TYPE s3lite_ec_volumes_by_state gauge\n")
-	fmt.Fprintf(w, "s3lite_ec_volumes_by_state{state=\"ok\"} %d\n", okc)
-	fmt.Fprintf(w, "s3lite_ec_volumes_by_state{state=\"degraded\"} %d\n", deg)
-	fmt.Fprintf(w, "s3lite_ec_volumes_by_state{state=\"at_risk\"} %d\n", risk)
 }
 
 // ---- helpers ----

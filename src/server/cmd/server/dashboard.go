@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"s3lite.dev/server/internal/masterapi"
-	"s3lite.dev/server/internal/redundancy"
+	"s3lite.dev/server/internal/store"
 )
 
 // dashboardHTML is the self-contained browser dashboard, embedded at build
@@ -100,16 +100,15 @@ func (s *server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 // dashboardAPI returns aggregated JSON used by the dashboard's fetch() calls:
-// nodes (with computed online/offline state), node counters, cluster capacity,
-// a summary cluster health badge and the volume reports from the live monitors.
+// nodes (with computed online/offline state), node counters, cluster capacity
+// and a summary cluster health badge.
 func (s *server) dashboardAPI(w http.ResponseWriter, r *http.Request) {
-	reports := s.lastReports.Load().([]*redundancy.Report)
 	nodes := s.nodeViews()
 	// Node IDs recently seen from more than one machine (e.g. cloned VM
 	// images ship the same /var/lib/s3lite/agent/agent.json to every clone).
 	dupNodeIDs := s.reg.DuplicateNodeIDs()
 
-	var okC, degC, riskC, onlineC, degradedC, offlineC int
+	var onlineC, degradedC, offlineC int
 	var totalCap, usedCap, freeCap int64
 	for _, n := range nodes {
 		totalCap += n.CapacityBytes
@@ -124,33 +123,14 @@ func (s *server) dashboardAPI(w http.ResponseWriter, r *http.Request) {
 			degradedC++
 		}
 	}
-	for _, rep := range reports {
-		switch rep.State {
-		case redundancy.StateOK:
-			okC++
-		case redundancy.StateDegraded:
-			degC++
-		case redundancy.StateAtRisk:
-			riskC++
-		}
-	}
-	// Summary cluster health, derived from actual EC data availability rather
-	// than raw node counts: with an k+m scheme (e.g. 6+4) a few offline nodes
-	// only reduce redundancy, so they are "degraded". Critical means some
-	// volume has burned through all m parity shards (available <= k, i.e.
-	// zero redundancy left) or already lost data (AT_RISK), or node IDs are
-	// duplicated (shard placement is no longer trustworthy).
-	exhaustedC := 0
-	for _, rep := range reports {
-		if rep.Available <= rep.DataShards && rep.Available < rep.Total {
-			exhaustedC++
-		}
-	}
+	// Summary cluster health from node state: critical when any node is
+	// offline or duplicate IDs are detected; degraded when a node reports
+	// degraded health; otherwise healthy.
 	health := "healthy"
 	switch {
-	case exhaustedC > 0 || riskC > 0 || len(dupNodeIDs) > 0:
+	case offlineC > 0 || len(dupNodeIDs) > 0:
 		health = "critical"
-	case offlineC > 0 || degradedC > 0 || degC > 0:
+	case degradedC > 0:
 		health = "degraded"
 	}
 	outdatedC := 0
@@ -172,8 +152,6 @@ func (s *server) dashboardAPI(w http.ResponseWriter, r *http.Request) {
 			"degraded": degradedC,
 			"offline":  offlineC,
 		},
-		"volumes": reports,
-		"ec":      map[string]int{"ok": okC, "degraded": degC, "at_risk": riskC, "total": len(reports)},
 		"capacity": map[string]int64{
 			"total_bytes": totalCap,
 			"used_bytes":  usedCap,
