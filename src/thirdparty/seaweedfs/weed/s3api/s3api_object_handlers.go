@@ -1381,6 +1381,35 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 		}
 	}
 
+	// Probe the first byte before committing headers. If the first read
+	// fails (e.g. not enough EC shards available), return 503 with the
+	// exact volumes that need nodes powered on instead of a 200 with a
+	// truncated body.
+	if probeErr := probeReadable(ctx, reader, offset, localReadProbeTimeout); probeErr != nil {
+		if isCanceledStreamingError(probeErr) {
+			glog.V(3).Infof("streamFromVolumeServers: request canceled while probing %s/%s: %v", bucket, object, probeErr)
+			return probeErr
+		}
+		glog.V(1).Infof("streamFromVolumeServers: first read of %s/%s failed (%v), returning 503 with volume info", bucket, object, probeErr)
+		if len(volumeIDs) > 0 {
+			w.Header().Set("Content-Type", "application/xml")
+			w.Header().Set("X-S3Lite-Volume-Id", volumeIDsToString(volumeIDs))
+			w.Header().Set("X-S3Lite-Collection", bucket)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			var xmlBuf strings.Builder
+			xmlBuf.WriteString(`<?xml version="1.0" encoding="UTF-8"?><Error><Code>S3LiteVolumeUnavailable</Code><Message>Some volume servers are offline. Power on the following nodes to restore download:</Message>`)
+			for _, vi := range volumeIDs {
+				xmlBuf.WriteString(`<Volume><Collection>` + vi.collection + `</Collection><VolumeId>` + strconv.Itoa(int(vi.volumeID)) + `</VolumeId></Volume>`)
+			}
+			xmlBuf.WriteString(`</Error>`)
+			w.Write([]byte(xmlBuf.String()))
+			return nil
+		}
+		glog.Errorf("streamFromVolumeServers: first read of %s/%s failed: %v", bucket, object, probeErr)
+		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
+		return newStreamErrorWithResponse(probeErr)
+	}
+
 	// Headers and status are committed on the first body write, once the first
 	// read from the volume servers has succeeded. The client sees the same wire
 	// timing either way -- the status line sits in the server's write buffer
