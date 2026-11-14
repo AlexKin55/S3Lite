@@ -43,6 +43,7 @@ type Node struct {
 	LastHeartbeat time.Time `json:"last_heartbeat"`
 	Alive         bool      `json:"alive"`
 	Status        string    `json:"status"`           // computed: "online" | "offline" (heartbeat TTL)
+	CpuLoad       int       `json:"cpu_load"`         // agent-reported CPU load (percent)
 	Health        string    `json:"health,omitempty"` // agent-reported: "online" | "degraded"
 	DiskFree      int64     `json:"disk_free"`
 	DiskUsed      int64     `json:"disk_used"`
@@ -82,6 +83,7 @@ type Node struct {
 // HeartbeatUpdate carries the mutable per-node stats from heartbeats.
 type HeartbeatUpdate struct {
 	Status            string // agent health: "online" | "degraded"
+	CpuLoad           int    // agent-reported CPU load (percent)
 	DiskFree          int64
 	DiskUsed          int64
 	VolumeServerAlive bool
@@ -231,6 +233,7 @@ func (r *Registry) UpdateHeartbeat(id string, hb HeartbeatUpdate) (*Node, bool) 
 	n.LastHeartbeat = now
 	n.Alive = hb.VolumeServerAlive
 	n.Health = hb.Status
+	n.CpuLoad = hb.CpuLoad
 	n.DiskFree = hb.DiskFree
 	n.DiskUsed = hb.DiskUsed
 	n.VolumesCount = hb.VolumesCount

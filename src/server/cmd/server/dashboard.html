@@ -98,7 +98,7 @@
 <div class="card scroll">
  <table id="nodes">
    <thead><tr>
-     <th></th><th>Node</th><th>IP:port</th><th>OS</th><th>Status</th><th>Disk</th><th>Last heartbeat</th><th>Volumes</th><th>EC shards</th><th title="Preferred replica target: the master places new raw replicas here first (before EC coding); falls back to regular nodes">★</th><th></th>
+     <th></th><th>Node</th><th>IP:port</th><th>OS</th><th>CPU</th><th>Status</th><th>Disk</th><th>Last heartbeat</th><th>Volumes</th><th>EC shards</th><th title="Preferred replica target: the master places new raw replicas here first (before EC coding); falls back to regular nodes">★</th><th></th>
    </tr></thead>
    <tbody></tbody>
  </table>
@@ -187,16 +187,17 @@ async function load(){
       '<td><b>'+esc(n.node_id)+'</b>'+(sub?'<span class="sub">'+esc(sub)+'</span>':'')+'</td>'+
       '<td>'+esc(n.ip)+':'+n.volume_port+'</td>'+
       '<td title="'+esc(n.arch)+'">'+esc(os||'—')+(n.arch?'<span class="sub">'+esc(n.arch)+'</span>':'')+'</td>'+
+      '<td>'+(n.cpu_load||'—')+'%</td>'+
       '<td>'+badge+'</td>'+
       '<td class="diskcell">'+diskBar(n.disk_used, n.capacity_bytes)+'</td>'+
       '<td>'+ago(n.last_heartbeat)+'</td>'+
       '<td>'+n.volumes_count+'</td><td>'+n.ec_shards_count+'</td>'+
       '<td><button class="pref'+(n.preferred?' on':'')+'" data-pref="'+esc(n.node_id)+'" title="Preferred replica target: new raw replicas are placed on this node first (before EC coding)">★</button></td>'+
       '<td><button class="del" data-id="'+esc(n.node_id)+'" title="Delete node permanently">✕</button></td></tr>'+
-      (detail ? '<tr class="detail-row"'+(isOpen?'':' hidden')+'><td colspan="11"><div class="detail-grid">'+detail+'</div>'+
+      (detail ? '<tr class="detail-row"'+(isOpen?'':' hidden')+'><td colspan="12"><div class="detail-grid">'+detail+'</div>'+
         (n.log_tail ? '<div class="logtail">'+esc(n.log_tail)+'</div>' : '')+'</td></tr>' : '');
   }).join('');
-  document.querySelector('#nodes tbody').innerHTML = nt || '<tr><td colspan=11>— no nodes registered —</td></tr>';
+  document.querySelector('#nodes tbody').innerHTML = nt || '<tr><td colspan=12>— no nodes registered —</td></tr>';
 }
 // Click a node row to expand/collapse its details row (the delete button
 // keeps its own handler, so clicks on it do not toggle the accordion).

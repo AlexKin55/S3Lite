@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"s3lite.dev/server/internal/masterapi"
-	"s3lite.dev/server/internal/store"
 )
 
 // dashboardHTML is the self-contained browser dashboard, embedded at build
