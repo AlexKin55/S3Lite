@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -44,6 +46,10 @@ type server struct {
 	// preferredPolicyFile, when set, is read at startup and lists node ids
 	// that are always preferred (operator-trusted, cannot be unmarked via UI).
 	preferredPolicyFile string
+	// adminURL is the base URL of the SeaweedFS admin server; used by the
+	// manual EC encode endpoint to trigger immediate detection + dispatch
+	// via the admin's plugin API.
+	adminURL string
 
 	// Volume size limit (MB) reported by the master; used to derive the
 	// per-node max volume count from the node's capacity quota.
@@ -121,6 +127,7 @@ func main() {
 	stateFile := flag.String("stateFile", "", "JSON file persisting operator node flags (preferred replica targets) across restarts")
 	preferredNodesFile := flag.String("preferredNodesFile", "", "File where the preferred volume server address list (\"ip:port\" per line) is published for the master's -preferredNodesFile")
 	preferredPolicyFile := flag.String("preferredPolicyFile", "", "File with preferred node ids (one per line) that are always preferred and cannot be unmarked via the web UI")
+	adminURL := flag.String("adminURL", "http://127.0.0.1:12535", "Base URL of the SeaweedFS admin server (used to trigger immediate EC encoding via its plugin API)")
 	weedBin := flag.String("weedBin", "/usr/bin/weed", "path to the weed binary; the dashboard fsck button runs 'weed shell volume.fsck' with it")
 	fsckTimeout := flag.Duration("fsckTimeout", 10*time.Minute, "wall-clock cap on a dashboard-triggered volume.fsck run")
 	flag.Parse()
@@ -157,6 +164,7 @@ func main() {
 	srv.lastUpdate.Store(time.Time{})
 	srv.preferredNodesFile = *preferredNodesFile
 	srv.preferredPolicyFile = *preferredPolicyFile
+	srv.adminURL = *adminURL
 	if *stateFile != "" {
 		reg.SetStatePath(*stateFile)
 	}
@@ -182,6 +190,7 @@ func main() {
 	mux.HandleFunc("/api/v1/cluster/status", srv.handleClusterStatus)
 	mux.HandleFunc("/api/v1/volumes/risk", srv.handleVolumesRisk)
 	mux.HandleFunc("/api/v1/admin/notify/test", srv.handleNotifyTest)
+	mux.HandleFunc("/api/v1/maintenance/encode", srv.handleMaintenanceEncode)
 	mux.HandleFunc("/api/v1/dashboard", srv.dashboardAPI)
 	mux.HandleFunc("/api/v1/orphans", srv.handleOrphansList)
 	mux.HandleFunc("/api/v1/orphans/cleanup", srv.handleOrphansCleanup)
@@ -555,6 +564,55 @@ func (s *server) handleNodesPreferred(w http.ResponseWriter, r *http.Request) {
 	}
 	addrs := s.reg.PreferredNodeAddrs()
 	writeJSON(w, http.StatusOK, map[string]any{"addresses": addrs})
+}
+
+// POST /api/v1/maintenance/encode — triggers immediate EC encoding + shard
+// distribution via the admin's plugin API (detect + run for erasure_coding).
+// Bypasses the 5-minute quiet period and the worker's 5-minute scan interval.
+func (s *server) handleMaintenanceEncode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	adminURL := s.adminURL
+	if adminURL == "" {
+		adminURL = "http://127.0.0.1:12535"
+	}
+	adminURL = strings.TrimRight(adminURL, "/")
+
+	reqBody, _ := json.Marshal(map[string]any{})
+	httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
+		adminURL+"/api/plugin/job-types/erasure_coding/run", bytes.NewReader(reqBody))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "admin request failed: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "read admin response failed: " + err.Error()})
+		return
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "admin returned " + resp.Status + ": " + string(body)})
+		return
+	}
+
+	var adminResp map[string]any
+	if err := json.Unmarshal(body, &adminResp); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"raw": string(body)})
+		return
+	}
+	writeJSON(w, http.StatusOK, adminResp)
 }
 
 // writePreferredNodesFile publishes the preferred node address list for the

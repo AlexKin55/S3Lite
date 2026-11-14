@@ -101,6 +101,8 @@
   <span id="notify-result"></span>
   <button class="warn" onclick="cleanOrphans()" title="Deletes collections that hold volume data on the nodes but have no bucket on the filer (unreachable through S3, e.g. after a filer metadata reset)">🧹 Clean orphaned data</button>
   <span id="orphans-result"></span>
+  <button id="encode-btn" onclick="runEncode()" title="Запускает кодирование тихих volumenов в EC 6+4 и распределение шардов по узлам сразу, не дожидаясь 5-минутного бездействия и сканирования воркера. Может занять несколько минут.">🔄 Разпеределить данные (EC encode now)</button>
+  <span id="encode-result"></span>
   <button id="fsck-btn" onclick="runFsck(false)" title="Scans every volume index and the filer store for orphan chunks: data on the volume servers that no filer entry references (e.g. an upload interrupted between the chunk write and the metadata commit). Report only; can take minutes on large clusters.">🔍 Check orphan chunks (fsck)</button>
   <button id="fsck-purge-btn" class="warn" onclick="runFsck(true)" style="display:none" title="Deletes the orphan chunks found by the previous check. The disk space is reclaimed by the next vacuum compaction.">💣 Purge orphan chunks</button>
   <span id="fsck-result"></span>
@@ -327,6 +329,31 @@ document.querySelector('#nodes tbody').addEventListener('click', async (e)=>{
   load();
 });
 setInterval(load, 5000); load();
+
+// "Redistribute data" button: triggers immediate EC encoding + shard
+// distribution via the admin's plugin API (detect + run for erasure_coding).
+// Bypasses the 5-minute quiet period and the worker's 5-minute scan interval.
+async function runEncode(){
+  const out = document.getElementById('encode-result');
+  const btn = document.getElementById('encode-btn');
+  btn.disabled = true;
+  btn.textContent = 'encoding…';
+  out.textContent = 'sending request…';
+  try {
+    const r = await fetch('/api/v1/maintenance/encode', {method:'POST'});
+    if(!r.ok){ out.textContent = 'encode request failed (HTTP '+r.status+')'; return; }
+    const j = await r.json();
+    if(j.error){ out.textContent = 'encode failed: '+esc(j.error); return; }
+    out.textContent = 'detected '+(j.detected_count||0)+' volume(s), ready '+(j.ready_to_execute_count||0)+', executed '+(j.executed_count||0)+', success '+(j.success_count||0)+' ✓';
+    if((j.error_count||0) > 0) out.textContent += ', errors '+(j.error_count||0);
+    load();
+  } catch(e) {
+    out.textContent = 'encode request failed';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🔄 Разпеределить данные (EC encode now)';
+  }
+}
 </script>
 </body>
 </html>
