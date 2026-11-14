@@ -78,6 +78,14 @@ type Node struct {
 	UpdateRequestedAt time.Time `json:"update_requested_at,omitempty"`
 	UpdateStatus      string    `json:"update_status,omitempty"`
 	UpdateDetail      string    `json:"update_detail,omitempty"`
+
+	// Agent restart state (dashboard "Restart node" button). Status flow:
+	// "requested" (admin) -> "dispatched" (command delivered with a
+	// heartbeat response) -> "running" (agent is restarting itself and the
+	// volume server) -> "done"/"failed" (agent-reported).
+	RestartRequestedAt time.Time `json:"restart_requested_at,omitempty"`
+	RestartStatus      string    `json:"restart_status,omitempty"`
+	RestartDetail      string    `json:"restart_detail,omitempty"`
 }
 
 // HeartbeatUpdate carries the mutable per-node stats from heartbeats.
@@ -98,6 +106,8 @@ type HeartbeatUpdate struct {
 	LogTail           string
 	UpdateStatus      string // agent self-update progress: "running"|"done"|"failed"
 	UpdateDetail      string
+	RestartStatus     string // agent restart progress: "running"|"done"|"failed"
+	RestartDetail     string
 }
 
 // Registry is a thread-safe in-memory node registry.
@@ -255,6 +265,15 @@ func (r *Registry) UpdateHeartbeat(id string, hb HeartbeatUpdate) (*Node, bool) 
 		n.UpdateStatus = "done"
 		n.UpdateDetail = "agent restarted; now reporting version " + hb.AgentVersion
 	}
+	// Agent restart progress. A heartbeat without a restart status while the
+	// restart is "running" means the agent restarted itself: mark as done.
+	if hb.RestartStatus != "" {
+		n.RestartStatus = hb.RestartStatus
+		n.RestartDetail = hb.RestartDetail
+	} else if n.RestartStatus == "running" {
+		n.RestartStatus = "done"
+		n.RestartDetail = "agent and volume server restarted; now reporting again"
+	}
 	return n, true
 }
 
@@ -283,6 +302,34 @@ func (r *Registry) TakeAgentUpdateCommand(id string) bool {
 		return false
 	}
 	n.UpdateStatus = "dispatched"
+	return true
+}
+
+// RequestNodeRestart schedules an agent+volume restart: the restart_agent
+// command is delivered to the agent with its next heartbeat response.
+func (r *Registry) RequestNodeRestart(id string) (*Node, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n, ok := r.nodes[id]
+	if !ok {
+		return nil, false
+	}
+	n.RestartRequestedAt = time.Now()
+	n.RestartStatus = "requested"
+	n.RestartDetail = ""
+	return n, true
+}
+
+// TakeRestartCommand atomically marks a pending restart request as dispatched
+// and reports it, so the command is delivered exactly once.
+func (r *Registry) TakeRestartCommand(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n, ok := r.nodes[id]
+	if !ok || n.RestartStatus != "requested" {
+		return false
+	}
+	n.RestartStatus = "dispatched"
 	return true
 }
 
