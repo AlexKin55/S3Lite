@@ -31,6 +31,10 @@
   .cluster-badge.critical { background:#450a0a; color:#f87171; }
   .sub { font-size:11px; color:#64748b; display:block; margin-top:1px; }
   .diskbar { background:#0f172a; border-radius:4px; height:10px; width:110px; margin-top:3px; overflow:hidden; }
+  .scroll { max-height: 560px; overflow-y: auto; border:1px solid #1e293b; border-radius:8px; }
+  .filter-row { display:flex; gap:8px; margin:8px 0; align-items:center; flex-wrap:wrap; }
+  .filter-row input { background:#0f172a; border:1px solid #334155; color:#e2e8f0; border-radius:6px; padding:6px 10px; font-size:13px; min-width:220px; }
+  .filter-row input::placeholder { color:#64748b; }
   .diskbar > div { height:100%; border-radius:4px; }
   .diskbar .low  { background:#4ade80; }
   .diskbar .mid  { background:#facc15; }
@@ -74,27 +78,6 @@
 <div class="grid" id="stats"></div>
 <div id="dup-banner" class="banner" hidden></div>
 
-<h2>Registered nodes <span class="hint">status computed from heartbeat freshness (TTL) · click a row for node details</span></h2>
-<div class="card">
- <table id="nodes">
-   <thead><tr>
-     <th></th><th>Node</th><th>IP:port</th><th>OS</th><th>Status</th><th>Disk</th><th>Last heartbeat</th><th>Volumes</th><th>EC shards</th><th title="Preferred replica target: the master places new raw replicas here first (before EC coding); falls back to regular nodes">★</th><th></th>
-   </tr></thead>
-   <tbody></tbody>
- </table>
- <div id="del-result" class="result"></div>
-</div>
-
-<h2>EC volumes</h2>
-<div class="card">
- <table id="volumes">
-   <thead><tr>
-     <th>Collection</th><th>Volume</th><th>Config</th><th>State</th><th>Shards</th><th>Offline nodes</th><th>Power on to restore</th>
-   </tr></thead>
-   <tbody></tbody>
- </table>
-</div>
-
 <h2>Actions</h2>
 <div class="card">
   <button onclick="testNotify()">Test notification</button>
@@ -106,6 +89,33 @@
   <button id="fsck-btn" onclick="runFsck(false)" title="Scans every volume index and the filer store for orphan chunks: data on the volume servers that no filer entry references (e.g. an upload interrupted between the chunk write and the metadata commit). Report only; can take minutes on large clusters.">🔍 Check orphan chunks (fsck)</button>
   <button id="fsck-purge-btn" class="warn" onclick="runFsck(true)" style="display:none" title="Deletes the orphan chunks found by the previous check. The disk space is reclaimed by the next vacuum compaction.">💣 Purge orphan chunks</button>
   <span id="fsck-result"></span>
+</div>
+
+<h2>Registered nodes <span class="hint">status computed from heartbeat freshness (TTL) · click a row for node details</span></h2>
+<div class="filter-row">
+  <input id="nodeFilter" placeholder="Filter by Node ID…" />
+</div>
+<div class="card scroll">
+ <table id="nodes">
+   <thead><tr>
+     <th></th><th>Node</th><th>IP:port</th><th>OS</th><th>Status</th><th>Disk</th><th>Last heartbeat</th><th>Volumes</th><th>EC shards</th><th title="Preferred replica target: the master places new raw replicas here first (before EC coding); falls back to regular nodes">★</th><th></th>
+   </tr></thead>
+   <tbody></tbody>
+ </table>
+ <div id="del-result" class="result"></div>
+</div>
+
+<h2>EC volumes</h2>
+<div class="filter-row">
+  <input id="ecFilter" placeholder="Filter by Collection…" />
+</div>
+<div class="card scroll">
+ <table id="volumes">
+   <thead><tr>
+     <th>Collection</th><th>Volume</th><th>Config</th><th>State</th><th>Shards</th><th>Offline nodes</th><th>Power on to restore</th>
+   </tr></thead>
+   <tbody></tbody>
+ </table>
 </div>
 
 <script>
@@ -129,6 +139,7 @@ function diskBar(used, cap){
 // Node ids expanded by the user; re-applied on every auto-refresh so the
 // details row doesn't collapse when the table is re-rendered.
 const expanded = new Set();
+let nodeFilter = '', ecFilter = '';
 async function load(){
   const j = await (await fetch('/api/v1/dashboard')).json();
   const ec = j.ec, cap = j.capacity, ns = j.node_status, nodes = j.nodes, health = j.health||'healthy';
@@ -139,6 +150,7 @@ async function load(){
   // otherwise a node "jumps" whenever any other one updates its heartbeat.
   // Numeric-aware compare: node-2 sorts before node-10.
   nodes.sort((a,b)=>String(a.node_id).localeCompare(String(b.node_id), undefined, {numeric:true}));
+  if (nodeFilter) nodes = nodes.filter(n => String(n.node_id).toLowerCase().includes(nodeFilter));
   const dupBanner = document.getElementById('dup-banner');
   if (dups.length) {
     dupBanner.hidden = false;
@@ -200,7 +212,8 @@ async function load(){
         (n.log_tail ? '<div class="logtail">'+esc(n.log_tail)+'</div>' : '')+'</td></tr>' : '');
   }).join('');
   document.querySelector('#nodes tbody').innerHTML = nt || '<tr><td colspan=11>— no nodes registered —</td></tr>';
-  const vt=j.volumes.map(v=>'<tr><td>'+esc(v.collection)+'</td><td>'+v.volume_id+'</td>'+
+  const vols = ecFilter ? j.volumes.filter(v => String(v.collection).toLowerCase().includes(ecFilter)) : j.volumes;
+  const vt=vols.map(v=>'<tr><td>'+esc(v.collection)+'</td><td>'+v.volume_id+'</td>'+
     '<td>'+(v.data_shards?+(v.data_shards)+'+'+(v.parity_shards||0):'—')+'</td>'+
     '<td class="'+v.state.toLowerCase()+'">'+v.state+'</td>'+
     '<td>'+v.available_shards+'/'+v.total_shards+'</td>'+
@@ -329,6 +342,8 @@ document.querySelector('#nodes tbody').addEventListener('click', async (e)=>{
   load();
 });
 setInterval(load, 5000); load();
+document.getElementById('nodeFilter').addEventListener('input', (e)=>{ nodeFilter = e.target.value.toLowerCase(); load(); });
+document.getElementById('ecFilter').addEventListener('input', (e)=>{ ecFilter = e.target.value.toLowerCase(); load(); });
 
 // "Redistribute data" button: triggers immediate EC encoding + shard
 // distribution via the admin's plugin API (detect + run for erasure_coding).
