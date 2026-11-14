@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
 	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
@@ -1340,11 +1341,11 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 		if cv == nil || cv.FileId == "" {
 			continue
 		}
-		parts := strings.SplitN(cv.FileId, ",", 3)
-		if len(parts) < 1 {
+		vidStr, _, err := operation.ParseFileId(cv.FileId)
+		if err != nil {
 			continue
 		}
-		vid, err := strconv.ParseUint(parts[0], 10, 32)
+		vid, err := strconv.ParseUint(vidStr, 10, 32)
 		if err != nil {
 			continue
 		}
