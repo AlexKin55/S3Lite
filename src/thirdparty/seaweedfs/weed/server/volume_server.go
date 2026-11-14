@@ -93,6 +93,7 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	ldbTimeout int64,
 	allowUntrustedRemoteEndpoints bool,
 	diskProbeConfig stats.DiskIOProbeConfig,
+	preferredNodesFile string,
 ) *VolumeServer {
 
 	v := util.GetViper()
@@ -149,6 +150,9 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 
 	vs.store = storage.NewStore(vs.grpcDialOption, ip, port, grpcPort, publicUrl, id, folders, maxCounts, minFreeSpaces, idxFolder, vs.needleMapKind, diskTypes, diskTags, ldbTimeout, diskProbeConfig)
 	vs.store.MasterFn = vs.getCurrentMaster
+	if preferredNodesFile != "" {
+		vs.store.LoadPreferredNodesFile(preferredNodesFile)
+	}
 	vs.guard = security.NewGuard(whiteList, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
 
 	handleStaticResources(adminMux)

@@ -177,6 +177,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/nodes", srv.handleNodes)
+	mux.HandleFunc("/api/v1/nodes/preferred", srv.handleNodesPreferred)
 	mux.HandleFunc("/api/v1/nodes/", srv.handleNodePath)
 	mux.HandleFunc("/api/v1/cluster/status", srv.handleClusterStatus)
 	mux.HandleFunc("/api/v1/volumes/risk", srv.handleVolumesRisk)
@@ -542,6 +543,18 @@ func (s *server) handleNodePreferred(w http.ResponseWriter, r *http.Request, nod
 	log.Printf("node %s preferred=%v", nodeID, *req.Preferred)
 	s.writePreferredNodesFile()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "node_id": nodeID, "preferred": *req.Preferred})
+}
+
+// GET /api/v1/nodes/preferred — list preferred node addresses (ip:port).
+// Used by volume servers to know which nodes to prefer for EC reads and
+// parity reconstruction offload.
+func (s *server) handleNodesPreferred(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	addrs := s.reg.PreferredNodeAddrs()
+	writeJSON(w, http.StatusOK, map[string]any{"addresses": addrs})
 }
 
 // writePreferredNodesFile publishes the preferred node address list for the

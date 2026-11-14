@@ -90,6 +90,7 @@ type VolumeServerOptions struct {
 	diskIOErrorPercent            *float64
 	diskIOMaxStatFailures         *int
 	diskRecoveryCoef              *float64
+	preferredNodesFile            *string
 	// shutdownCtx, when non-nil, tells startVolumeServer to shut down once the
 	// ctx is cancelled. Used by integration tests and by weed mini; nil for
 	// standalone weed volume.
@@ -232,6 +233,7 @@ func init() {
 	v.allowUntrustedRemoteEndpoints = cmdVolume.Flag.Bool("volume.allowUntrustedRemoteEndpoints", false, "if true, FetchAndWriteNeedle accepts arbitrary remote S3 endpoints including loopback / link-local hosts. Default rejects internal / metadata endpoints.")
 	v.debug = cmdVolume.Flag.Bool("debug", false, "serves runtime profiling data via pprof on the port specified by -debug.port")
 	v.debugPort = cmdVolume.Flag.Int("debug.port", 6060, "http port for debugging")
+	v.preferredNodesFile = cmdVolume.Flag.String("preferredNodesFile", "", "file with preferred volume server addresses (ip:port per line) for EC read preference")
 	v.setDiskIOProbeDefaults()
 }
 
@@ -461,6 +463,7 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 		*v.ldbTimeout,
 		*v.allowUntrustedRemoteEndpoints,
 		diskProbeConfig,
+		*v.preferredNodesFile,
 	)
 
 	// Apply hard storage size limit (STORAGE_SIZE) if configured

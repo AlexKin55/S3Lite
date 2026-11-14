@@ -55,6 +55,7 @@ const (
 	VolumeServer_VolumeEcShardsMount_FullMethodName         = "/volume_server_pb.VolumeServer/VolumeEcShardsMount"
 	VolumeServer_VolumeEcShardsUnmount_FullMethodName       = "/volume_server_pb.VolumeServer/VolumeEcShardsUnmount"
 	VolumeServer_VolumeEcShardRead_FullMethodName           = "/volume_server_pb.VolumeServer/VolumeEcShardRead"
+	VolumeServer_VolumeEcShardDecode_FullMethodName         = "/volume_server_pb.VolumeServer/VolumeEcShardDecode"
 	VolumeServer_VolumeEcBlobDelete_FullMethodName          = "/volume_server_pb.VolumeServer/VolumeEcBlobDelete"
 	VolumeServer_VolumeEcShardsToVolume_FullMethodName      = "/volume_server_pb.VolumeServer/VolumeEcShardsToVolume"
 	VolumeServer_VolumeEcShardsInfo_FullMethodName          = "/volume_server_pb.VolumeServer/VolumeEcShardsInfo"
@@ -113,6 +114,7 @@ type VolumeServerClient interface {
 	VolumeEcShardsMount(ctx context.Context, in *VolumeEcShardsMountRequest, opts ...grpc.CallOption) (*VolumeEcShardsMountResponse, error)
 	VolumeEcShardsUnmount(ctx context.Context, in *VolumeEcShardsUnmountRequest, opts ...grpc.CallOption) (*VolumeEcShardsUnmountResponse, error)
 	VolumeEcShardRead(ctx context.Context, in *VolumeEcShardReadRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[VolumeEcShardReadResponse], error)
+	VolumeEcShardDecode(ctx context.Context, in *VolumeEcShardDecodeRequest, opts ...grpc.CallOption) (*VolumeEcShardDecodeResponse, error)
 	VolumeEcBlobDelete(ctx context.Context, in *VolumeEcBlobDeleteRequest, opts ...grpc.CallOption) (*VolumeEcBlobDeleteResponse, error)
 	VolumeEcShardsToVolume(ctx context.Context, in *VolumeEcShardsToVolumeRequest, opts ...grpc.CallOption) (*VolumeEcShardsToVolumeResponse, error)
 	VolumeEcShardsInfo(ctx context.Context, in *VolumeEcShardsInfoRequest, opts ...grpc.CallOption) (*VolumeEcShardsInfoResponse, error)
@@ -566,6 +568,16 @@ func (c *volumeServerClient) VolumeEcShardRead(ctx context.Context, in *VolumeEc
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type VolumeServer_VolumeEcShardReadClient = grpc.ServerStreamingClient[VolumeEcShardReadResponse]
 
+func (c *volumeServerClient) VolumeEcShardDecode(ctx context.Context, in *VolumeEcShardDecodeRequest, opts ...grpc.CallOption) (*VolumeEcShardDecodeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VolumeEcShardDecodeResponse)
+	err := c.cc.Invoke(ctx, VolumeServer_VolumeEcShardDecode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *volumeServerClient) VolumeEcBlobDelete(ctx context.Context, in *VolumeEcBlobDeleteRequest, opts ...grpc.CallOption) (*VolumeEcBlobDeleteResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(VolumeEcBlobDeleteResponse)
@@ -766,6 +778,7 @@ type VolumeServerServer interface {
 	VolumeEcShardsMount(context.Context, *VolumeEcShardsMountRequest) (*VolumeEcShardsMountResponse, error)
 	VolumeEcShardsUnmount(context.Context, *VolumeEcShardsUnmountRequest) (*VolumeEcShardsUnmountResponse, error)
 	VolumeEcShardRead(*VolumeEcShardReadRequest, grpc.ServerStreamingServer[VolumeEcShardReadResponse]) error
+	VolumeEcShardDecode(context.Context, *VolumeEcShardDecodeRequest) (*VolumeEcShardDecodeResponse, error)
 	VolumeEcBlobDelete(context.Context, *VolumeEcBlobDeleteRequest) (*VolumeEcBlobDeleteResponse, error)
 	VolumeEcShardsToVolume(context.Context, *VolumeEcShardsToVolumeRequest) (*VolumeEcShardsToVolumeResponse, error)
 	VolumeEcShardsInfo(context.Context, *VolumeEcShardsInfoRequest) (*VolumeEcShardsInfoResponse, error)
@@ -900,6 +913,9 @@ func (UnimplementedVolumeServerServer) VolumeEcShardsUnmount(context.Context, *V
 }
 func (UnimplementedVolumeServerServer) VolumeEcShardRead(*VolumeEcShardReadRequest, grpc.ServerStreamingServer[VolumeEcShardReadResponse]) error {
 	return status.Error(codes.Unimplemented, "method VolumeEcShardRead not implemented")
+}
+func (UnimplementedVolumeServerServer) VolumeEcShardDecode(context.Context, *VolumeEcShardDecodeRequest) (*VolumeEcShardDecodeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method VolumeEcShardDecode not implemented")
 }
 func (UnimplementedVolumeServerServer) VolumeEcBlobDelete(context.Context, *VolumeEcBlobDeleteRequest) (*VolumeEcBlobDeleteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method VolumeEcBlobDelete not implemented")
@@ -1549,6 +1565,24 @@ func _VolumeServer_VolumeEcShardRead_Handler(srv interface{}, stream grpc.Server
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type VolumeServer_VolumeEcShardReadServer = grpc.ServerStreamingServer[VolumeEcShardReadResponse]
 
+func _VolumeServer_VolumeEcShardDecode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VolumeEcShardDecodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VolumeServerServer).VolumeEcShardDecode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VolumeServer_VolumeEcShardDecode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VolumeServerServer).VolumeEcShardDecode(ctx, req.(*VolumeEcShardDecodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _VolumeServer_VolumeEcBlobDelete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(VolumeEcBlobDeleteRequest)
 	if err := dec(in); err != nil {
@@ -1880,6 +1914,10 @@ var VolumeServer_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "VolumeEcShardsUnmount",
 			Handler:    _VolumeServer_VolumeEcShardsUnmount_Handler,
+		},
+		{
+			MethodName: "VolumeEcShardDecode",
+			Handler:    _VolumeServer_VolumeEcShardDecode_Handler,
 		},
 		{
 			MethodName: "VolumeEcBlobDelete",

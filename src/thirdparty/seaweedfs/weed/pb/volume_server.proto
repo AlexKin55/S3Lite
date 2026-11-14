@@ -102,6 +102,8 @@ service VolumeServer {
     }
     rpc VolumeEcShardRead (VolumeEcShardReadRequest) returns (stream VolumeEcShardReadResponse) {
     }
+    rpc VolumeEcShardDecode (VolumeEcShardDecodeRequest) returns (VolumeEcShardDecodeResponse) {
+    }
     rpc VolumeEcBlobDelete (VolumeEcBlobDeleteRequest) returns (VolumeEcBlobDeleteResponse) {
     }
     rpc VolumeEcShardsToVolume (VolumeEcShardsToVolumeRequest) returns (VolumeEcShardsToVolumeResponse) {
@@ -517,6 +519,21 @@ message VolumeEcShardReadResponse {
     bytes data = 1;
     bool is_deleted = 2;
     int64 encode_ts_ns = 3; // identity of the shard actually served; client rejects a mismatch (0 = pre-upgrade server)
+}
+
+message VolumeEcShardDecodeRequest {
+    uint32 volume_id = 1;
+    uint32 shard_id = 2;
+    int64 offset = 3;
+    int64 size = 4;
+    uint64 file_key = 5;
+    int64 encode_ts_ns = 6; // caller's expected encode time
+    repeated string donor_nodes = 7; // addresses of nodes holding donor shards for reconstruction
+}
+message VolumeEcShardDecodeResponse {
+    bytes data = 1;
+    bool is_deleted = 2;
+    int64 encode_ts_ns = 3; // identity of the decoded shard
 }
 
 message VolumeEcBlobDeleteRequest {

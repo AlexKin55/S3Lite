@@ -115,11 +115,96 @@ type Store struct {
 	vidStampReady         atomic.Bool
 	vidStampDirty         atomic.Bool
 	vidStampLock          sync.Mutex
+	// preferredNodes are volume server addresses (ip:port) that are preferred
+	// for EC shard reads and parity reconstruction. Loaded from -preferredNodesFile.
+	preferredNodesLock sync.RWMutex
+	preferredNodes     []pb.ServerAddress
 }
 
 func (s *Store) String() (str string) {
 	str = fmt.Sprintf("Id:%s, Ip:%s, Port:%d, GrpcPort:%d PublicUrl:%s, dataCenter:%s, rack:%s, connected:%v, volumeSizeLimit:%d", s.Id, s.Ip, s.Port, s.GrpcPort, s.PublicUrl, s.dataCenter, s.rack, s.connected, s.GetVolumeSizeLimit())
 	return
+}
+
+// SetPreferredNodes replaces the set of preferred volume server addresses.
+func (s *Store) SetPreferredNodes(addrs []pb.ServerAddress) {
+	s.preferredNodesLock.Lock()
+	defer s.preferredNodesLock.Unlock()
+	s.preferredNodes = addrs
+}
+
+// PreferredNodes returns the current preferred volume server addresses.
+func (s *Store) PreferredNodes() []pb.ServerAddress {
+	s.preferredNodesLock.RLock()
+	defer s.preferredNodesLock.RUnlock()
+	out := make([]pb.ServerAddress, 0, len(s.preferredNodes))
+	out = append(out, s.preferredNodes...)
+	return out
+}
+
+// IsPreferredNode reports whether addr is a preferred volume server.
+func (s *Store) IsPreferredNode(addr pb.ServerAddress) bool {
+	s.preferredNodesLock.RLock()
+	defer s.preferredNodesLock.RUnlock()
+	for _, p := range s.preferredNodes {
+		if p == addr {
+			return true
+		}
+	}
+	return false
+}
+
+// SortNodesByPreference returns nodes sorted so preferred nodes come first,
+// preserving the original order within each group.
+func (s *Store) SortNodesByPreference(nodes []pb.ServerAddress) []pb.ServerAddress {
+	s.preferredNodesLock.RLock()
+	defer s.preferredNodesLock.RUnlock()
+	if len(s.preferredNodes) == 0 {
+		return nodes
+	}
+	preferred := make([]pb.ServerAddress, 0, len(nodes))
+	regular := make([]pb.ServerAddress, 0, len(nodes))
+	prefSet := make(map[pb.ServerAddress]struct{}, len(s.preferredNodes))
+	for _, p := range s.preferredNodes {
+		prefSet[p] = struct{}{}
+	}
+	for _, n := range nodes {
+		if _, ok := prefSet[n]; ok {
+			preferred = append(preferred, n)
+		} else {
+			regular = append(regular, n)
+		}
+	}
+	result := make([]pb.ServerAddress, 0, len(nodes))
+	result = append(result, preferred...)
+	result = append(result, regular...)
+	return result
+}
+
+// LoadPreferredNodesFile reads preferred node addresses (one "ip:port" per line,
+// blank lines and #-comments ignored) from path and installs them as the
+// preferred node set. A missing file is not an error.
+func (s *Store) LoadPreferredNodesFile(path string) {
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			glog.Warningf("read preferred nodes file %s: %v", path, err)
+		}
+		return
+	}
+	var addrs []pb.ServerAddress
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		addrs = append(addrs, pb.ServerAddress(line))
+	}
+	s.SetPreferredNodes(addrs)
+	glog.V(0).Infof("loaded %d preferred nodes from %s", len(addrs), path)
 }
 
 func NewStore(

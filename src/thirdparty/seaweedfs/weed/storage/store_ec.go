@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -649,20 +650,47 @@ func (s *Store) readOneEcShardInterval(needleId types.NeedleId, ecVolume *erasur
 	sourceDataNodes, hasShardIdLocation := ecVolume.ShardLocations[shardId]
 	ecVolume.ShardLocationsLock.RUnlock()
 
-	// try reading directly
+	// try reading directly - preferred nodes first
 	if hasShardIdLocation {
+		sourceDataNodes = s.SortNodesByPreference(sourceDataNodes)
 		_, is_deleted, err = s.readRemoteEcShardInterval(sourceDataNodes, needleId, ecVolume.VolumeId, shardId, data, actualOffset, ecVolume.EncodeTsNs)
 		if err == nil {
 			return
 		}
 		glog.V(0).Infof("read remote ec shard %d.%d locations: %v", ecVolume.VolumeId, shardId, err)
-		// Recovery below skips this very shard, so nothing else invalidates the
-		// location that just failed -- and a shard that has moved would otherwise
-		// be reconstructed on every read until the map's own window expires.
 		markShardLocationsStale(ecVolume)
 	}
 
-	// try reading by recovering from other shards
+	// try reading by recovering from other shards - offload to priority node if available
+	if preferredNodes := s.PreferredNodes(); len(preferredNodes) > 0 {
+		// collect donor addresses from all shard locations except the shard being recovered
+		ecVolume.ShardLocationsLock.RLock()
+		var donorAddrs []pb.ServerAddress
+		for sid, locations := range ecVolume.ShardLocations {
+			if erasure_coding.ShardId(sid) == shardId {
+				continue
+			}
+			donorAddrs = append(donorAddrs, locations...)
+		}
+		ecVolume.ShardLocationsLock.RUnlock()
+
+		ownAddr := pb.ServerAddress(s.Ip + ":" + strconv.Itoa(s.Port))
+		for _, prefNode := range preferredNodes {
+			if prefNode == ownAddr {
+				continue // skip self
+			}
+			glog.V(0).Infof("offloading ec shard decode to %s for shard %d.%d", prefNode, ecVolume.VolumeId, shardId)
+			decoded, isDel, decodeErr := s.decodeEcShardViaNode(prefNode, needleId, ecVolume.VolumeId, shardId, actualOffset, ecVolume.EncodeTsNs, donorAddrs)
+			if decodeErr == nil {
+				copy(data, decoded)
+				is_deleted = isDel
+				return
+			}
+			glog.V(0).Infof("decode offload to %s failed for shard %d.%d: %v", prefNode, ecVolume.VolumeId, shardId, decodeErr)
+		}
+	}
+
+	// try reading by recovering from other shards (local fallback)
 	_, is_deleted, err = s.recoverOneRemoteEcShardInterval(needleId, ecVolume, shardId, data, actualOffset)
 	if err == nil {
 		return
@@ -670,6 +698,98 @@ func (s *Store) readOneEcShardInterval(needleId types.NeedleId, ecVolume *erasur
 	glog.V(0).Infof("recover ec shard %d.%d : %v", ecVolume.VolumeId, shardId, err)
 
 	return
+}
+
+// decodeEcShardViaNode asks a remote volume server to reconstruct an EC shard
+// from donor nodes and return the decoded bytes.
+func (s *Store) decodeEcShardViaNode(node pb.ServerAddress, needleId types.NeedleId, volumeId needle.VolumeId, shardId erasure_coding.ShardId, offset int64, encodeTsNs int64, donorNodes []pb.ServerAddress) ([]byte, bool, error) {
+	var result []byte
+	var isDeleted bool
+	donorStrings := make([]string, 0, len(donorNodes))
+	for _, d := range donorNodes {
+		donorStrings = append(donorStrings, string(d))
+	}
+	err := operation.WithVolumeServerClient(false, node, s.grpcDialOption, func(client volume_server_pb.VolumeServerClient) error {
+		resp, err := client.VolumeEcShardDecode(context.Background(), &volume_server_pb.VolumeEcShardDecodeRequest{
+			VolumeId:   uint32(volumeId),
+			ShardId:    uint32(shardId),
+			Offset:     offset,
+			Size:       0, // server decides from shard size
+			FileKey:    uint64(needleId),
+			EncodeTsNs: encodeTsNs,
+			DonorNodes: donorStrings,
+		})
+		if err != nil {
+			return err
+		}
+		result = resp.Data
+		isDeleted = resp.IsDeleted
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return result, isDeleted, nil
+}
+
+// DecodeEcShardInterval reconstructs a single EC shard from donor nodes,
+// used when a reader offloads parity reconstruction to a priority node.
+// donorNodes are volume server addresses holding the donor shards.
+func (s *Store) DecodeEcShardInterval(volumeId needle.VolumeId, shardIdToRecover erasure_coding.ShardId, offset int64, size int, encodeTsNs int64, donorNodes []pb.ServerAddress) (data []byte, isDeleted bool, err error) {
+	ecVolume, found := s.FindEcVolume(volumeId)
+	if !found {
+		return nil, false, fmt.Errorf("ec volume %d not found locally", volumeId)
+	}
+
+	ecCtx := ecVolume.ECContext
+	if ecCtx == nil {
+		ecCtx = erasure_coding.NewDefaultECContext("", volumeId)
+	}
+
+	if err := checkEcShardRebuildable(ecVolume, ecCtx, shardIdToRecover); err != nil {
+		return nil, false, err
+	}
+
+	data = make([]byte, size)
+
+	totalShards := erasure_coding.ShardId(ecCtx.Total())
+	shardIntervals := make([][]byte, totalShards)
+
+	available := 0
+	for _, donorNode := range donorNodes {
+		if available >= ecCtx.DataShards {
+			break
+		}
+		for shardId := erasure_coding.ShardId(0); shardId < totalShards && available < ecCtx.DataShards; shardId++ {
+			if shardId == shardIdToRecover || shardIntervals[shardId] != nil {
+				continue
+			}
+			buf := make([]byte, size)
+			nRead, isDel, readErr := s.doReadRemoteEcShardInterval(donorNode, types.NeedleId(0), volumeId, shardId, buf, offset, encodeTsNs)
+			if readErr != nil {
+				glog.V(3).Infof("decode: read shard %d.%d from %s: %v", volumeId, shardId, donorNode, readErr)
+				continue
+			}
+			if isDel {
+				isDeleted = true
+			}
+			if nRead == size {
+				shardIntervals[shardId] = buf
+				available++
+			}
+		}
+	}
+
+	if available < ecCtx.DataShards {
+		return nil, false, fmt.Errorf("not enough donor shards for decode: got %d, need %d", available, ecCtx.DataShards)
+	}
+
+	if err := reconstructEcShardInterval(ecVolume, ecCtx, shardIntervals, shardIdToRecover); err != nil {
+		return nil, false, fmt.Errorf("reconstruct ec shard %d.%d: %v", volumeId, shardIdToRecover, err)
+	}
+
+	copy(data, shardIntervals[shardIdToRecover])
+	return data, isDeleted, nil
 }
 
 func forgetShardId(ecVolume *erasure_coding.EcVolume, shardId erasure_coding.ShardId) {

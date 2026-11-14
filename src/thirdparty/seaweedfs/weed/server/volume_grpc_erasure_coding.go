@@ -1113,6 +1113,51 @@ func (vs *VolumeServer) VolumeEcShardRead(req *volume_server_pb.VolumeEcShardRea
 
 }
 
+// VolumeEcShardDecode reconstructs an EC shard from donor nodes and returns
+// the decoded bytes. Used by readers that offload parity reconstruction to
+// a priority node.
+func (vs *VolumeServer) VolumeEcShardDecode(ctx context.Context, req *volume_server_pb.VolumeEcShardDecodeRequest) (*volume_server_pb.VolumeEcShardDecodeResponse, error) {
+	if err := vs.CheckMaintenanceMode(); err != nil {
+		return nil, err
+	}
+
+	glog.V(0).Infof("VolumeEcShardDecode: volume=%d shard=%d offset=%d size=%d donors=%d encode_ts_ns=%d",
+		req.VolumeId, req.ShardId, req.Offset, req.Size, len(req.DonorNodes), req.EncodeTsNs)
+
+	donorAddrs := make([]pb.ServerAddress, 0, len(req.DonorNodes))
+	for _, d := range req.DonorNodes {
+		donorAddrs = append(donorAddrs, pb.ServerAddress(d))
+	}
+
+	data, isDeleted, err := vs.store.DecodeEcShardInterval(
+		needle.VolumeId(req.VolumeId),
+		erasure_coding.ShardId(req.ShardId),
+		req.Offset,
+		int(req.Size),
+		req.EncodeTsNs,
+		donorAddrs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("decode ec shard %d.%d: %v", req.VolumeId, req.ShardId, err)
+	}
+
+	return &volume_server_pb.VolumeEcShardDecodeResponse{
+		Data:         data,
+		IsDeleted:    isDeleted,
+		EncodeTsNs:   ecVolumeEncodeTsNs(vs.store, needle.VolumeId(req.VolumeId)),
+	}, nil
+}
+
+// ecVolumeEncodeTsNs returns the encode timestamp of the mounted EC volume for
+// the given volume id, or 0 if not found.
+func ecVolumeEncodeTsNs(s *storage.Store, vid needle.VolumeId) int64 {
+	ev, found := s.FindEcVolume(vid)
+	if !found {
+		return 0
+	}
+	return ev.EncodeTsNs
+}
+
 func (vs *VolumeServer) VolumeEcBlobDelete(ctx context.Context, req *volume_server_pb.VolumeEcBlobDeleteRequest) (*volume_server_pb.VolumeEcBlobDeleteResponse, error) {
 	if err := vs.CheckMaintenanceMode(); err != nil {
 		return nil, err
