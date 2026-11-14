@@ -30,6 +30,7 @@ packages `s3lite-weed`, `s3lite-agent` and `s3lite-server`, and add one
 repository per target:
 
 * `openSUSE_16` — rpm
+* `RedOS_8` — rpm
 * `Fedora_44` — rpm
 
 (Debian/Ubuntu .deb builds are on hold — the spec-based deb path needs extra
@@ -41,6 +42,7 @@ in `%if` blocks driven by macros OBS injects per repository:
 | Macro | Target | Effect |
 |-------|--------|--------|
 | `0%{?suse_version}` | openSUSE | `golang`, `Requires(pre): shadow`, `Group:`/`BuildRoot:` |
+| `0%{?rhel}` | RedOS | `golang`, `Requires(pre): shadow-utils` |
 | `0%{?fedora}` | Fedora | `golang`, `Requires(pre): shadow-utils` (no `Group:`/`BuildRoot:`) |
 
 All modules floor their `go` directive at 1.26 (`src/agent`, `src/server`,

@@ -35,6 +35,11 @@
   .filter-row { display:flex; gap:8px; margin:8px 0; align-items:center; flex-wrap:wrap; }
   .filter-row input { background:#0f172a; border:1px solid #334155; color:#e2e8f0; border-radius:6px; padding:6px 10px; font-size:13px; min-width:220px; }
   .filter-row input::placeholder { color:#64748b; }
+  .console { background:#0b1220; border:1px solid #1e293b; border-radius:8px; padding:10px 14px; font-family: ui-monospace, monospace; font-size:12px; color:#e2e8f0; max-height: 240px; overflow-y: auto; }
+  .console .line { margin:2px 0; white-space:pre-wrap; }
+  .console .line.err { color:#f87171; }
+  .console .line.ok { color:#4ade80; }
+  .console .line.warn { color:#facc15; }
   .diskbar > div { height:100%; border-radius:4px; }
   .diskbar .low  { background:#4ade80; }
   .diskbar .mid  { background:#facc15; }
@@ -103,6 +108,11 @@
    <tbody></tbody>
  </table>
  <div id="del-result" class="result"></div>
+</div>
+
+<h2>Console <span class="hint">errors from the cluster: download failures, offline nodes, recovery hints</span></h2>
+<div class="card">
+  <div id="console" class="console"></div>
 </div>
 
 <script>
@@ -198,6 +208,24 @@ async function load(){
         (n.log_tail ? '<div class="logtail">'+esc(n.log_tail)+'</div>' : '')+'</td></tr>' : '');
   }).join('');
   document.querySelector('#nodes tbody').innerHTML = nt || '<tr><td colspan=12>— no nodes registered —</td></tr>';
+
+  // Console: download errors reported by s3proxy when a client fails to
+  // download a file because required EC nodes are offline. Each error lists
+  // the nodes to power on to restore the download.
+  const consoleEl = document.getElementById('console');
+  const errors = j.download_errors || [];
+  const now = new Date().toLocaleTimeString();
+  const lines = [];
+  if (errors.length === 0) {
+    lines.push('<div class="line ok">['+now+'] ✓ Нет ошибок скачивания.</div>');
+  } else {
+    for (const e of errors) {
+      const nodes = (e.nodes_to_start||[]).map(n=>'<b>'+esc(n)+'</b>').join(', ');
+      lines.push('<div class="line err">['+e.last_seen+'] ⚠ Скачка недоступна: '+esc(e.collection)+' vol '+
+        e.volume_id+'. Включите узлы: '+nodes+'</div>');
+    }
+  }
+  consoleEl.innerHTML = lines.join('');
 }
 // Click a node row to expand/collapse its details row (the delete button
 // keeps its own handler, so clicks on it do not toggle the accordion).

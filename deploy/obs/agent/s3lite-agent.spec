@@ -35,6 +35,10 @@ Requires(pre):  shadow
 BuildRequires:  golang >= 1.26
 Requires(pre):  shadow-utils
 %endif
+%if 0%{?rhel}
+BuildRequires:  golang >= 1.26
+Requires(pre):  shadow-utils
+%endif
 %if 0%{?ubuntu} || 0%{?debian}
 BuildRequires:  golang-go >= 1.26
 Requires(pre):  passwd

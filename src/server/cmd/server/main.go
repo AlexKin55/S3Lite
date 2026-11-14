@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +21,7 @@ import (
 
 	"s3lite.dev/server/internal/masterapi"
 	"s3lite.dev/server/internal/notify"
+	"s3lite.dev/server/internal/redundancy"
 	"s3lite.dev/server/internal/store"
 )
 
@@ -82,6 +84,27 @@ type server struct {
 	// newestAgentVersionSeen guards under agentVerMu; empty until the first
 	// heartbeat with a version string arrives.
 	newestAgentVersionSeen string
+
+	// Download errors reported by s3proxy when a client fails to download
+	// an object because required EC nodes are offline. Keyed by
+	// "collection:volumeID". Used by the dashboard console to show the
+	// operator which nodes to power on. Entries expire after downloadErrTTL.
+	downloadErrMu sync.Mutex
+	downloadErrors map[string]downloadErrorInfo
+	// downloadErrTTL is how long a download error is retained before being
+	// forgotten (default 10 minutes).
+	downloadErrTTL time.Duration
+}
+
+// downloadErrorInfo records a failed download attempt: which volume was
+// inaccessible and which nodes need to be powered on to restore it.
+type downloadErrorInfo struct {
+	Collection   string   `json:"collection"`
+	VolumeID     uint32   `json:"volume_id"`
+	NodesToStart []string `json:"nodes_to_start"`
+	FirstSeen    string   `json:"first_seen"`
+	LastSeen     string   `json:"last_seen"`
+	Count        int      `json:"count"`
 }
 
 // VolumeTemplate is the static part of the volume config sent to agents.
@@ -145,6 +168,8 @@ func main() {
 	srv.preferredNodesFile = *preferredNodesFile
 	srv.preferredPolicyFile = *preferredPolicyFile
 	srv.adminURL = *adminURL
+	srv.downloadErrors = make(map[string]downloadErrorInfo)
+	srv.downloadErrTTL = 10 * time.Minute
 	if *stateFile != "" {
 		reg.SetStatePath(*stateFile)
 	}
@@ -168,6 +193,9 @@ func main() {
 	mux.HandleFunc("/api/v1/nodes/preferred", srv.handleNodesPreferred)
 	mux.HandleFunc("/api/v1/nodes/", srv.handleNodePath)
 	mux.HandleFunc("/api/v1/cluster/status", srv.handleClusterStatus)
+	mux.HandleFunc("/api/v1/download/chains", srv.handleDownloadChains)
+	mux.HandleFunc("/api/v1/download/errors", srv.handleDownloadErrors)
+	mux.HandleFunc("/api/v1/volumes/risk", srv.handleVolumesRisk)
 	mux.HandleFunc("/api/v1/admin/notify/test", srv.handleNotifyTest)
 	mux.HandleFunc("/api/v1/maintenance/encode", srv.handleMaintenanceEncode)
 	mux.HandleFunc("/api/v1/dashboard", srv.dashboardAPI)
@@ -646,6 +674,154 @@ func (s *server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GET /api/v1/download/chains — reactive: calculate node chains to power on
+// for a volume that failed to download due to offline nodes.
+// Query params: collection, volume_id.
+func (s *server) handleDownloadChains(w http.ResponseWriter, r *http.Request) {
+	collection := r.URL.Query().Get("collection")
+	volumeStr := r.URL.Query().Get("volume_id")
+	if collection == "" || volumeStr == "" {
+		http.Error(w, "collection and volume_id required", http.StatusBadRequest)
+		return
+	}
+	var volumeID uint32
+	_, err := fmt.Sscanf(volumeStr, "%d", &volumeID)
+	if err != nil {
+		http.Error(w, "invalid volume_id", http.StatusBadRequest)
+		return
+	}
+	topo, _, err := s.master.Topology(r.Context())
+	if err != nil {
+		log.Printf("download/chains: topology fetch failed: %v", err)
+		http.Error(w, "topology fetch failed", http.StatusInternalServerError)
+		return
+	}
+	volumes := redundancy.Collect(topo)
+	online := make(map[string]bool)
+	for _, n := range s.reg.All() {
+		addr := fmt.Sprintf("%s:%d", n.IP, n.VolumePort)
+		if s.nodeStatus(n) == "online" {
+			online[addr] = true
+		}
+	}
+	chains := redundancy.CalcDownloadChains(volumes, online, collection, volumeID)
+	writeJSON(w, http.StatusOK, map[string]any{"chains": chains})
+}
+
+// POST /api/v1/download/errors — s3proxy reports a failed download here so
+// the dashboard console can show the operator which nodes to power on.
+// Body: {"collection": "bucket", "volume_id": 123, "nodes_to_start": ["node1", "node2"]}.
+func (s *server) handleDownloadErrors(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Collection    string   `json:"collection"`
+		VolumeID      uint32   `json:"volume_id"`
+		NodesToStart  []string `json:"nodes_to_start"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Collection == "" || req.VolumeID == 0 {
+		http.Error(w, "collection and volume_id required", http.StatusBadRequest)
+		return
+	}
+	key := req.Collection + ":" + strconv.Itoa(int(req.VolumeID))
+	now := time.Now().UTC().Format(time.RFC3339)
+	s.downloadErrMu.Lock()
+	info, exists := s.downloadErrors[key]
+	if !exists {
+		info = downloadErrorInfo{
+			Collection:   req.Collection,
+			VolumeID:     req.VolumeID,
+			NodesToStart: req.NodesToStart,
+			FirstSeen:    now,
+			Count:        0,
+		}
+	}
+	info.NodesToStart = req.NodesToStart
+	info.LastSeen = now
+	info.Count++
+	s.downloadErrors[key] = info
+	s.downloadErrMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// GET /api/v1/volumes/risk — reactive: check EC volume download risk.
+// With collection+volume_id query params, checks only that volume
+// (point-check before download). Without params, returns all AT_RISK
+// volumes (used by s3proxy on download failure when volume info is
+// unavailable). No background state — topology and redundancy are
+// calculated on each request.
+func (s *server) handleVolumesRisk(w http.ResponseWriter, r *http.Request) {
+	topo, _, err := s.master.Topology(r.Context())
+	if err != nil {
+		log.Printf("volumes/risk: topology fetch failed: %v", err)
+		http.Error(w, "topology fetch failed", http.StatusInternalServerError)
+		return
+	}
+	volumes := redundancy.Collect(topo)
+	online := make(map[string]bool)
+	for _, n := range s.reg.All() {
+		addr := fmt.Sprintf("%s:%d", n.IP, n.VolumePort)
+		if s.nodeStatus(n) == "online" {
+			online[addr] = true
+		}
+	}
+	collection := r.URL.Query().Get("collection")
+	volumeStr := r.URL.Query().Get("volume_id")
+
+	pointCheck := collection != "" || volumeStr != ""
+
+	out := make([]map[string]any, 0)
+	for _, v := range volumes {
+		// Point-check mode: only the requested volume.
+		if collection != "" && v.Collection != collection {
+			continue
+		}
+		if volumeStr != "" {
+			var volumeID uint32
+			if _, err := fmt.Sscanf(volumeStr, "%d", &volumeID); err != nil {
+				http.Error(w, "invalid volume_id", http.StatusBadRequest)
+				return
+			}
+			if v.VolumeID != volumeID {
+				continue
+			}
+		}
+
+		available := 0
+		for node, shards := range v.ShardsByNode {
+			if online[node] {
+				available += len(shards)
+			}
+		}
+		if available >= v.DataShards {
+			// Volume is downloadable. In point-check mode report "no risk".
+			if pointCheck {
+				writeJSON(w, http.StatusOK, map[string]any{"volumes": []map[string]any{}})
+				return
+			}
+			continue
+		}
+		chains := redundancy.CalcDownloadChains(volumes, online, v.Collection, v.VolumeID)
+		nodesToStart := []string{}
+		if len(chains) > 0 {
+			nodesToStart = chains[0].Nodes
+		}
+		out = append(out, map[string]any{
+			"state":         "AT_RISK",
+			"collection":    v.Collection,
+			"volume_id":     v.VolumeID,
+			"nodes_to_start": nodesToStart,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"volumes": out})
+}
+
 // POST /api/v1/admin/notify/test.
 func (s *server) handleNotifyTest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -705,18 +881,6 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
-}
-
-func sameStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // nodeStatus computes the node state shown in the dashboard: "online" while

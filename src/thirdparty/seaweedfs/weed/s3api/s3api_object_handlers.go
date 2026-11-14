@@ -288,6 +288,24 @@ func isCanceledStreamingError(err error) bool {
 	return errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled
 }
 
+// volumeIDsToString formats offline volume infos as a comma-separated
+// "volumeId:collection" list for the X-S3Lite-Volume-Id header.
+func volumeIDsToString(vols []struct {
+	collection string
+	volumeID   uint32
+}) string {
+	var sb strings.Builder
+	for i, v := range vols {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString(strconv.Itoa(int(v.volumeID)))
+		sb.WriteString(":")
+		sb.WriteString(v.collection)
+	}
+	return sb.String()
+}
+
 func shouldWriteStreamingErrorResponse(err error) bool {
 	return err != nil && !isCanceledStreamingError(err)
 }
@@ -1309,6 +1327,37 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 	defer reader.ReleaseStream()
 	streamPrepTime = time.Since(tStreamPrep)
 
+	// Collect volume IDs from chunk views for precise download-failure
+	// reporting. If the first read fails before headers are committed, we
+	// can return 503 with the exact volumes that need nodes powered on.
+	var volumeIDs []struct {
+		collection string
+		volumeID   uint32
+	}
+	seenVolumes := make(map[uint32]bool)
+	for x := chunkViews.Front(); x != nil; x = x.Next {
+		cv := x.Value
+		if cv == nil || cv.FileId == "" {
+			continue
+		}
+		parts := strings.SplitN(cv.FileId, ",", 3)
+		if len(parts) < 1 {
+			continue
+		}
+		vid, err := strconv.ParseUint(parts[0], 10, 32)
+		if err != nil {
+			continue
+		}
+		if seenVolumes[uint32(vid)] {
+			continue
+		}
+		seenVolumes[uint32(vid)] = true
+		volumeIDs = append(volumeIDs, struct {
+			collection string
+			volumeID   uint32
+		}{collection: bucket, volumeID: uint32(vid)})
+	}
+
 	// A cached chunk whose volume server is down, or whose needle was evicted and
 	// now 404s under retry-backoff, would stall and then 500 after the headers are
 	// already sent -- serve the authoritative remote instead.
@@ -1368,6 +1417,24 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 			if isCanceledStreamingError(err) {
 				glog.V(3).Infof("streamFromVolumeServers: request canceled before first byte of %s/%s: %v", bucket, object, err)
 				return err
+			}
+			// First read failed before headers were committed. If we know
+			// which volumes are involved, return 503 with volume info so the
+			// caller (s3proxy) can tell the operator exactly which nodes to
+			// power on.
+			if len(volumeIDs) > 0 {
+				w.Header().Set("Content-Type", "application/xml")
+				w.Header().Set("X-S3Lite-Volume-Id", volumeIDsToString(volumeIDs))
+				w.Header().Set("X-S3Lite-Collection", bucket)
+				w.WriteHeader(http.StatusServiceUnavailable)
+				var xmlBuf strings.Builder
+				xmlBuf.WriteString(`<?xml version="1.0" encoding="UTF-8"?><Error><Code>S3LiteVolumeUnavailable</Code><Message>Some volume servers are offline. Power on the following nodes to restore download:</Message>`)
+				for _, vi := range volumeIDs {
+					xmlBuf.WriteString(`<Volume><Collection>` + vi.collection + `</Collection><VolumeId>` + strconv.Itoa(int(vi.volumeID)) + `</VolumeId></Volume>`)
+				}
+				xmlBuf.WriteString(`</Error>`)
+				w.Write([]byte(xmlBuf.String()))
+				return nil
 			}
 			glog.Errorf("streamFromVolumeServers: first read of %s/%s failed: %v", bucket, object, err)
 			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)

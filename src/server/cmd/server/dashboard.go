@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -138,10 +139,22 @@ func (s *server) dashboardAPI(w http.ResponseWriter, r *http.Request) {
 			outdatedC++
 		}
 	}
+	// Recent download errors reported by s3proxy (nodes to power on for
+	// failed downloads). Shown in the dashboard console.
+	s.downloadErrMu.Lock()
+	downloadErrors := make([]downloadErrorInfo, 0, len(s.downloadErrors))
+	for _, info := range s.downloadErrors {
+		downloadErrors = append(downloadErrors, info)
+	}
+	s.downloadErrMu.Unlock()
+	// Sort by last_seen descending so newest errors appear first.
+	sort.Slice(downloadErrors, func(i, j int) bool {
+		return downloadErrors[i].LastSeen > downloadErrors[j].LastSeen
+	})
 	payload := map[string]any{
-		"nodes":      nodes,
-		"health":     health,
-		"duplicates": dupNodeIDs,
+		"nodes":           nodes,
+		"health":          health,
+		"duplicates":      dupNodeIDs,
 		// Newest agent version seen in any heartbeat; nodes reporting an
 		// older version carry agent_outdated=true and are highlighted.
 		"agent_latest_version": s.newestAgentVersion(),
@@ -151,6 +164,7 @@ func (s *server) dashboardAPI(w http.ResponseWriter, r *http.Request) {
 			"degraded": degradedC,
 			"offline":  offlineC,
 		},
+		"download_errors": downloadErrors,
 		"capacity": map[string]int64{
 			"total_bytes": totalCap,
 			"used_bytes":  usedCap,

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -187,7 +188,56 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Intercept failed downloads: a 5xx on GET is almost always "not enough
 	// EC shards to read the object". Enhance it with the recovery hint.
 	if r.Method == http.MethodGet && resp.StatusCode >= 500 && looksLikeObjectPath(r.URL.Path) {
-		if advice := p.fetchAdvice(); len(advice) > 0 {
+		// Parse volume info from S3 gateway error headers.
+		// Format: X-S3Lite-Volume-Id: "volumeId:collection,volumeId:collection"
+		//         X-S3Lite-Collection: "bucket-name"
+		volumeIDs := resp.Header.Get("X-S3Lite-Volume-Id")
+		headerCollection := resp.Header.Get("X-S3Lite-Collection")
+
+		var advice []string
+		var reportedVolumes []struct {
+			Collection   string
+			VolumeID     string
+			NodesToStart []string
+		}
+		if volumeIDs != "" && headerCollection != "" {
+			// Per-volume check: call /api/v1/download/chains for each volume.
+			parts := strings.Split(volumeIDs, ",")
+			seenNodes := make(map[string]bool)
+			for _, part := range parts {
+				vidColl := strings.SplitN(part, ":", 2)
+				if len(vidColl) != 2 {
+					continue
+				}
+				volumeID := vidColl[0]
+				volCollection := vidColl[1]
+				if volCollection == "" {
+					volCollection = headerCollection
+				}
+				chains := p.fetchDownloadChains(volCollection, volumeID)
+				if len(chains) > 0 {
+					reportedVolumes = append(reportedVolumes, struct {
+						Collection   string
+						VolumeID     string
+						NodesToStart []string
+					}{Collection: volCollection, VolumeID: volumeID, NodesToStart: chains})
+				}
+				for _, node := range chains {
+					if !seenNodes[node] {
+						seenNodes[node] = true
+						advice = append(advice, node)
+					}
+				}
+			}
+		} else {
+			// Fallback: all AT_RISK volumes (older S3 gateway without volume info).
+			advice = p.fetchAdvice()
+		}
+
+		if len(advice) > 0 {
+			// Report the error to the control plane so the dashboard console
+			// can show the operator which nodes to power on.
+			go p.reportDownloadError(reportedVolumes)
 			writeS3Failure(w, advice)
 			return
 		}
@@ -340,6 +390,70 @@ func (p *proxy) fetchAdvice() []string {
 	return out
 }
 
+// fetchDownloadChains calls /api/v1/download/chains for a specific volume
+// and returns the list of nodes to power on.
+func (p *proxy) fetchDownloadChains(collection, volumeID string) []string {
+	u := p.controlURL + "/api/v1/download/chains?collection=" +
+		url.QueryEscape(collection) + "&volume_id=" + url.QueryEscape(volumeID)
+	resp, err := p.client.Get(u)
+	if err != nil {
+		log.Printf("s3proxy: download/chains request failed: %v", err)
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var d struct {
+		Chains []struct {
+			Nodes  []string `json:"nodes"`
+			Shards int      `json:"shards"`
+		} `json:"chains"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
+		return nil
+	}
+	var out []string
+	seen := make(map[string]bool)
+	for _, ch := range d.Chains {
+		for _, n := range ch.Nodes {
+			if !seen[n] {
+				seen[n] = true
+				out = append(out, n)
+			}
+		}
+	}
+	return out
+}
+
+// reportDownloadError POSTs a failed download to the control plane so the
+// dashboard console can show the operator which nodes to power on. Runs in
+// the background (fire-and-forget) so it doesn't delay the error response
+// to the S3 client.
+func (p *proxy) reportDownloadError(volumes []struct {
+	Collection   string
+	VolumeID     string
+	NodesToStart []string
+}) {
+	for _, v := range volumes {
+		body, _ := json.Marshal(map[string]any{
+			"collection":    v.Collection,
+			"volume_id":     v.VolumeID,
+			"nodes_to_start": v.NodesToStart,
+		})
+		req, err := http.NewRequest(http.MethodPost,
+			p.controlURL+"/api/v1/download/errors", strings.NewReader(string(body)))
+		if err != nil {
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		_, err = p.client.Do(req)
+		if err != nil {
+			log.Printf("s3proxy: failed to report download error: %v", err)
+		}
+	}
+}
+
 // writeCapacityError refuses a write whose declared size cannot fit the
 // cluster's usable (replication- and EC-adjusted) free space. The refusal
 // goes to the S3 client as 507 and to the s3proxy log (see ServeHTTP).
@@ -379,6 +493,6 @@ func writeS3ErrorStatus(w http.ResponseWriter, code, msg string, status int) {
 }
 
 func xmlEscape(s string) string {
-	r := strings.NewReplacer("&", "&", "<", "<", ">", ">")
+	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", "\"", "&quot;", "'", "&#39;")
 	return r.Replace(s)
 }
