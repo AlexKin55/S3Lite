@@ -13,7 +13,10 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
+
+	"s3lite.dev/agent/internal/supervisor"
 )
 
 // reinstallScript is the agent self-update script. It is embedded (not
@@ -273,4 +276,50 @@ func parseKV(s string) map[string]string {
 		}
 	}
 	return kv
+}
+
+// restarting guards against concurrent restarts: a repeated restart_agent
+// command while one is already in progress is ignored.
+var restarting atomic.Bool
+
+// triggerRestart arms the "running" state and restarts the agent + volume
+// server in the background. It is called from the heartbeat loop when the
+// control plane delivers a restart_agent command. Returns false if a restart
+// is already in progress.
+func triggerRestart(ctx context.Context, sup *supervisor.Supervisor, st *agentState) bool {
+	if !restarting.CompareAndSwap(false, true) {
+		fmt.Println("agent: restart already in progress, ignoring")
+		return false
+	}
+	st.setRestart("running", "")
+	go agentRestart(ctx, sup, st)
+	return true
+}
+
+// agentRestart stops the volume server and restarts the agent process. On
+// Linux it uses systemctl when available; otherwise it re-execs the current
+// binary.
+func agentRestart(ctx context.Context, sup *supervisor.Supervisor, st *agentState) {
+	defer restarting.Store(false)
+
+	// Stop the volume server first so the new agent starts fresh.
+	if err := sup.Stop(); err != nil {
+		fmt.Printf("agent: stop volume server before restart: %v\n", err)
+	}
+
+	// Try systemd restart first (works when agent runs under systemd).
+	if _, err := exec.LookPath("systemctl"); err == nil {
+		if out, err := exec.Command("systemctl", "restart", "s3lite-agent").CombinedOutput(); err != nil {
+			st.setRestart("failed", "systemctl restart failed: "+err.Error()+": "+string(out))
+			return
+		}
+		// If we get here, this process is being replaced by systemd.
+		st.setRestart("done", "agent restarted via systemd")
+		return
+	}
+
+	// Fallback: re-exec the current binary.
+	if err := syscall.Exec(os.Args[0], os.Args, os.Environ()); err != nil {
+		st.setRestart("failed", "re-exec failed: "+err.Error())
+	}
 }

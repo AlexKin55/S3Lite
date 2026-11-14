@@ -160,6 +160,7 @@ func run(agentDir, serverOverride string, portOverride int, weedOverride, storag
 // updateStatus/updateDetail carry the agent self-update progress; they are
 // reported with every heartbeat ("running") until the outcome ("done" /
 // "failed") is acknowledged by the control plane and cleared (one-shot).
+// restartStatus/restartDetail carry the agent restart progress the same way.
 type agentState struct {
 	mu           sync.Mutex
 	lastIP       string
@@ -167,6 +168,8 @@ type agentState struct {
 	startedAt    time.Time
 	updateStatus string
 	updateDetail string
+	restartStatus string
+	restartDetail string
 }
 
 func (st *agentState) snapshot() (ip string, volCfg *api.VolumeConfig) {
@@ -185,6 +188,18 @@ func (st *agentState) updateSnapshot() (status, detail string) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return st.updateStatus, st.updateDetail
+}
+
+func (st *agentState) setRestart(status, detail string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.restartStatus, st.restartDetail = status, detail
+}
+
+func (st *agentState) restartSnapshot() (status, detail string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.restartStatus, st.restartDetail
 }
 
 // statsCache caches slow-to-collect node statistics so heartbeat payloads are
@@ -316,6 +331,12 @@ func sendHeartbeat(ctx context.Context, client *api.Client, cfg *config.Config, 
 	if updStatus, updDetail := st.updateSnapshot(); updStatus != "" {
 		hb.UpdateStatus, hb.UpdateDetail = updStatus, updDetail
 	}
+	// Agent restart progress: "running" is reported with every heartbeat
+	// while the restart is in progress; the final "done"/"failed" status is
+	// one-shot and cleared once the control plane has acknowledged it.
+	if rstStatus, rstDetail := st.restartSnapshot(); rstStatus != "" {
+		hb.RestartStatus, hb.RestartDetail = rstStatus, rstDetail
+	}
 	resp, err := client.Heartbeat(ctx, cfg.NodeID, hb)
 	if err != nil {
 		fmt.Printf("agent: heartbeat error: %v\n", err)
@@ -338,13 +359,21 @@ func sendHeartbeat(ctx context.Context, client *api.Client, cfg *config.Config, 
 	if s, _ := st.updateSnapshot(); s == "done" || s == "failed" {
 		st.setUpdate("", "")
 	}
+	// One-shot restart statuses ("done"/"failed") are cleared the same way.
+	if s, _ := st.restartSnapshot(); s == "done" || s == "failed" {
+		st.setRestart("", "")
+	}
 
-	// Control-plane commands delivered with this heartbeat. Currently only
-	// "update_agent" exists: it reinstalls the agent package preserving the
-	// node configuration and restarts the agent service (selfupdate.go).
+	// Control-plane commands delivered with this heartbeat. "update_agent"
+	// reinstalls the agent package preserving the node configuration and
+	// restarts the agent service (selfupdate.go). "restart_agent" restarts
+	// the agent and the volume server in place.
 	for _, cmd := range resp.Commands {
 		if cmd == "update_agent" {
 			triggerSelfUpdate(ctx, agentDir, st)
+		}
+		if cmd == "restart_agent" {
+			triggerRestart(ctx, sup, st)
 		}
 	}
 }

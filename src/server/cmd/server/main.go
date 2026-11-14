@@ -405,6 +405,8 @@ func (s *server) handleNodePath(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		http.NotFound(w, r)
+	case "restart":
+		s.handleNodeRestart(w, r, nodeID)
 	default:
 		http.NotFound(w, r)
 	}
@@ -432,6 +434,19 @@ func (s *server) handleAgentUpdate(w http.ResponseWriter, r *http.Request, nodeI
 // restart on the node. The restart_agent command is delivered with the
 // node's next heartbeat response; the agent restarts itself and the volume
 // server (weed volume) in place.
+func (s *server) handleNodeRestart(w http.ResponseWriter, r *http.Request, nodeID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	n, ok := s.reg.RequestNodeRestart(nodeID)
+	if !ok {
+		http.Error(w, "unknown node", http.StatusNotFound)
+		return
+	}
+	log.Printf("node restart requested: %s (IP %s, version %s)", nodeID, n.IP, n.AgentVersion)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "node_id": nodeID})
+}
 
 // POST /api/v1/nodes/{id}/preferred — toggle the preferred-replica flag.
 // Preferred ("reliable") nodes receive new volume replicas first during the
@@ -606,6 +621,15 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request, nodeID 
 	// reinstalls its package (configs preserved) and restarts its service.
 	if s.reg.TakeAgentUpdateCommand(nodeID) {
 		resp["commands"] = []string{"update_agent"}
+	}
+	// Deliver a pending restart command exactly once: the agent restarts
+	// itself and the volume server in place.
+	if s.reg.TakeRestartCommand(nodeID) {
+		if cmds, ok := resp["commands"].([]string); ok {
+			resp["commands"] = append(cmds, "restart_agent")
+		} else {
+			resp["commands"] = []string{"restart_agent"}
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

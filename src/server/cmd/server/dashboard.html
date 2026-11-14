@@ -45,6 +45,7 @@
   .diskbar .mid  { background:#facc15; }
   .diskbar .high { background:#f87171; }
   .diskcell { min-width:150px; }
+.errorcell { max-width:200px; }
   tr.detail-row td { background:#16223b; border-bottom:2px solid #1e293b; padding:12px 16px; }
   .detail-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap:8px 24px; font-size:12.5px; }
   .detail-grid div b { color:#94a3b8; font-weight:600; display:block; font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
@@ -103,7 +104,7 @@ button.warn:disabled { background:#475569; cursor:wait; }
 <div class="card scroll">
  <table id="nodes">
      <thead><tr>
-      <th></th><th>Node</th><th>IP:port</th><th>OS</th><th>CPU</th><th>Agent</th><th>Volume</th><th>Disk</th><th>Last heartbeat</th><th>Volumes</th><th>EC shards</th><th title="Preferred replica target: the master places new raw replicas here first (before EC coding); falls back to regular nodes">★</th><th></th>
+      <th></th><th>Node</th><th>IP:port</th><th>OS</th><th>CPU</th><th>Agent</th><th>Volume</th><th>Disk</th><th>Last heartbeat</th><th>Volumes</th><th>EC shards</th><th title="Last volume server error (from volume log) and when it occurred">Last error</th><th title="Preferred replica target: the master places new raw replicas here first (before EC coding); falls back to regular nodes">★</th><th></th>
      </tr></thead>
    <tbody></tbody>
  </table>
@@ -204,14 +205,14 @@ async function load(){
       '<td><span class="badge '+esc(n.volume_status)+'">'+esc(n.volume_status)+'</span></td>'+
       '<td class="diskcell">'+diskBar(n.disk_used, n.capacity_bytes)+'</td>'+
       '<td>'+ago(n.last_heartbeat)+'</td>'+
-      '<td>'+n.volumes_count+'</td><td>'+n.ec_shards_count+'</td>'+
+      '<td>'+n.volumes_count+'</td><td>'+n.ec_shards_count+'</td>+'<td class="errorcell">'+(n.last_error ? '<span class="sub" title="'+ago(n.last_error_at)+'">'+esc(n.last_error).slice(0,80)+'…</span>' : '—')+'</td>'+
       '<td><button class="pref'+(n.preferred?' on':'')+'" data-pref="'+esc(n.node_id)+'" title="Preferred replica target: new raw replicas are placed on this node first (before EC coding)">★</button></td>'+
       '<td><button class="rst" data-rst="'+esc(n.node_id)+'"'+(n.restart_status==='running' ? ' disabled' : '')+' title="Restart the agent + volume server on this node. The command is delivered with its next heartbeat (works even for currently offline nodes).">⟳</button></td>'+
       '<td><button class="del" data-id="'+esc(n.node_id)+'" title="Delete node permanently">✕</button></td></tr>'+
-      (detail ? '<tr class="detail-row"'+(isOpen?'':' hidden')+'><td colspan="13"><div class="detail-grid">'+detail+'</div>'+
+      (detail ? '<tr class="detail-row"'+(isOpen?'':' hidden')+'><td colspan="14"><div class="detail-grid">'+detail+'</div>'+
         (n.log_tail ? '<div class="logtail">'+esc(n.log_tail)+'</div>' : '')+'</td></tr>' : '');
   }).join('');
-  document.querySelector('#nodes tbody').innerHTML = nt || '<tr><td colspan=13>— no nodes registered —</td></tr>';
+  document.querySelector('#nodes tbody').innerHTML = nt || '<tr><td colspan=14>— no nodes registered —</td></tr>';
 
   // Console: download errors reported by s3proxy when a client fails to
   // download a file because required EC nodes are offline. Each error lists

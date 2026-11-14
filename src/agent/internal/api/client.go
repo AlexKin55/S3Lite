@@ -95,6 +95,11 @@ type HeartbeatRequest struct {
 	// "done"/"failed" is the one-shot outcome reported to the control plane.
 	UpdateStatus string `json:"update_status,omitempty"`
 	UpdateDetail string `json:"update_detail,omitempty"`
+
+	// Agent restart progress: "running" while the restart is in progress;
+	// "done"/"failed" is the one-shot outcome reported to the control plane.
+	RestartStatus string `json:"restart_status,omitempty"`
+	RestartDetail string `json:"restart_detail,omitempty"`
 }
 
 // HeartbeatResponse is the server's reply to a heartbeat. Commands carries

@@ -76,6 +76,12 @@ type Node struct {
 	// "agent online, volume dead" from "agent offline".
 	VolumeStatus string `json:"volume_status,omitempty"`
 
+	// LastError records the most recent volume server error (from the
+	// volume log tail reported by the agent) and when it occurred, so
+	// the dashboard can show why the volume server is down.
+	LastError   string     `json:"last_error,omitempty"`
+	LastErrorAt time.Time  `json:"last_error_at,omitempty"`
+
 	// Agent self-update state (dashboard "Update agent" button). Status
 	// flow: "requested" (admin) -> "dispatched" (command delivered with a
 	// heartbeat response) -> "running" (agent is reinstalling the package)
@@ -85,6 +91,14 @@ type Node struct {
 	UpdateRequestedAt time.Time `json:"update_requested_at,omitempty"`
 	UpdateStatus      string    `json:"update_status,omitempty"`
 	UpdateDetail      string    `json:"update_detail,omitempty"`
+
+	// Agent restart state (dashboard "Restart node" button). Status flow:
+	// "requested" (admin) -> "dispatched" (command delivered with a
+	// heartbeat response) -> "running" (agent is restarting itself and the
+	// volume server) -> "done"/"failed" (agent-reported).
+	RestartRequestedAt time.Time `json:"restart_requested_at,omitempty"`
+	RestartStatus      string    `json:"restart_status,omitempty"`
+	RestartDetail      string    `json:"restart_detail,omitempty"`
 }
 
 // HeartbeatUpdate carries the mutable per-node stats from heartbeats.
@@ -105,6 +119,8 @@ type HeartbeatUpdate struct {
 	LogTail           string
 	UpdateStatus      string // agent self-update progress: "running"|"done"|"failed"
 	UpdateDetail      string
+	RestartStatus     string // agent restart progress: "running"|"done"|"failed"
+	RestartDetail     string
 }
 
 // Registry is a thread-safe in-memory node registry.
@@ -252,6 +268,18 @@ func (r *Registry) UpdateHeartbeat(id string, hb HeartbeatUpdate) (*Node, bool) 
 	n.RestartsTotal = hb.RestartsTotal
 	n.StatsAgeSec = hb.StatsAgeSec
 	n.LogTail = hb.LogTail
+	n.VolumeStatus = "offline"
+	if hb.VolumeServerAlive {
+		n.VolumeStatus = "online"
+		// Volume came back online: clear the last error.
+		n.LastError = ""
+		n.LastErrorAt = time.Time{}
+	} else if n.LastError == "" && hb.LogTail != "" {
+		// Volume just went offline and we have a log tail: capture the
+		// error once so the dashboard can show why it is down.
+		n.LastError = hb.LogTail
+		n.LastErrorAt = now
+	}
 	// Agent self-update progress. A heartbeat without an update status while
 	// the update is "running" means the update helper restarted the agent
 	// service and the fresh agent is reporting again: the update completed.
@@ -261,6 +289,15 @@ func (r *Registry) UpdateHeartbeat(id string, hb HeartbeatUpdate) (*Node, bool) 
 	} else if n.UpdateStatus == "running" {
 		n.UpdateStatus = "done"
 		n.UpdateDetail = "agent restarted; now reporting version " + hb.AgentVersion
+	}
+	// Agent restart progress. A heartbeat without a restart status while the
+	// restart is "running" means the agent restarted itself: mark as done.
+	if hb.RestartStatus != "" {
+		n.RestartStatus = hb.RestartStatus
+		n.RestartDetail = hb.RestartDetail
+	} else if n.RestartStatus == "running" {
+		n.RestartStatus = "done"
+		n.RestartDetail = "agent and volume server restarted; now reporting again"
 	}
 	return n, true
 }
@@ -290,6 +327,34 @@ func (r *Registry) TakeAgentUpdateCommand(id string) bool {
 		return false
 	}
 	n.UpdateStatus = "dispatched"
+	return true
+}
+
+// RequestNodeRestart schedules an agent+volume restart: the restart_agent
+// command is delivered to the agent with its next heartbeat response.
+func (r *Registry) RequestNodeRestart(id string) (*Node, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n, ok := r.nodes[id]
+	if !ok {
+		return nil, false
+	}
+	n.RestartRequestedAt = time.Now()
+	n.RestartStatus = "requested"
+	n.RestartDetail = ""
+	return n, true
+}
+
+// TakeRestartCommand atomically marks a pending restart request as dispatched
+// and reports it, so the command is delivered exactly once.
+func (r *Registry) TakeRestartCommand(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n, ok := r.nodes[id]
+	if !ok || n.RestartStatus != "requested" {
+		return false
+	}
+	n.RestartStatus = "dispatched"
 	return true
 }
 
