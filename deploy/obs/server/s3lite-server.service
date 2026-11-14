@@ -24,6 +24,7 @@ ExecStart=/usr/bin/s3lite-server \
     -webhook=${WEBHOOK} \
     -minWriteNodes=${MIN_WRITE_NODES} \
     -stateFile=/var/lib/s3lite/server-state.json \
+    -preferredPolicyFile=/etc/s3lite/policy.conf \
     -preferredNodesFile=/var/lib/s3lite/preferred-nodes.txt
 Restart=on-failure
 RestartSec=5

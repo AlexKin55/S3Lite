@@ -2,10 +2,12 @@ package store
 
 import (
 	"encoding/json"
+	"log"
 	"net"
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -111,14 +113,18 @@ type Registry struct {
 	// applied when the node registers.
 	statePath        string
 	preferredPending map[string]bool
+	// policyPreferred holds node IDs loaded from /etc/s3lite/policy.conf.
+	// These are always preferred and cannot be unmarked through the web UI.
+	policyPreferred map[string]bool
 }
 
 func NewRegistry(portBase int, heartbeatTTL time.Duration) *Registry {
 	return &Registry{
-		nodes:        make(map[string]*Node),
-		nextRack:     1,
-		portBase:     portBase,
-		heartbeatTTL: heartbeatTTL,
+		nodes:           make(map[string]*Node),
+		nextRack:        1,
+		portBase:        portBase,
+		heartbeatTTL:    heartbeatTTL,
+		policyPreferred: make(map[string]bool),
 	}
 }
 
@@ -311,13 +317,19 @@ func (r *Registry) Delete(id string) bool {
 }
 
 // SetPreferred flags a node as a preferred replica target (operator action,
-// dashboard toggle). Returns false if the node id is unknown.
+// dashboard toggle). Returns false if the node id is unknown. Nodes listed
+// in /etc/s3lite/policy.conf are always preferred and cannot be unmarked
+// through the web UI.
 func (r *Registry) SetPreferred(id string, preferred bool) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	n, ok := r.nodes[id]
 	if !ok {
 		return false
+	}
+	// Policy nodes are sticky: they cannot be unmarked from the dashboard.
+	if !preferred && r.policyPreferred[id] {
+		return true
 	}
 	n.Preferred = preferred
 	if !preferred {
@@ -330,6 +342,48 @@ func (r *Registry) SetPreferred(id string, preferred bool) bool {
 	}
 	r.persistStateLocked()
 	return true
+}
+
+// IsPolicyPreferred reports whether the node is a policy-preferred node
+// loaded from /etc/s3lite/policy.conf. Such nodes cannot be unmarked via
+// the web UI.
+func (r *Registry) IsPolicyPreferred(id string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.policyPreferred[id]
+}
+
+// LoadPreferredPolicy reads node IDs from /etc/s3lite/policy.conf (one id
+// per line, blank lines and # comments ignored) and marks them as preferred.
+// The flags are applied to already-registered nodes immediately and are
+// remembered in preferredPending for nodes that register later. Policy nodes
+// cannot be unmarked through the web UI.
+func (r *Registry) LoadPreferredPolicy(path string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("read preferred policy file %s: %v", path, err)
+		}
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		id := strings.TrimSpace(line)
+		if id == "" || strings.HasPrefix(id, "#") {
+			continue
+		}
+		r.policyPreferred[id] = true
+		if n, ok := r.nodes[id]; ok {
+			n.Preferred = true
+		} else {
+			if r.preferredPending == nil {
+				r.preferredPending = make(map[string]bool)
+			}
+			r.preferredPending[id] = true
+		}
+	}
+	r.persistStateLocked()
 }
 
 // PreferredNodeAddrs returns the "ip:port" volume server addresses of all

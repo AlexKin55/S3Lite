@@ -41,6 +41,9 @@ type server struct {
 	// preferred (operator-trusted) nodes; the SeaweedFS master watches it
 	// via -preferredNodesFile and prefers those servers for new replicas.
 	preferredNodesFile string
+	// preferredPolicyFile, when set, is read at startup and lists node ids
+	// that are always preferred (operator-trusted, cannot be unmarked via UI).
+	preferredPolicyFile string
 
 	// Volume size limit (MB) reported by the master; used to derive the
 	// per-node max volume count from the node's capacity quota.
@@ -117,6 +120,7 @@ func main() {
 	portBase := flag.Int("portBase", 8080, "starting port for agent volume servers")
 	stateFile := flag.String("stateFile", "", "JSON file persisting operator node flags (preferred replica targets) across restarts")
 	preferredNodesFile := flag.String("preferredNodesFile", "", "File where the preferred volume server address list (\"ip:port\" per line) is published for the master's -preferredNodesFile")
+	preferredPolicyFile := flag.String("preferredPolicyFile", "", "File with preferred node ids (one per line) that are always preferred and cannot be unmarked via the web UI")
 	weedBin := flag.String("weedBin", "/usr/bin/weed", "path to the weed binary; the dashboard fsck button runs 'weed shell volume.fsck' with it")
 	fsckTimeout := flag.Duration("fsckTimeout", 10*time.Minute, "wall-clock cap on a dashboard-triggered volume.fsck run")
 	flag.Parse()
@@ -152,8 +156,14 @@ func main() {
 	srv.histMaxMiss = 10 // ~10 polls before a phantom volume is forgotten
 	srv.lastUpdate.Store(time.Time{})
 	srv.preferredNodesFile = *preferredNodesFile
+	srv.preferredPolicyFile = *preferredPolicyFile
 	if *stateFile != "" {
 		reg.SetStatePath(*stateFile)
+	}
+	if *preferredPolicyFile != "" {
+		// Load operator-declared preferred node ids from /etc/s3lite/policy.conf.
+		// These are sticky: they cannot be unmarked via the web UI.
+		reg.LoadPreferredPolicy(*preferredPolicyFile)
 	}
 	if srv.preferredNodesFile != "" {
 		// Publish the loaded state so the master picks up the preference
@@ -517,6 +527,12 @@ func (s *server) handleNodePreferred(w http.ResponseWriter, r *http.Request, nod
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Preferred == nil {
 		http.Error(w, `bad request: need {"preferred": true|false}`, http.StatusBadRequest)
+		return
+	}
+	// Policy-preferred nodes (from /etc/s3lite/policy.conf) cannot be
+	// unmarked through the web UI.
+	if !*req.Preferred && s.reg.IsPolicyPreferred(nodeID) {
+		http.Error(w, "policy-preferred node cannot be unmarked", http.StatusForbidden)
 		return
 	}
 	if !s.reg.SetPreferred(nodeID, *req.Preferred) {
