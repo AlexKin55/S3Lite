@@ -1,6 +1,7 @@
 package store
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -64,5 +65,53 @@ func TestPreferredFlagsAndPersistence(t *testing.T) {
 	}
 	if got := reg.PreferredNodeAddrs(); len(got) != 0 {
 		t.Fatalf("PreferredNodeAddrs() after clear = %v, want empty", got)
+	}
+}
+
+func TestPolicyPreferredCannotBeUnmarked(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.json")
+
+	reg := NewRegistry(8080, time.Minute)
+	reg.SetStatePath(statePath)
+
+	if _, isNew := reg.Register("policy-node", 100<<20, "", "192.168.1.20", "linux", "1", "amd64"); !isNew {
+		t.Fatal("policy-node must register as new")
+	}
+
+	// Load policy from a temp file: policy-node is declared preferred.
+	policyPath := filepath.Join(dir, "policy.conf")
+	if err := os.WriteFile(policyPath, []byte("# comment\npolicy-node\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	reg.LoadPreferredPolicy(policyPath)
+
+	n, ok := reg.Get("policy-node")
+	if !ok || !n.Preferred {
+		t.Fatalf("policy-node must be preferred after LoadPreferredPolicy: %+v", n)
+	}
+	if !reg.IsPolicyPreferred("policy-node") {
+		t.Fatal("IsPolicyPreferred(policy-node) must be true")
+	}
+
+	// Dashboard toggle off is rejected for policy nodes: returns true (no-op)
+	// but the node stays preferred.
+	if !reg.SetPreferred("policy-node", false) {
+		t.Fatal("SetPreferred(policy-node, false) must not error")
+	}
+	if n, ok := reg.Get("policy-node"); !ok || !n.Preferred {
+		t.Fatalf("policy-node must remain preferred after attempted unmark: %+v", n)
+	}
+	if !reg.IsPolicyPreferred("policy-node") {
+		t.Fatal("IsPolicyPreferred(policy-node) must still be true")
+	}
+
+	// Policy flag survives a registry restart: reloading state re-applies it.
+	reg2 := NewRegistry(8080, time.Minute)
+	reg2.SetStatePath(statePath)
+	reg2.LoadPreferredPolicy(policyPath)
+	reg2.Register("policy-node", 100<<20, "", "192.168.1.20", "linux", "1", "amd64")
+	if n, ok := reg2.Get("policy-node"); !ok || !n.Preferred {
+		t.Fatalf("policy-node preferred flag not restored after restart: %+v", n)
 	}
 }
