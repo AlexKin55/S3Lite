@@ -7,7 +7,8 @@ import (
 )
 
 // buildTestVolume creates a Volume with k data shards and m parity shards,
-// placing shards on the given nodes.
+// placing shards on the given nodes. Node keys are IP-only (no port) to
+// match dataNodeAddr() which strips ports for registry matching.
 func buildTestVolume(collection string, volumeID uint32, k, m int, shardsByNode map[string][]int) *Volume {
 	return &Volume{
 		Collection:   collection,
@@ -24,7 +25,7 @@ func buildTestTopology(vols ...*Volume) *master_pb.TopologyInfo {
 	disk := &master_pb.DiskInfo{}
 	for _, v := range vols {
 		ecIndexBits := uint32(0)
-		for _, s := range v.ShardsByNode["node-1:8080"] {
+		for _, s := range v.ShardsByNode["node-1"] {
 			ecIndexBits |= 1 << s
 		}
 		disk.EcShardInfos = append(disk.EcShardInfos, &master_pb.VolumeEcShardInformationMessage{
@@ -37,8 +38,8 @@ func buildTestTopology(vols ...*Volume) *master_pb.TopologyInfo {
 	}
 
 	dn := &master_pb.DataNodeInfo{
-		Id:        "node-1:8080",
-		Address:   "node-1:8080",
+		Id:        "node-1",
+		Address:   "node-1",
 		DiskInfos: map[string]*master_pb.DiskInfo{"disk1": disk},
 	}
 
@@ -54,9 +55,9 @@ func buildTestTopology(vols ...*Volume) *master_pb.TopologyInfo {
 func TestCalcDownloadChains_EnoughShards(t *testing.T) {
 	// 6+4 scheme, all shards on one online node => available=6 >= k=6 => no chains needed
 	v := buildTestVolume("bucket-a", 1, 6, 4, map[string][]int{
-		"node-1:8080": {0, 1, 2, 3, 4, 5},
+		"node-1": {0, 1, 2, 3, 4, 5},
 	})
-	online := map[string]bool{"node-1:8080": true}
+	online := map[string]bool{"node-1": true}
 
 	chains := CalcDownloadChains([]*Volume{v}, online, "bucket-a", 1)
 	if len(chains) != 0 {
@@ -68,11 +69,11 @@ func TestCalcDownloadChains_NotEnoughShards(t *testing.T) {
 	// 6+4 scheme, only 4 shards online => available=4 < k=6 => need 2 more shards
 	// node-2 has shards 6,7 => chain [node-2] gives 2 shards => enough
 	v := buildTestVolume("bucket-a", 1, 6, 4, map[string][]int{
-		"node-1:8080": {0, 1, 2, 3},
-		"node-2:8080": {6, 7},
-		"node-3:8080": {4, 5},
+		"node-1": {0, 1, 2, 3},
+		"node-2": {6, 7},
+		"node-3": {4, 5},
 	})
-	online := map[string]bool{"node-1:8080": true}
+	online := map[string]bool{"node-1": true}
 
 	chains := CalcDownloadChains([]*Volume{v}, online, "bucket-a", 1)
 	if len(chains) == 0 {
@@ -82,7 +83,7 @@ func TestCalcDownloadChains_NotEnoughShards(t *testing.T) {
 	// Either node-2 or node-3 alone provides 2 shards which meets need=2
 	found := false
 	for _, ch := range chains {
-		if (len(ch.Nodes) == 1 && (ch.Nodes[0] == "node-2:8080" || ch.Nodes[0] == "node-3:8080")) && ch.Shards >= 2 {
+		if (len(ch.Nodes) == 1 && (ch.Nodes[0] == "node-2" || ch.Nodes[0] == "node-3")) && ch.Shards >= 2 {
 			found = true
 		}
 	}
@@ -93,9 +94,9 @@ func TestCalcDownloadChains_NotEnoughShards(t *testing.T) {
 
 func TestCalcDownloadChains_VolumeNotFound(t *testing.T) {
 	v := buildTestVolume("bucket-a", 1, 6, 4, map[string][]int{
-		"node-1:8080": {0, 1, 2, 3, 4, 5},
+		"node-1": {0, 1, 2, 3, 4, 5},
 	})
-	online := map[string]bool{"node-1:8080": true}
+	online := map[string]bool{"node-1": true}
 
 	chains := CalcDownloadChains([]*Volume{v}, online, "bucket-a", 999)
 	if len(chains) != 0 {
@@ -105,8 +106,8 @@ func TestCalcDownloadChains_VolumeNotFound(t *testing.T) {
 
 func TestCollect(t *testing.T) {
 	topo := buildTestTopology(
-		buildTestVolume("bucket-a", 1, 6, 4, map[string][]int{"node-1:8080": {0, 1, 2, 3, 4, 5}}),
-		buildTestVolume("bucket-b", 2, 3, 2, map[string][]int{"node-1:8080": {0, 1, 2}}),
+		buildTestVolume("bucket-a", 1, 6, 4, map[string][]int{"node-1": {0, 1, 2, 3, 4, 5}}),
+		buildTestVolume("bucket-b", 2, 3, 2, map[string][]int{"node-1": {0, 1, 2}}),
 	)
 
 	vols := Collect(topo)
@@ -120,8 +121,8 @@ func TestCollect(t *testing.T) {
 	if vols[0].DataShards != 6 || vols[0].ParityShards != 4 {
 		t.Fatalf("expected 6+4, got %d+%d", vols[0].DataShards, vols[0].ParityShards)
 	}
-	if len(vols[0].ShardsByNode["node-1:8080"]) != 6 {
-		t.Fatalf("expected 6 shards on node-1, got %d", len(vols[0].ShardsByNode["node-1:8080"]))
+	if len(vols[0].ShardsByNode["node-1"]) != 6 {
+		t.Fatalf("expected 6 shards on node-1, got %d", len(vols[0].ShardsByNode["node-1"]))
 	}
 
 	if vols[1].Collection != "bucket-b" || vols[1].VolumeID != 2 {
