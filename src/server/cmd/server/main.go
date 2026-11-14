@@ -699,9 +699,8 @@ func (s *server) handleDownloadChains(w http.ResponseWriter, r *http.Request) {
 	volumes := redundancy.Collect(topo)
 	online := make(map[string]bool)
 	for _, n := range s.reg.All() {
-		addr := fmt.Sprintf("%s:%d", n.IP, n.VolumePort)
 		if s.nodeStatus(n) == "online" {
-			online[addr] = true
+			online[n.IP] = true
 		}
 	}
 	chains := redundancy.CalcDownloadChains(volumes, online, collection, volumeID)
@@ -766,9 +765,8 @@ func (s *server) handleVolumesRisk(w http.ResponseWriter, r *http.Request) {
 	volumes := redundancy.Collect(topo)
 	online := make(map[string]bool)
 	for _, n := range s.reg.All() {
-		addr := fmt.Sprintf("%s:%d", n.IP, n.VolumePort)
 		if s.nodeStatus(n) == "online" {
-			online[addr] = true
+			online[n.IP] = true
 		}
 	}
 	collection := r.URL.Query().Get("collection")

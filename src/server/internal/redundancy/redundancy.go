@@ -1,6 +1,7 @@
 package redundancy
 
 import (
+	"net"
 	"sort"
 	"strconv"
 
@@ -187,12 +188,19 @@ func calculateChains(nodes []struct {
 	return result
 }
 
-// dataNodeAddr returns the node's cluster address (ip:port).
+// dataNodeAddr returns the node's IP address (without port) so it can be
+// matched against the control-plane node registry which uses IPs as keys.
+// Port numbers differ between the master topology and the agent registry,
+// so matching on IP only is reliable.
 func dataNodeAddr(dn *master_pb.DataNodeInfo) string {
-	if id := dn.GetId(); id != "" {
-		return id
+	addr := dn.GetAddress()
+	if addr == "" {
+		addr = dn.GetId()
 	}
-	return dn.GetAddress()
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
 }
 
 // bitsSet returns indices of set bits in a 32-bit mask.
