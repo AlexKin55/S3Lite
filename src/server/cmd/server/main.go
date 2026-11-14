@@ -405,8 +405,6 @@ func (s *server) handleNodePath(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		http.NotFound(w, r)
-	case "restart":
-		s.handleNodeRestart(w, r, nodeID)
 	default:
 		http.NotFound(w, r)
 	}
@@ -434,19 +432,6 @@ func (s *server) handleAgentUpdate(w http.ResponseWriter, r *http.Request, nodeI
 // restart on the node. The restart_agent command is delivered with the
 // node's next heartbeat response; the agent restarts itself and the volume
 // server (weed volume) in place.
-func (s *server) handleNodeRestart(w http.ResponseWriter, r *http.Request, nodeID string) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	n, ok := s.reg.RequestNodeRestart(nodeID)
-	if !ok {
-		http.Error(w, "unknown node", http.StatusNotFound)
-		return
-	}
-	log.Printf("node restart requested: %s (IP %s, version %s)", nodeID, n.IP, n.AgentVersion)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "node_id": nodeID})
-}
 
 // POST /api/v1/nodes/{id}/preferred — toggle the preferred-replica flag.
 // Preferred ("reliable") nodes receive new volume replicas first during the
@@ -621,15 +606,6 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request, nodeID 
 	// reinstalls its package (configs preserved) and restarts its service.
 	if s.reg.TakeAgentUpdateCommand(nodeID) {
 		resp["commands"] = []string{"update_agent"}
-	}
-	// Deliver a pending restart command exactly once: the agent restarts
-	// itself and the volume server in place.
-	if s.reg.TakeRestartCommand(nodeID) {
-		if cmds, ok := resp["commands"].([]string); ok {
-			resp["commands"] = append(cmds, "restart_agent")
-		} else {
-			resp["commands"] = []string{"restart_agent"}
-		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -910,21 +886,33 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// nodeStatus computes the node state shown in the dashboard: "online" while
-// the agent heartbeat is fresh (within the TTL) and the volume server was
-// reported alive, otherwise "offline".
+// nodeStatus computes the agent state shown in the dashboard: "online" while
+// the agent heartbeat is fresh (within the TTL), otherwise "offline".
 func (s *server) nodeStatus(n *store.Node) string {
-	if n.Alive && time.Since(n.LastHeartbeat) <= s.hbTTL {
+	if time.Since(n.LastHeartbeat) <= s.hbTTL {
 		return "online"
 	}
 	return "offline"
 }
 
-// nodeView returns a snapshot copy of the node whose Alive/Status fields are
-// recomputed from heartbeat freshness instead of the raw heartbeat payload.
+// volumeStatus computes the volume server state reported by the agent:
+// "online" when the volume server answers /status, "offline" otherwise.
+// Independent of agent heartbeat freshness so the dashboard can distinguish
+// "agent online, volume dead" from "agent offline".
+func (s *server) volumeStatus(n *store.Node) string {
+	if n.Alive {
+		return "online"
+	}
+	return "offline"
+}
+
+// nodeView returns a snapshot copy of the node with recomputed agent and
+// volume statuses. Agent status comes from heartbeat freshness; volume
+// status comes from the agent's last VolumeServerAlive report.
 func (s *server) nodeView(n *store.Node) store.Node {
 	v := *n
 	v.Status = s.nodeStatus(n)
+	v.VolumeStatus = s.volumeStatus(n)
 	v.Alive = v.Status == "online"
 	// A node is flagged when its agent reports a version older than the
 	// newest one observed anywhere in the cluster (see observeAgentVersion).

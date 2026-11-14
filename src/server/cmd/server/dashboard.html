@@ -72,9 +72,6 @@
 button.warn { background:#7f1d1d; }
 button.warn:hover { background:#ef4444; }
 button.warn:disabled { background:#475569; cursor:wait; }
-button.rst { background:#b45309; padding:3px 9px; font-size:11px; margin-left:8px; vertical-align:middle; }
-button.rst:hover { background:#f59e0b; }
-button.rst:disabled { background:#475569; cursor:wait; }
   .result { margin-top:8px; font-size:13px; color:#94a3b8; min-height:16px; }
   .banner { background:#450a0a; color:#fecaca; border:1px solid #7f1d1d; border-radius:8px;
             padding:10px 14px; margin:10px 0; font-size:13.5px; line-height:1.5; }
@@ -106,7 +103,7 @@ button.rst:disabled { background:#475569; cursor:wait; }
 <div class="card scroll">
  <table id="nodes">
      <thead><tr>
-      <th></th><th>Node</th><th>IP:port</th><th>OS</th><th>CPU</th><th>Status</th><th>Disk</th><th>Last heartbeat</th><th>Volumes</th><th>EC shards</th><th title="Preferred replica target: the master places new raw replicas here first (before EC coding); falls back to regular nodes">★</th><th title="Restart the agent + volume server on this node (e.g. when shards are unresponsive despite the node showing online)">Restart</th><th></th>
+      <th></th><th>Node</th><th>IP:port</th><th>OS</th><th>CPU</th><th>Agent</th><th>Volume</th><th>Disk</th><th>Last heartbeat</th><th>Volumes</th><th>EC shards</th><th title="Preferred replica target: the master places new raw replicas here first (before EC coding); falls back to regular nodes">★</th><th></th>
      </tr></thead>
    <tbody></tbody>
  </table>
@@ -193,9 +190,6 @@ async function load(){
       (n.agent_uptime_sec ? '<div><b>Agent uptime</b>'+fmtUptime(n.agent_uptime_sec)+'</div>' : '')+
       (n.volume_uptime_sec ? '<div><b>Volume uptime</b>'+fmtUptime(n.volume_uptime_sec)+'</div>' : '')+
       (n.restarts_total ? '<div><b>Volume restarts</b>'+n.restarts_total+'</div>' : '')+
-      (n.restart_status ? '<div><b>Restart status</b>'+esc(n.restart_status)+
-        (n.restart_detail ? ' — '+esc(n.restart_detail) : '')+
-        (n.restart_requested_at ? ' ('+ago(new Date(n.restart_requested_at).toISOString())+')' : '')+'</div>' : '')+
       (n.stats_age_sec ? '<div><b>Stats freshness</b>'+ago(new Date(Date.now()-n.stats_age_sec*1000).toISOString())+'</div>' : '');
     const isOpen = expanded.has(n.node_id);
     return '<tr class="node-row'+(isOutdated?' outdated':'')+'" data-id="'+esc(n.node_id)+'">'+
@@ -204,17 +198,20 @@ async function load(){
       '<td>'+esc(n.ip)+':'+n.volume_port+'</td>'+
       '<td title="'+esc(n.arch)+'">'+esc(os||'—')+(n.arch?'<span class="sub">'+esc(n.arch)+'</span>':'')+'</td>'+
       '<td>'+(n.cpu_load||'—')+'%</td>'+
-      '<td>'+badge+'</td>'+
+      '<td><span class="badge '+esc(n.status)+'">'+esc(n.status)+'</span>'+
+        (n.health==='degraded' ? ' <span class="badge warn">degraded</span>' : '')+
+        (isOutdated ? ' <span class="badge warn">outdated</span>' : '')+'</td>'+
+      '<td><span class="badge '+esc(n.volume_status)+'">'+esc(n.volume_status)+'</span></td>'+
       '<td class="diskcell">'+diskBar(n.disk_used, n.capacity_bytes)+'</td>'+
       '<td>'+ago(n.last_heartbeat)+'</td>'+
       '<td>'+n.volumes_count+'</td><td>'+n.ec_shards_count+'</td>'+
       '<td><button class="pref'+(n.preferred?' on':'')+'" data-pref="'+esc(n.node_id)+'" title="Preferred replica target: new raw replicas are placed on this node first (before EC coding)">★</button></td>'+
       '<td><button class="rst" data-rst="'+esc(n.node_id)+'"'+(n.restart_status==='running' ? ' disabled' : '')+' title="Restart the agent + volume server on this node. The command is delivered with its next heartbeat (works even for currently offline nodes).">⟳</button></td>'+
       '<td><button class="del" data-id="'+esc(n.node_id)+'" title="Delete node permanently">✕</button></td></tr>'+
-      (detail ? '<tr class="detail-row"'+(isOpen?'':' hidden')+'><td colspan="12"><div class="detail-grid">'+detail+'</div>'+
+      (detail ? '<tr class="detail-row"'+(isOpen?'':' hidden')+'><td colspan="13"><div class="detail-grid">'+detail+'</div>'+
         (n.log_tail ? '<div class="logtail">'+esc(n.log_tail)+'</div>' : '')+'</td></tr>' : '');
   }).join('');
-  document.querySelector('#nodes tbody').innerHTML = nt || '<tr><td colspan=12>— no nodes registered —</td></tr>';
+  document.querySelector('#nodes tbody').innerHTML = nt || '<tr><td colspan=13>— no nodes registered —</td></tr>';
 
   // Console: download errors reported by s3proxy when a client fails to
   // download a file because required EC nodes are offline. Each error lists

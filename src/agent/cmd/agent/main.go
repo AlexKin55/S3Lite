@@ -235,10 +235,12 @@ func (c *statsCache) get() (used int64, status supervisor.Status, restarts int, 
 	return c.used, c.status, c.restarts, age, c.logTail
 }
 
-// statsLoop refreshes the statistics cache every 30 seconds in the background.
+// statsLoop refreshes the statistics cache every 5 seconds in the background.
+// A 5-second interval lets the control plane detect a dead or hung volume
+// server quickly, well before the heartbeat TTL expires.
 func statsLoop(ctx context.Context, cache *statsCache, sup *supervisor.Supervisor, dataDir string) {
 	cache.refresh(dataDir, sup) // first sample right away
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
