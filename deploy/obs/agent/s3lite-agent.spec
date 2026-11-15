@@ -168,7 +168,7 @@ exit 0
 %dir %{_prefix}/lib/s3lite
 %{_prefix}/lib/s3lite/agent-update.sh
 %dir %attr(0755,root,root) %{_sysconfdir}/s3lite
-%config(noreplace) %attr(0640,root,root) %{_sysconfdir}/s3lite/agent.env
+%config(noreplace) %attr(0644,root,root) %{_sysconfdir}/s3lite/agent.env
 # Ownership is fixed to s3lite:s3lite by the post scriptlet.
 # Keep root:root here so rpm does not auto-generate the
 # user(s3lite)/group(s3lite) dependencies that block first install.

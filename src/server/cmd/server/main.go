@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"s3lite.dev/server/internal/config"
@@ -206,6 +208,15 @@ func main() {
 		err = http.ListenAndServe(cfg.Listen, mux)
 	}
 	if err != nil {
+		if opErr, ok := err.(*net.OpError); ok {
+			if errors.Is(opErr.Err, syscall.EADDRINUSE) {
+				_, port, errSplit := net.SplitHostPort(cfg.Listen)
+				if errSplit == nil {
+					proc := listeningProcess(port)
+					log.Fatalf("control plane on %s://%s: bind: address %s already in use (process: %s)", scheme, cfg.Listen, cfg.Listen, proc)
+				}
+			}
+		}
 		log.Fatal(err)
 	}
 }
@@ -938,6 +949,119 @@ func clientIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// listeningProcess returns "pid cmdline" of the process listening on the given
+// TCP port, by scanning /proc/net/tcp and /proc/net/tcp6. Empty string when the
+// process cannot be determined.
+func listeningProcess(port string) string {
+	inodes := tcpListeningInodes(port)
+	if len(inodes) == 0 {
+		return ""
+	}
+	pid := findPidBySocketInode(inodes)
+	if pid == "" {
+		return "unknown"
+	}
+	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%s/cmdline", pid))
+	if err != nil {
+		return pid
+	}
+	parts := bytes.Split(cmdline, []byte{0})
+	cmd := ""
+	for _, p := range parts {
+		if len(p) > 0 {
+			if cmd != "" {
+				cmd += " "
+			}
+			cmd += string(p)
+		}
+	}
+	if cmd == "" {
+		cmd = fmt.Sprintf("pid %s", pid)
+	}
+	return fmt.Sprintf("%s (%s)", pid, cmd)
+}
+
+// tcpListeningInodes parses /proc/net/tcp and /proc/net/tcp6 and returns the
+// inode numbers of sockets in LISTEN state on the given port.
+func tcpListeningInodes(port string) []string {
+	var inodes []string
+	portHex := fmt.Sprintf("%04X", mustParsePort(port))
+	for _, file := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 10 {
+				continue
+			}
+			localAddr := fields[1]
+			state := fields[3]
+			inode := fields[9]
+			if state != "0A" { // LISTEN
+				continue
+			}
+			parts := strings.Split(localAddr, ":")
+			if len(parts) != 2 {
+				continue
+			}
+			if strings.EqualFold(parts[1], portHex) {
+				inodes = append(inodes, inode)
+			}
+		}
+	}
+	return inodes
+}
+
+func mustParsePort(port string) int {
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// findPidBySocketInode scans /proc/[0-9]*/fd for symlinks whose target matches
+// "socket:[inode]" for any of the given inodes.
+func findPidBySocketInode(inodes []string) string {
+	inodeSet := make(map[string]struct{}, len(inodes))
+	for _, ino := range inodes {
+		inodeSet[ino] = struct{}{}
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+		fds, err := os.ReadDir(fmt.Sprintf("/proc/%s/fd", e.Name()))
+		if err != nil {
+			continue
+		}
+		for _, fd := range fds {
+			target, err := os.Readlink(fmt.Sprintf("/proc/%s/fd/%s", e.Name(), fd.Name()))
+			if err != nil {
+				continue
+			}
+			if target == "" {
+				continue
+			}
+			for ino := range inodeSet {
+				if strings.Contains(target, fmt.Sprintf("socket:[%s]", ino)) {
+					return e.Name()
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func (s *server) nodeViews() []store.Node {

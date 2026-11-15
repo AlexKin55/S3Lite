@@ -146,7 +146,14 @@ func parseEnvFile(data []byte, cfg *Config) error {
 func Load() (*Config, error) {
 	cfg := Default()
 
-	if data, err := os.ReadFile(envFilePath()); err == nil {
+	if data, err := os.ReadFile(envFilePath()); err != nil {
+		if os.IsNotExist(err) {
+			// File not installed yet — fall back to compile-time defaults.
+			// This is acceptable before the package conffile is in place.
+		} else {
+			return nil, fmt.Errorf("read %s: %w (check file permissions — the s3lite user must be able to read it)", envFilePath(), err)
+		}
+	} else {
 		if err := parseEnvFile(data, &cfg); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", envFilePath(), err)
 		}

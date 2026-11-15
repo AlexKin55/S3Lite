@@ -20,21 +20,48 @@ import (
 
 func main() {
 	agentDir := flag.String("dir", ".cluster/agent", "agent directory: config, data, logs")
+	server := flag.String("server", "", "control plane address (scheme + host:port)")
+	weedBin := flag.String("weed", "", "path to the SeaweedFS weed binary")
+	storage := flag.String("storage", "", "agent data directory")
+	capacityGB := flag.Int("capacityGB", 0, "node capacity in gigabytes")
+	insecure := flag.Bool("insecure", false, "skip TLS certificate verification")
 	flag.Parse()
 
-	if err := run(*agentDir); err != nil {
+	cfg, err := config.Load(*agentDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agent: load config: %v\n", err)
+		os.Exit(1)
+	}
+	// CLI flags override values from /etc/s3lite/agent.env.
+	if *server != "" {
+		cfg.Server = *server
+	}
+	if *weedBin != "" {
+		cfg.WeedBin = *weedBin
+	}
+	if *storage != "" {
+		cfg.DataDir = *storage
+	}
+	if *capacityGB > 0 {
+		cfg.CapacityBytes = int64(*capacityGB) * 1024 * 1024 * 1024
+	}
+	if *insecure {
+		cfg.TLSInsecure = true
+	}
+
+	if err := run(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "agent: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(agentDir string) error {
-	agentDir = abs(agentDir)
-
-	cfg, err := config.Load(agentDir)
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
+func run(cfg *config.Config) error {
+	agentDir := abs(cfg.DataDir)
+	if agentDir == "" {
+		agentDir = abs(".cluster/agent")
 	}
+	agentDir = filepath.Dir(agentDir)
+
 	if cfg.WeedBin == "" {
 		return fmt.Errorf("weed binary path is empty: set WEED_BIN in /etc/s3lite/agent.env")
 	}
@@ -51,8 +78,14 @@ func run(agentDir string) error {
 		dataDir = filepath.Join(agentDir, "data")
 	}
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return err
+		return fmt.Errorf("create data dir %s: %w (check permissions — the s3lite user must be able to read and write it)", dataDir, err)
 	}
+	// Verify the data directory is readable and writable by this process.
+	testFile := filepath.Join(dataDir, ".s3lite-write-test")
+	if err := os.WriteFile(testFile, []byte("ok"), 0o644); err != nil {
+		return fmt.Errorf("data dir %s is not writable: %w (check permissions — the s3lite user must be able to read and write it)", dataDir, err)
+	}
+	os.Remove(testFile)
 	logPath := filepath.Join(agentDir, "volume.log")
 
 	fmt.Printf("agent %s: server=%s ip=%s port=%d zone=%s cap=%dMiB\n",

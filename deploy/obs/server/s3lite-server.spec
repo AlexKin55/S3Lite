@@ -184,7 +184,7 @@ exit 0
 %{_unitdir}/s3lite-ecworker.service
 %{_unitdir}/s3lite-s3proxy.service
 %dir %attr(0755,root,root) %{_sysconfdir}/s3lite
-%config(noreplace) %attr(0640,root,root) %{_sysconfdir}/s3lite/server.env
+%config(noreplace) %attr(0644,root,root) %{_sysconfdir}/s3lite/server.env
 %config(noreplace) %attr(0644,root,root) %{_sysconfdir}/s3lite/admin.toml
 %config(noreplace) %attr(0644,root,root) %{_sysconfdir}/s3lite/s3.json
 %dir %attr(0750,root,root) %{_localstatedir}/lib/s3lite/filer
