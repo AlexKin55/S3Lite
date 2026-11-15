@@ -335,6 +335,11 @@ func (s *server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		Detail:  fmt.Sprintf("%s rack=%s port=%d", n.IP, n.Rack, n.VolumePort),
 		At:      time.Now(),
 	})
+	// Publish the preferred nodes list for the master's -preferredNodesFile.
+	// A node may carry a preferred flag from the persisted state file
+	// (preferredPending), so the file must be updated on every registration,
+	// not only at startup or on manual toggle.
+	s.writePreferredNodesFile()
 	// Derive the per-node volume count from the node's capacity quota and the
 	// master's volume size limit, so a node can never store more than its
 	// configured STORAGE_SIZE (maxVolumes * volumeSizeLimitMB <= capacity).
