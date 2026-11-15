@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"s3lite.dev/server/internal/config"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 
@@ -118,65 +119,49 @@ type VolumeTemplate struct {
 }
 
 func main() {
-	listen := flag.String("listen", ":8099", "control plane listen address")
-	tlsCert := flag.String("tlsCert", "", "TLS certificate file (PEM). Empty = plain HTTP")
-	tlsKey := flag.String("tlsKey", "", "TLS private key file (PEM)")
-	masterHTTP := flag.String("master", "192.168.1.9:9333", "SeaweedFS master HTTP address")
-	filerHTTP := flag.String("filer", "127.0.0.1:8888", "SeaweedFS filer HTTP address (used to list existing S3 buckets)")
-	pollSec := flag.Int("poll", 15, "topology poll interval (seconds)")
-	hbTTL := flag.Int("heartbeatTTL", 60, "agent heartbeat TTL (seconds)")
-	minWriteNodes := flag.Int("minWriteNodes", 10, "refuse S3 writes when fewer volume servers are online than this (cluster read-only); 0 disables the guard. Set >= dataShards+parityShards of the EC scheme")
-	webhookURL := flag.String("webhook", "", "webhook URL for notifications (empty = log only)")
-	dc := flag.String("dataCenter", "dc1", "data center name for volume servers")
-	rackBase := flag.String("rackBase", "rack", "rack name prefix")
-	maxVol := flag.Int("maxVolumes", 8, "max volumes for volume servers")
-	diskType := flag.String("diskType", "hdd", "disk type for volume servers")
-	portBase := flag.Int("portBase", 8080, "starting port for agent volume servers")
-	stateFile := flag.String("stateFile", "", "JSON file persisting operator node flags (preferred replica targets) across restarts")
-	preferredNodesFile := flag.String("preferredNodesFile", "", "File where the preferred volume server address list (\"ip:port\" per line) is published for the master's -preferredNodesFile")
-	preferredPolicyFile := flag.String("preferredPolicyFile", "", "File with preferred node ids (one per line) that are always preferred and cannot be unmarked via the web UI")
-	adminURL := flag.String("adminURL", "http://127.0.0.1:12535", "Base URL of the SeaweedFS admin server (used to trigger immediate EC encoding via its plugin API)")
-	weedBin := flag.String("weedBin", "/usr/bin/weed", "path to the weed binary; the dashboard fsck button runs 'weed shell volume.fsck' with it")
-	fsckTimeout := flag.Duration("fsckTimeout", 10*time.Minute, "wall-clock cap on a dashboard-triggered volume.fsck run")
-	flag.Parse()
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "server: load config: %v\n", err)
+		os.Exit(1)
+	}
 
-	reg := store.NewRegistry(*portBase, time.Duration(*hbTTL)*time.Second)
+	reg := store.NewRegistry(cfg.PortBase, time.Duration(cfg.HeartbeatTTL)*time.Second)
 	notifier := notify.New(time.Hour)
 	notifier.Add(notify.LogSender{})
-	if *webhookURL != "" {
-		notifier.Add(notify.NewWebhookSender(*webhookURL))
+	if cfg.WebhookURL != "" {
+		notifier.Add(notify.NewWebhookSender(cfg.WebhookURL))
 	}
 
 	srv := &server{
 		reg:       reg,
-		master:    masterapi.New(*masterHTTP, 10*time.Second),
+		master:    masterapi.New(cfg.Master, 10*time.Second),
 		notifier:  notifier,
-		filerAddr: *filerHTTP,
-		hbTTL:     time.Duration(*hbTTL) * time.Second,
+		filerAddr: cfg.Filer,
+		hbTTL:     time.Duration(cfg.HeartbeatTTL) * time.Second,
 		volumeCfg: VolumeTemplate{
-			Master:     *masterHTTP,
-			DataCenter: *dc,
-			RackBase:   *rackBase,
-			MaxVolumes: *maxVol,
-			DiskType:   *diskType,
-			PortBase:   *portBase,
+			Master:     cfg.Master,
+			DataCenter: cfg.DataCenter,
+			RackBase:   cfg.RackBase,
+			MaxVolumes: cfg.MaxVolumes,
+			DiskType:   cfg.DiskType,
+			PortBase:   cfg.PortBase,
 		},
-		minWriteNodes: *minWriteNodes,
-		weedBin:       *weedBin,
-		fsckTimeout:   *fsckTimeout,
+		minWriteNodes: cfg.MinWriteNodes,
+		weedBin:       cfg.WeedBin,
+		fsckTimeout:   cfg.FsckTimeout,
 	}
-	srv.preferredNodesFile = *preferredNodesFile
-	srv.preferredPolicyFile = *preferredPolicyFile
-	srv.adminURL = *adminURL
+	srv.preferredNodesFile = cfg.PreferredNodesFile
+	srv.preferredPolicyFile = cfg.PreferredPolicyFile
+	srv.adminURL = cfg.AdminURL
 	srv.downloadErrors = make(map[string]downloadErrorInfo)
 	srv.downloadErrTTL = 10 * time.Minute
-	if *stateFile != "" {
-		reg.SetStatePath(*stateFile)
+	if cfg.StateFile != "" {
+		reg.SetStatePath(cfg.StateFile)
 	}
-	if *preferredPolicyFile != "" {
+	if cfg.PreferredPolicyFile != "" {
 		// Load operator-declared preferred node ids from /etc/s3lite/policy.conf.
 		// These are sticky: they cannot be unmarked via the web UI.
-		reg.LoadPreferredPolicy(*preferredPolicyFile)
+		reg.LoadPreferredPolicy(cfg.PreferredPolicyFile)
 	}
 	if srv.preferredNodesFile != "" {
 		// Publish the loaded state so the master picks up the preference
@@ -186,7 +171,7 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go srv.monitorLoop(ctx, time.Duration(*pollSec)*time.Second)
+	go srv.monitorLoop(ctx, time.Duration(cfg.PollSec)*time.Second)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/nodes", srv.handleNodes)
@@ -210,16 +195,15 @@ func main() {
 	})
 
 	scheme := "http"
-	if *tlsCert != "" {
+	if cfg.TLSCert != "" {
 		scheme = "https"
 	}
 	log.Printf("control plane on %s://%s, master=%s, poll=%ds, hbTTL=%ds",
-		scheme, *listen, *masterHTTP, *pollSec, *hbTTL)
-	var err error
-	if *tlsCert != "" {
-		err = http.ListenAndServeTLS(*listen, *tlsCert, *tlsKey, mux)
+		scheme, cfg.Listen, cfg.Master, cfg.PollSec, cfg.HeartbeatTTL)
+	if cfg.TLSCert != "" {
+		err = http.ListenAndServeTLS(cfg.Listen, cfg.TLSCert, cfg.TLSKey, mux)
 	} else {
-		err = http.ListenAndServe(*listen, mux)
+		err = http.ListenAndServe(cfg.Listen, mux)
 	}
 	if err != nil {
 		log.Fatal(err)
