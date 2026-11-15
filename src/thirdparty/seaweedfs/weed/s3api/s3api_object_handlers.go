@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
-	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
 	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
@@ -287,24 +286,6 @@ func newStreamErrorWithResponse(err error) *StreamError {
 
 func isCanceledStreamingError(err error) bool {
 	return errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled
-}
-
-// volumeIDsToString formats offline volume infos as a comma-separated
-// "volumeId:collection" list for the X-S3Lite-Volume-Id header.
-func volumeIDsToString(vols []struct {
-	collection string
-	volumeID   uint32
-}) string {
-	var sb strings.Builder
-	for i, v := range vols {
-		if i > 0 {
-			sb.WriteString(",")
-		}
-		sb.WriteString(strconv.Itoa(int(v.volumeID)))
-		sb.WriteString(":")
-		sb.WriteString(v.collection)
-	}
-	return sb.String()
 }
 
 func shouldWriteStreamingErrorResponse(err error) bool {
@@ -1328,148 +1309,36 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 	defer reader.ReleaseStream()
 	streamPrepTime = time.Since(tStreamPrep)
 
-	// Collect volume IDs from chunk views for precise download-failure
-	// reporting. If the first read fails before headers are committed, we
-	// can return 503 with the exact volumes that need nodes powered on.
-	var volumeIDs []struct {
-		collection string
-		volumeID   uint32
+	// Headers are committed immediately before streaming begins. s3proxy wraps
+	// the response body with a countingReader and, if the stream truncates
+	// mid-way (fewer bytes than Content-Length), uses the /api/v1/download/
+	// chunkmap to identify which volume failed and calls /api/v1/download/
+	// chains for recovery advice.
+	s3a.setResponseHeaders(w, r, entry, totalSize)
+	if isRangeRequest {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+size-1, totalSize))
 	}
-	seenVolumes := make(map[uint32]bool)
-	for x := chunkViews.Front(); x != nil; x = x.Next {
-		cv := x.Value
-		if cv == nil || cv.FileId == "" {
-			continue
-		}
-		vidStr, _, err := operation.ParseFileId(cv.FileId)
-		if err != nil {
-			continue
-		}
-		vid, err := strconv.ParseUint(vidStr, 10, 32)
-		if err != nil {
-			continue
-		}
-		if seenVolumes[uint32(vid)] {
-			continue
-		}
-		seenVolumes[uint32(vid)] = true
-		volumeIDs = append(volumeIDs, struct {
-			collection string
-			volumeID   uint32
-		}{collection: bucket, volumeID: uint32(vid)})
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	headerSetTime = time.Since(tStreamPrep)
+	if isRangeRequest {
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		w.WriteHeader(http.StatusOK)
 	}
+	TimeToFirstByte(r.Method, t0, r)
 
-	// A cached chunk whose volume server is down, or whose needle was evicted and
-	// now 404s under retry-backoff, would stall and then 500 after the headers are
-	// already sent -- serve the authoritative remote instead.
-	if s3a.shouldFallBackToRemote(entry, totalSize, versionId) {
-		if probeErr := probeReadable(ctx, reader, offset, localReadProbeTimeout); probeErr != nil {
-			if isCanceledStreamingError(probeErr) {
-				glog.V(3).Infof("streamFromVolumeServers: request canceled while probing %s/%s: %v", bucket, object, probeErr)
-				return probeErr
-			}
-			glog.V(1).Infof("streamFromVolumeServers: local read of %s/%s failed (%v), falling back to remote mount", bucket, object, probeErr)
-			if served, streamErr := s3a.serveObjectFromRemoteMount(w, r, entry, bucket, object, offset, size, isRangeRequest, totalSize, t0); served {
-				if streamErr != nil {
-					return newStreamErrorWithResponse(streamErr)
-				}
-				return nil
-			}
-			glog.Errorf("streamFromVolumeServers: local read of %s/%s failed and remote mount unavailable: %v", bucket, object, probeErr)
-			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-			return newStreamErrorWithResponse(probeErr)
-		}
-	}
-
-	// Probe the first byte before committing headers. If the first read
-	// fails (e.g. not enough EC shards available), return 503 with the
-	// exact volumes that need nodes powered on instead of a 200 with a
-	// truncated body.
-	if probeErr := probeReadable(ctx, reader, offset, localReadProbeTimeout); probeErr != nil {
-		if isCanceledStreamingError(probeErr) {
-			glog.V(3).Infof("streamFromVolumeServers: request canceled while probing %s/%s: %v", bucket, object, probeErr)
-			return probeErr
-		}
-		glog.V(1).Infof("streamFromVolumeServers: first read of %s/%s failed (%v), returning 503 with volume info", bucket, object, probeErr)
-		if len(volumeIDs) > 0 {
-			w.Header().Set("Content-Type", "application/xml")
-			w.Header().Set("X-S3Lite-Volume-Id", volumeIDsToString(volumeIDs))
-			w.Header().Set("X-S3Lite-Collection", bucket)
-			w.WriteHeader(http.StatusServiceUnavailable)
-			var xmlBuf strings.Builder
-			xmlBuf.WriteString(`<?xml version="1.0" encoding="UTF-8"?><Error><Code>S3LiteVolumeUnavailable</Code><Message>Some volume servers are offline. Power on the following nodes to restore download:</Message>`)
-			for _, vi := range volumeIDs {
-				xmlBuf.WriteString(`<Volume><Collection>` + vi.collection + `</Collection><VolumeId>` + strconv.Itoa(int(vi.volumeID)) + `</VolumeId></Volume>`)
-			}
-			xmlBuf.WriteString(`</Error>`)
-			w.Write([]byte(xmlBuf.String()))
-			return nil
-		}
-		glog.Errorf("streamFromVolumeServers: first read of %s/%s failed: %v", bucket, object, probeErr)
-		s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-		return newStreamErrorWithResponse(probeErr)
-	}
-
-	// Headers and status are committed on the first body write, once the first
-	// read from the volume servers has succeeded. The client sees the same wire
-	// timing either way -- the status line sits in the server's write buffer
-	// until body bytes arrive -- but a first read that fails now surfaces as a
-	// clean 5xx instead of a 200 with a broken body.
-	body := &commitOnFirstWrite{w: w, commit: func() {
-		tHeaderSet := time.Now()
-		s3a.setResponseHeaders(w, r, entry, totalSize)
-		if isRangeRequest {
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+size-1, totalSize))
-		}
-		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-		headerSetTime = time.Since(tHeaderSet)
-		if isRangeRequest {
-			w.WriteHeader(http.StatusPartialContent)
-		} else {
-			w.WriteHeader(http.StatusOK)
-		}
-		TimeToFirstByte(r.Method, t0, r)
-	}}
-
-	// Stream directly to response with counting wrapper.
+	// Stream directly to response.
 	// ChunkReadAt's ReadAt is backed by in-memory prefetched chunk buffers, so
 	// io.CopyBuffer drains them as fast memcpys.
 	tStreamExec := time.Now()
 	glog.V(4).Infof("streamFromVolumeServers: starting chunk reader, offset=%d, size=%d", offset, size)
-	written, err := s3a.streamRangeToClient(body, r, reader, entry, bucket, object, offset, size, totalSize, versionId)
+	written, err := s3a.streamRangeToClient(w, r, reader, entry, bucket, object, offset, size, totalSize, versionId)
 	streamExecTime = time.Since(tStreamExec)
 	// Track traffic even on partial writes for accurate egress accounting
 	if written > 0 {
 		BucketTrafficSent(written, r)
 	}
 	if err != nil {
-		if !body.committed {
-			if isCanceledStreamingError(err) {
-				glog.V(3).Infof("streamFromVolumeServers: request canceled before first byte of %s/%s: %v", bucket, object, err)
-				return err
-			}
-			// First read failed before headers were committed. If we know
-			// which volumes are involved, return 503 with volume info so the
-			// caller (s3proxy) can tell the operator exactly which nodes to
-			// power on.
-			if len(volumeIDs) > 0 {
-				w.Header().Set("Content-Type", "application/xml")
-				w.Header().Set("X-S3Lite-Volume-Id", volumeIDsToString(volumeIDs))
-				w.Header().Set("X-S3Lite-Collection", bucket)
-				w.WriteHeader(http.StatusServiceUnavailable)
-				var xmlBuf strings.Builder
-				xmlBuf.WriteString(`<?xml version="1.0" encoding="UTF-8"?><Error><Code>S3LiteVolumeUnavailable</Code><Message>Some volume servers are offline. Power on the following nodes to restore download:</Message>`)
-				for _, vi := range volumeIDs {
-					xmlBuf.WriteString(`<Volume><Collection>` + vi.collection + `</Collection><VolumeId>` + strconv.Itoa(int(vi.volumeID)) + `</VolumeId></Volume>`)
-				}
-				xmlBuf.WriteString(`</Error>`)
-				w.Write([]byte(xmlBuf.String()))
-				return nil
-			}
-			glog.Errorf("streamFromVolumeServers: first read of %s/%s failed: %v", bucket, object, err)
-			s3err.WriteErrorResponse(w, r, s3err.ErrInternalError)
-			return newStreamErrorWithResponse(err)
-		}
 		switch {
 		case isCanceledStreamingError(err):
 			// Client disconnected mid-stream (e.g. Nginx upstream timeout, browser cancel) - expected
@@ -1483,14 +1352,9 @@ func (s3a *S3ApiServer) streamFromVolumeServers(w http.ResponseWriter, r *http.R
 		// Streaming error after WriteHeader was called - response already partially written
 		return newStreamErrorWithResponse(err)
 	}
-	body.Commit()
 	glog.V(4).Infof("streamFromVolumeServers: streamFn completed successfully, wrote %d bytes", written)
 	return nil
 }
-
-// short, so a down volume server or an evicted needle under retry-backoff falls
-// back promptly instead of stalling the request
-const localReadProbeTimeout = 2 * time.Second
 
 // shouldFallBackToRemote reports whether a failed local read may be served from
 // the mounted remote instead: openRemoteStream only reads the unversioned key,
@@ -1502,28 +1366,6 @@ func (s3a *S3ApiServer) shouldFallBackToRemote(entry *filer_pb.Entry, totalSize 
 	}
 	remote := entry.GetRemoteEntry()
 	return totalSize > 0 && remote != nil && remote.GetRemoteSize() == totalSize
-}
-
-// the context-honoring read of filer.ChunkReadAt, so probeReadable can bound it
-type ctxReaderAt interface {
-	ReadAtWithTime(ctx context.Context, p []byte, offset int64) (int, int64, error)
-}
-
-// probeReadable decides whether the local copy is usable by reading one byte at
-// offset. Only a returned byte counts -- a zero-byte read, EOF or not, would
-// otherwise wave through a stream that then truncates.
-func probeReadable(ctx context.Context, reader ctxReaderAt, offset int64, timeout time.Duration) error {
-	probeCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	var b [1]byte
-	n, _, err := reader.ReadAtWithTime(probeCtx, b[:], offset)
-	if n == len(b) {
-		return nil
-	}
-	if err == nil {
-		err = io.ErrUnexpectedEOF
-	}
-	return err
 }
 
 func respondObjectGone(w http.ResponseWriter, r *http.Request, bucket, object string, err error) error {

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +30,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/iam/integration"
 	"github.com/seaweedfs/seaweedfs/weed/iam/policy"
 	"github.com/seaweedfs/seaweedfs/weed/iam/sts"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
@@ -938,6 +940,9 @@ func (s3a *S3ApiServer) registerRouter(router *mux.Router) {
 	apiRouter.Methods(http.MethodGet, http.MethodHead).Path("/healthz").HandlerFunc(s3a.StatusHandler)
 	apiRouter.Methods(http.MethodGet, http.MethodHead).Path("/readyz").HandlerFunc(s3a.StatusHandler)
 
+	// Chunkmap endpoint for s3proxy: returns volume-to-bytes mapping for an object.
+	apiRouter.Methods(http.MethodGet).Path("/api/v1/download/chunkmap").HandlerFunc(s3a.handleDownloadChunkMap)
+
 	// Object path pattern with (?s) flag to match newlines in object keys
 	const objectPath = "/{object:(?s).+}"
 
@@ -1535,4 +1540,109 @@ func (s3a *S3ApiServer) GetCredentialByAccessKey(accessKey string) (string, inte
 		return "", nil, "", fmt.Errorf("credential is inactive")
 	}
 	return identity.Name, identity, cred.SecretKey, nil
+}
+
+// chunkMapEntry describes one contiguous byte range of an object backed by a
+// single EC volume.
+type chunkMapEntry struct {
+	VolumeID   uint32 `json:"volume_id"`
+	Collection string `json:"collection,omitempty"`
+	StartByte  int64  `json:"start_byte"`
+	EndByte    int64  `json:"end_byte"`
+}
+
+// handleDownloadChunkMap returns the volume-to-bytes mapping for an object.
+// s3proxy uses this to determine which volume (and thus which nodes) to power
+// on when a download stream truncates mid-way.
+// GET /api/v1/download/chunkmap?bucket=X&object=Y
+func (s3a *S3ApiServer) handleDownloadChunkMap(w http.ResponseWriter, r *http.Request) {
+	bucket := r.URL.Query().Get("bucket")
+	object := r.URL.Query().Get("object")
+	if bucket == "" || object == "" {
+		http.Error(w, "bucket and object query parameters are required", http.StatusBadRequest)
+		return
+	}
+
+	// Look up the entry from the filer.
+	ctx := r.Context()
+	entry, err := s3a.fetchObjectEntry(bucket, object)
+	if err != nil {
+		if errors.Is(err, filer_pb.ErrNotFound) {
+			http.Error(w, "object not found", http.StatusNotFound)
+		} else {
+			glog.V(2).Infof("handleDownloadChunkMap: filer lookup failed for %s/%s: %v", bucket, object, err)
+			http.Error(w, "object lookup failed", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	totalSize := int64(filer.FileSize(entry))
+	chunks := entry.GetChunks()
+	if len(chunks) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"chunks": []chunkMapEntry{}})
+		return
+	}
+
+	// Resolve chunk manifests to visible intervals so we know which volume
+	// servers hold each shard.
+	lookupFileIdFn := s3a.createLookupFileIdFunction()
+	visibleIntervals, err := filer.NonOverlappingVisibleIntervals(ctx, lookupFileIdFn, chunks, 0, totalSize)
+	if err != nil {
+		glog.V(2).Infof("handleDownloadChunkMap: resolve chunks failed for %s/%s: %v", bucket, object, err)
+		http.Error(w, "failed to resolve chunks", http.StatusInternalServerError)
+		return
+	}
+
+	// Convert visible intervals to chunk views (which have exported FileId/offset/size).
+	chunkViews := filer.ViewFromVisibleIntervals(visibleIntervals, 0, totalSize)
+
+	// Build volume -> byte range mapping.
+	type volRange struct {
+		volumeID   uint32
+		collection string
+		startByte  int64
+		endByte    int64
+	}
+	var ranges []volRange
+	for x := chunkViews.Front(); x != nil; x = x.Next {
+		cv := x.Value
+		chunkSize := int64(cv.ChunkSize)
+		if chunkSize <= 0 {
+			continue
+		}
+		vidStr, _, perr := operation.ParseFileId(cv.FileId)
+		if perr != nil {
+			continue
+		}
+		vid, perr := strconv.ParseUint(vidStr, 10, 32)
+		if perr != nil {
+			continue
+		}
+		ranges = append(ranges, volRange{
+			volumeID:   uint32(vid),
+			collection: bucket,
+			startByte:  cv.ViewOffset,
+			endByte:    cv.ViewOffset + chunkSize - 1,
+		})
+	}
+
+	// Merge adjacent ranges from the same volume.
+	merged := make([]chunkMapEntry, 0, len(ranges))
+	for _, r := range ranges {
+		if len(merged) > 0 && merged[len(merged)-1].VolumeID == r.volumeID &&
+			merged[len(merged)-1].EndByte+1 == r.startByte {
+			merged[len(merged)-1].EndByte = r.endByte
+		} else {
+			merged = append(merged, chunkMapEntry{
+				VolumeID:   r.volumeID,
+				Collection: r.collection,
+				StartByte:  r.startByte,
+				EndByte:    r.endByte,
+			})
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"chunks": merged})
 }
