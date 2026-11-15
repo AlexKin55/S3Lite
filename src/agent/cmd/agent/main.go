@@ -129,6 +129,7 @@ func run(cfg *config.Config) error {
 		DiskType:   pickDisk(cfg.DiskType, volCfg.DiskType),
 		StorageGB:  int(cfg.CapacityBytes / (1024 * 1024 * 1024)),
 		LogPath:    logPath,
+		ECShardSlotRatio: cfg.ECShardSlotRatio,
 	})
 
 	if err := sup.Start(2 * time.Second); err != nil {

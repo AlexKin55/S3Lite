@@ -46,6 +46,11 @@ type Config struct {
 	// MaxVolumes is the volume server -max (0 = SeaweedFS default, 8).
 	MaxVolumes int `json:"max_volumes,omitempty"`
 
+	// ECShardSlotRatio is the percent of volume slots reserved for erasure
+	// coding shards (the rest hold raw volume replicas). 0 means no hint;
+	// the server's DEFAULT_REPLICATION / MAX_VOLUMES still apply.
+	ECShardSlotRatio int `json:"ec_shard_slot_ratio,omitempty"`
+
 	// DiskType is the disk tag: hdd/ssd/arbitrary.
 	DiskType string `json:"disk_type,omitempty"`
 
@@ -65,6 +70,7 @@ func Default() Config {
 		CapacityBytes:        200 * 1024 * 1024 * 1024, // 200 GB
 		HeartbeatIntervalSec: 10,
 		Port:                 8080,
+		ECShardSlotRatio:     30,
 	}
 }
 
@@ -116,6 +122,10 @@ func parseEnvFile(data []byte, cfg *Config) error {
 		case "STORAGE_SIZE":
 			if v, err := strconv.ParseInt(val, 10, 64); err == nil {
 				cfg.CapacityBytes = v * 1024 * 1024 * 1024
+			}
+		case "EC_SHARD_SLOT_RATIO":
+			if v, err := strconv.Atoi(val); err == nil {
+				cfg.ECShardSlotRatio = v
 			}
 		case "PORT":
 			if v, err := strconv.Atoi(val); err == nil {

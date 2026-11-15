@@ -28,6 +28,10 @@ type VolumeArgs struct {
 	DiskType   string // -disk
 	StorageGB  int    // -storageSizeGB (0 = unlimited)
 	LogPath    string // process log file (empty = discard)
+	// ECShardSlotRatio is the percent of volume slots reserved for erasure
+	// coding shards (planning hint; SeaweedFS decides the actual type per
+	// slot).
+	ECShardSlotRatio int
 }
 
 // Status summarizes the volume server state for heartbeats.
