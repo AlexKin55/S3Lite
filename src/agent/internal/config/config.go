@@ -7,9 +7,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 )
 
-// Config is the local agent configuration, stored as JSON in the agent dir.
+// Config is the local agent configuration.
+// Static settings (server, zone, capacity, paths, ports) come from
+// /etc/s3lite/agent.env. Agent-managed state (node_id) lives in
+// <baseDir>/agent.json. The two files must not overlap.
 type Config struct {
 	// NodeID is generated on first run and persisted forever.
 	NodeID string `json:"node_id"`
@@ -68,49 +73,136 @@ func Path(baseDir string) string {
 	return filepath.Join(baseDir, "agent.json")
 }
 
-// Load reads the config from baseDir/agent.json. If the file does not exist,
-// it creates a config with a fresh node_id and persists it.
+// envFilePath returns the path to the static environment file.
+func envFilePath() string {
+	if v := os.Getenv("AGENT_ENV_FILE"); v != "" {
+		return v
+	}
+	return "/etc/s3lite/agent.env"
+}
+
+// parseEnvFile reads KEY=VALUE lines (comments start with #) and applies
+// them to cfg. Static settings from the env file take precedence over
+// agent.json; only agent-managed fields (node_id) live in agent.json.
+func parseEnvFile(data []byte, cfg *Config) error {
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+		switch key {
+		case "CONTROL_PLANE":
+			cfg.Server = val
+		case "API_KEY":
+			cfg.APIKey = val
+		case "ZONE":
+			cfg.Zone = val
+		case "CAPACITY_BYTES":
+			if v, err := strconv.ParseInt(val, 10, 64); err == nil {
+				cfg.CapacityBytes = v
+			}
+		case "RACK":
+			cfg.Rack = val
+		case "WEED_BIN":
+			cfg.WeedBin = val
+		case "STORAGE":
+			cfg.DataDir = val
+		case "STORAGE_SIZE":
+			if v, err := strconv.ParseInt(val, 10, 64); err == nil {
+				cfg.CapacityBytes = v * 1024 * 1024 * 1024
+			}
+		case "PORT":
+			if v, err := strconv.Atoi(val); err == nil {
+				cfg.Port = v
+			}
+		case "HEARTBEAT_INTERVAL_SEC":
+			if v, err := strconv.Atoi(val); err == nil {
+				cfg.HeartbeatIntervalSec = v
+			}
+		case "TLS_INSECURE":
+			cfg.TLSInsecure = strings.EqualFold(val, "true")
+		}
+	}
+	return nil
+}
+
+// Load reads configuration with the following priority (lowest to highest):
+//   1. Default values (see Default)
+//   2. /etc/s3lite/agent.env (static admin configuration)
+//   3. <baseDir>/agent.json (agent-managed state, only node_id)
+//
+// Static fields from agent.env are never overridden by agent.json — the two
+// files must not overlap.
 func Load(baseDir string) (*Config, error) {
 	if err := os.MkdirAll(baseDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create agent dir %s: %w", baseDir, err)
 	}
-	path := Path(baseDir)
 	cfg := Default()
+
+	// 1. Static configuration from /etc/s3lite/agent.env
+	if data, err := os.ReadFile(envFilePath()); err == nil {
+		if err := parseEnvFile(data, &cfg); err != nil {
+			return nil, fmt.Errorf("parse %s: %w", envFilePath(), err)
+		}
+	}
+
+	// 2. Agent-managed state from agent.json (only node_id etc.)
+	path := filepath.Join(baseDir, "agent.json")
 	if data, err := os.ReadFile(path); err == nil {
-		if err := json.Unmarshal(data, &cfg); err != nil {
+		var agentState struct {
+			NodeID string `json:"node_id"`
+		}
+		if err := json.Unmarshal(data, &agentState); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
-		if cfg.DataDir == "" {
-			cfg.DataDir = filepath.Join(baseDir, "data")
+		if agentState.NodeID != "" {
+			cfg.NodeID = agentState.NodeID
 		}
-		return &cfg, nil
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 
-	// First run: generate node_id and persist the config.
-	id, err := newNodeID()
-	if err != nil {
-		return nil, err
+	// First run: generate node_id if not present anywhere.
+	if cfg.NodeID == "" {
+		id, err := newNodeID()
+		if err != nil {
+			return nil, fmt.Errorf("generate node id: %w", err)
+		}
+		cfg.NodeID = id
+		if err := cfg.Save(baseDir); err != nil {
+			return nil, fmt.Errorf("save config: %w", err)
+		}
 	}
-	cfg.NodeID = id
-	cfg.DataDir = filepath.Join(baseDir, "data")
-	if err := cfg.Save(baseDir); err != nil {
-		return nil, err
+
+	if cfg.DataDir == "" {
+		cfg.DataDir = filepath.Join(baseDir, "data")
 	}
 	return &cfg, nil
 }
 
-// Save writes the config to baseDir/agent.json (atomic replace).
+// Save writes the agent-managed state (node_id) to baseDir/agent.json.
+// Static settings from /etc/s3lite/agent.env are not persisted here.
 func (c *Config) Save(baseDir string) error {
 	if err := os.MkdirAll(baseDir, 0o755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(c, "", "  ")
+	// Only persist agent-managed fields, not static ones from .env.
+	state := struct {
+		NodeID string `json:"node_id"`
+	}{
+		NodeID: c.NodeID,
+	}
+	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
-	path := Path(baseDir)
+	path := filepath.Join(baseDir, "agent.json")
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err

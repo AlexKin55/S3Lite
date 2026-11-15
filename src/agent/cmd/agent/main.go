@@ -52,7 +52,7 @@ func run(agentDir, serverOverride string, portOverride int, weedOverride, storag
 		cfg.WeedBin = weedOverride
 	}
 	if cfg.WeedBin == "" {
-		return fmt.Errorf("weed binary path is empty: pass -weed or set weed_bin in %s", config.Path(agentDir))
+		return fmt.Errorf("weed binary path is empty: pass -weed or set WEED_BIN in /etc/s3lite/agent.env")
 	}
 	if storageOverride != "" {
 		cfg.DataDir = storageOverride
