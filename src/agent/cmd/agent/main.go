@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -211,6 +213,9 @@ type statsCache struct {
 	used        int64
 	status      supervisor.Status
 	restarts    int       // volume server process starts (supervisor counter)
+	cpuLoad     int       // most recent CPU load percent
+	prevTotal   uint64    // previous /proc/stat total time (for delta)
+	prevIdle    uint64    // previous /proc/stat idle time (for delta)
 	refreshedAt time.Time // when these statistics were collected
 	logTail     string    // volume log tail, filled only when degraded
 	ready       chan struct{}
@@ -221,6 +226,7 @@ type statsCache struct {
 func (c *statsCache) refresh(dataDir string, sup *supervisor.Supervisor) {
 	status := sup.FetchStatus(5 * time.Second)
 	used := dirSize(dataDir)
+	cpu := readCpuLoadDelta(&c.prevTotal, &c.prevIdle)
 	// The log tail is collected only while the volume server is down: it
 	// explains WHY the node is degraded (disk full, io error, ...) and is
 	// shown in the dashboard's node details.
@@ -232,6 +238,7 @@ func (c *statsCache) refresh(dataDir string, sup *supervisor.Supervisor) {
 	c.used = used
 	c.status = status
 	c.restarts = sup.RestartCount()
+	c.cpuLoad = cpu
 	c.refreshedAt = time.Now()
 	c.logTail = tail
 	c.mu.Unlock()
@@ -242,14 +249,14 @@ func (c *statsCache) refresh(dataDir string, sup *supervisor.Supervisor) {
 	}
 }
 
-func (c *statsCache) get() (used int64, status supervisor.Status, restarts int, statsAge time.Duration, logTail string) {
+func (c *statsCache) get() (used int64, status supervisor.Status, restarts int, cpuLoad int, statsAge time.Duration, logTail string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	age := time.Duration(0)
 	if !c.refreshedAt.IsZero() {
 		age = time.Since(c.refreshedAt)
 	}
-	return c.used, c.status, c.restarts, age, c.logTail
+	return c.used, c.status, c.restarts, c.cpuLoad, age, c.logTail
 }
 
 // statsLoop refreshes the statistics cache every 5 seconds in the background.
@@ -300,7 +307,7 @@ func heartbeatLoop(ctx context.Context, client *api.Client, cfg *config.Config, 
 // sendHeartbeat reports the cached statistics; on a heartbeat error it
 // re-registers to recover (the control plane registry is in-memory).
 func sendHeartbeat(ctx context.Context, client *api.Client, cfg *config.Config, sup *supervisor.Supervisor, st *agentState, cache *statsCache, agentDir string) {
-	used, status, restarts, statsAge, logTail := cache.get()
+	used, status, restarts, cpuLoad, statsAge, logTail := cache.get()
 	free := cfg.CapacityBytes - used
 	if free < 0 {
 		free = 0
@@ -318,6 +325,7 @@ func sendHeartbeat(ctx context.Context, client *api.Client, cfg *config.Config, 
 		VolumeServerAlive: status.Alive,
 		VolumesCount:      status.VolumesCount,
 		EcShardsCount:     status.EcShardsCount,
+		CpuLoad:           cpuLoad,
 
 		AgentVersion:    agentVersion,
 		WeedVersion:     status.WeedVersion,
@@ -496,4 +504,54 @@ func abs(p string) string {
 	}
 	wd, _ := os.Getwd()
 	return filepath.Join(wd, p)
+}
+
+// readCpuLoadDelta reads /proc/stat and returns CPU load percent since the
+// previous call, using prevTotal/prevIdle for delta calculation. Returns 0 on
+// the first call (no baseline yet) or on any read error.
+func readCpuLoadDelta(prevTotal, prevIdle *uint64) int {
+	f, err := os.Open("/proc/stat")
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	if !sc.Scan() {
+		return 0
+	}
+	line := sc.Text()
+	// First line: "cpu  user nice system idle iowait irq softirq steal guest guest_nice"
+	fields := strings.Fields(line)
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return 0
+	}
+
+	var total, idle uint64
+	for i := 1; i < len(fields); i++ {
+		v, err := strconv.ParseUint(fields[i], 10, 64)
+		if err != nil {
+			return 0
+		}
+		total += v
+		if i == 4 { // idle is the 4th value after "cpu"
+			idle = v
+		}
+	}
+
+	if *prevTotal == 0 {
+		*prevTotal = total
+		*prevIdle = idle
+		return 0
+	}
+
+	dTotal := total - *prevTotal
+	dIdle := idle - *prevIdle
+	*prevTotal = total
+	*prevIdle = idle
+
+	if dTotal == 0 {
+		return 0
+	}
+	return int((100 * (dTotal - dIdle)) / dTotal)
 }

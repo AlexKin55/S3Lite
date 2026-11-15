@@ -81,6 +81,9 @@ type HeartbeatRequest struct {
 	VolumesCount      int    `json:"volumes_count"`
 	EcShardsCount     int    `json:"ec_shards_count"`
 
+	// CpuLoad is the most recent CPU load percent reported by the node.
+	CpuLoad int `json:"cpu_load,omitempty"`
+
 	AgentVersion    string `json:"agent_version,omitempty"`
 	WeedVersion     string `json:"weed_version,omitempty"`
 	AgentUptimeSec  int64  `json:"agent_uptime_sec,omitempty"`
