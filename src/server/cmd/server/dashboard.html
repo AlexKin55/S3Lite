@@ -205,7 +205,8 @@ async function load(){
       '<td><span class="badge '+esc(n.volume_status)+'">'+esc(n.volume_status)+'</span></td>'+
       '<td class="diskcell">'+diskBar(n.disk_used, n.capacity_bytes)+'</td>'+
       '<td>'+ago(n.last_heartbeat)+'</td>'+
-      '<td>'+n.volumes_count+'</td><td>'+n.ec_shards_count+'</td>+'<td class="errorcell">'+(n.last_error ? '<span class="sub" title="'+ago(n.last_error_at)+'">'+esc(n.last_error).slice(0,80)+'…</span>' : '—')+'</td>'+
+      '<td>'+n.volumes_count+'</td><td>'+n.ec_shards_count+'</td>'+
+      '<td class="errorcell">'+(n.last_error ? '<span class="sub" title="'+ago(n.last_error_at)+'">'+esc(n.last_error).slice(0,80)+'…</span>' : '—')+'</td>'+
       '<td><button class="pref'+(n.preferred?' on':'')+'" data-pref="'+esc(n.node_id)+'" title="Preferred replica target: new raw replicas are placed on this node first (before EC coding)">★</button></td>'+
       '<td><button class="rst" data-rst="'+esc(n.node_id)+'"'+(n.restart_status==='running' ? ' disabled' : '')+' title="Restart the agent + volume server on this node. The command is delivered with its next heartbeat (works even for currently offline nodes).">⟳</button></td>'+
       '<td><button class="del" data-id="'+esc(n.node_id)+'" title="Delete node permanently">✕</button></td></tr>'+
