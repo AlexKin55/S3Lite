@@ -48,10 +48,19 @@ func (s *server) newestAgentVersion() string {
 
 // versionLess compares dotted version strings ("0.0.4" < "0.0.10").
 // Segments are compared numerically; non-numeric tails (e.g. "-rc1") are
-// ignored and missing segments count as 0.
+// ignored and missing segments count as 0. Epoch (everything before ':')
+// and release (everything after '-') are stripped before comparison so
+// RPM-style versions like "0:0.0.5-30.1" compare correctly against
+// "0.0.4".
 func versionLess(a, b string) bool {
+	if i := strings.IndexByte(a, ':'); i >= 0 {
+		a = a[i+1:]
+	}
 	if i := strings.IndexByte(a, '-'); i >= 0 {
 		a = a[:i]
+	}
+	if i := strings.IndexByte(b, ':'); i >= 0 {
+		b = b[i+1:]
 	}
 	if i := strings.IndexByte(b, '-'); i >= 0 {
 		b = b[:i]

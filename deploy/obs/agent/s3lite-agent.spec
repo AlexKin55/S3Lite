@@ -87,7 +87,7 @@ export GOCACHE="%{_builddir}/gocache"
 # Dependencies are vendored; never touch the network — fail loudly instead.
 export GOFLAGS=-mod=vendor
 export GOPROXY=off
-(cd src/agent && go build -trimpath -ldflags "-s -w -X s3lite.dev/agent/cmd/agent.agentVersion=%{version}" -o s3lite-agent ./cmd/agent)
+(cd src/agent && go build -trimpath -ldflags "-s -w -X main.agentVersion=%{version}-%{release}" -o s3lite-agent ./cmd/agent)
 
 %install
 cd s3lite-src
