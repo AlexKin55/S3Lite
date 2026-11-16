@@ -104,17 +104,40 @@ func run(cfg *config.Config) error {
 
 	volumePort := pickPort(volCfg.VolumePort, cfg.Port)
 
-	// Derive max volumes from node capacity and the volume size limit
-	// advertised by the server: slots = STORAGE_SIZE / volumeSizeLimitMB.
-	maxVolumes := pickMax(cfg.MaxVolumes, volCfg.MaxVolumes)
+	// Derive max volumes from node capacity, EC slot ratio, and config limits.
+	// totalSlots   = STORAGE_SIZE / volumeSizeLimitMB
+	// ecSlots      = totalSlots * EC_SHARD_SLOT_RATIO / 100 (reserved for EC shards)
+	// volumeSlots  = totalSlots - ecSlots
+	// maxVolumes   = min(volumeSlots, user_MAX_VOLUMES if set, server_MAX_VOLUMES if set)
+	var maxVolumes int
 	if volCfg.VolumeSizeLimitMB > 0 && cfg.CapacityBytes > 0 {
-		if n := int(cfg.CapacityBytes / (int64(volCfg.VolumeSizeLimitMB) * 1024 * 1024)); n > 0 {
-			maxVolumes = n
+		totalSlots := int(cfg.CapacityBytes / (int64(volCfg.VolumeSizeLimitMB) * 1024 * 1024))
+		if totalSlots > 0 {
+			ecSlots := totalSlots * cfg.ECShardSlotRatio / 100
+			if ecSlots >= totalSlots {
+				ecSlots = totalSlots - 1
+			}
+			if ecSlots < 0 {
+				ecSlots = 0
+			}
+			volumeSlots := totalSlots - ecSlots
+			// Cap by user-configured MAX_VOLUMES if set.
+			if cfg.MaxVolumes > 0 && cfg.MaxVolumes < volumeSlots {
+				volumeSlots = cfg.MaxVolumes
+			}
+			// Cap by server-configured MAX_VOLUMES if set.
+			if volCfg.MaxVolumes > 0 && volCfg.MaxVolumes < volumeSlots {
+				volumeSlots = volCfg.MaxVolumes
+			}
+			maxVolumes = volumeSlots
 		} else {
 			maxVolumes = 1
 			fmt.Printf("agent: capacity %d bytes is below one volume (%d MB); granting 1 volume slot\n",
 				cfg.CapacityBytes, volCfg.VolumeSizeLimitMB)
 		}
+	} else {
+		// No capacity/volume size info: fall back to config limits.
+		maxVolumes = pickMax(cfg.MaxVolumes, volCfg.MaxVolumes)
 	}
 
 	sup := supervisor.New(supervisor.VolumeArgs{
