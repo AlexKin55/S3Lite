@@ -234,7 +234,19 @@ async function load(){
     for (const op of ecOps) {
       const status = op.status === 'done' ? '✓' : (op.status === 'failed' ? '✗' : '⟳');
       const vol = (op.volume_id !== undefined && op.volume_id !== null) ? ' vol '+op.volume_id : ' (volume не определён)';
-      lines.push('<div class="line info">['+op.started_at+'] EC '+status+esc(op.status)+vol+
+      let fname = '';
+      if (op.filename) {
+        fname = ' '+esc(op.filename);
+      }
+      let fsize = '';
+      if (op.size !== undefined && op.size !== null && op.size > 0) {
+        let sz = op.size;
+        const units = ['B','KB','MB','GB','TB'];
+        let u = 0;
+        while (sz >= 1024 && u < units.length-1) { sz /= 1024; u++; }
+        fsize = ' ('+sz.toFixed(1)+' '+units[u]+')';
+      }
+      lines.push('<div class="line info">['+op.started_at+'] EC '+status+esc(op.status)+vol+fname+fsize+
         (op.error ? ' — '+esc(op.error) : '')+'</div>');
     }
   }

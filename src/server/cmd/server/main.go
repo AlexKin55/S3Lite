@@ -110,6 +110,9 @@ type server struct {
 // control plane for dashboard visibility.
 type ecOpInfo struct {
 	VolumeID   *uint32 `json:"volume_id,omitempty"`
+	Filename   string  `json:"filename,omitempty"`
+	Size       int64   `json:"size,omitempty"`
+	ECShards   int     `json:"ec_shards,omitempty"`
 	Status     string  `json:"status"` // requested, encoding, done, failed
 	StartedAt  string  `json:"started_at"`
 	FinishedAt string  `json:"finished_at,omitempty"`
@@ -568,6 +571,17 @@ func (s *server) handleMaintenanceEncode(w http.ResponseWriter, r *http.Request)
 	if volID, ok := adminResp["volume_id"]; ok {
 		if v, err := parseVolumeID(volID); err == nil {
 			op.VolumeID = &v
+			op.Filename = fmt.Sprintf("volume-%d", v)
+		}
+	}
+	if size, ok := adminResp["size"]; ok {
+		if s, err := parseSize(size); err == nil {
+			op.Size = s
+		}
+	}
+	if shards, ok := adminResp["ec_shards"]; ok {
+		if sh, err := parseVolumeID(shards); err == nil {
+			op.ECShards = int(sh)
 		}
 	}
 	if errStr, ok := adminResp["error"]; ok {
@@ -1159,5 +1173,30 @@ func parseVolumeID(v any) (uint32, error) {
 		return uint32(i), nil
 	default:
 		return 0, fmt.Errorf("unsupported volume id type: %T", v)
+	}
+}
+
+// parseSize extracts a file size in bytes from an interface{} value
+// returned by the admin API (may be float64, int64, string, or json.Number).
+func parseSize(v any) (int64, error) {
+	switch n := v.(type) {
+	case float64:
+		return int64(n), nil
+	case int64:
+		return n, nil
+	case string:
+		var s int64
+		if _, err := fmt.Sscanf(n, "%d", &s); err != nil {
+			return 0, err
+		}
+		return s, nil
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil {
+			return 0, err
+		}
+		return i, nil
+	default:
+		return 0, fmt.Errorf("unsupported size type: %T", v)
 	}
 }
