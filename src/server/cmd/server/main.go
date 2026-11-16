@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -97,6 +98,22 @@ type server struct {
 	// downloadErrTTL is how long a download error is retained before being
 	// forgotten (default 10 minutes).
 	downloadErrTTL time.Duration
+
+	// EC encoding operations currently in progress or recently completed.
+	// Keyed by volume ID string. Updated when the manual encode endpoint is
+	// called and when the admin API reports progress.
+	ecOpsMu sync.Mutex
+	ecOps   map[string]ecOpInfo
+}
+
+// ecOpInfo describes a single erasure-coding operation tracked by the
+// control plane for dashboard visibility.
+type ecOpInfo struct {
+	VolumeID   uint32 `json:"volume_id"`
+	Status     string `json:"status"` // requested, encoding, done, failed
+	StartedAt  string `json:"started_at"`
+	FinishedAt string `json:"finished_at,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 // downloadErrorInfo records a failed download attempt: which volume was
@@ -157,6 +174,7 @@ func main() {
 	srv.adminURL = cfg.AdminURL
 	srv.downloadErrors = make(map[string]downloadErrorInfo)
 	srv.downloadErrTTL = 10 * time.Minute
+	srv.ecOps = make(map[string]ecOpInfo)
 	if cfg.StateFile != "" {
 		reg.SetStatePath(cfg.StateFile)
 	}
@@ -185,6 +203,7 @@ func main() {
 	mux.HandleFunc("/api/v1/volumes/risk", srv.handleVolumesRisk)
 	mux.HandleFunc("/api/v1/admin/notify/test", srv.handleNotifyTest)
 	mux.HandleFunc("/api/v1/maintenance/encode", srv.handleMaintenanceEncode)
+	mux.HandleFunc("/api/v1/maintenance/encode/status", srv.handleEncodeStatus)
 	mux.HandleFunc("/api/v1/dashboard", srv.dashboardAPI)
 	mux.HandleFunc("/api/v1/orphans", srv.handleOrphansList)
 	mux.HandleFunc("/api/v1/orphans/cleanup", srv.handleOrphansCleanup)
@@ -538,7 +557,47 @@ func (s *server) handleMaintenanceEncode(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusOK, map[string]any{"raw": string(body)})
 		return
 	}
+	opID := fmt.Sprintf("enc-%d", time.Now().UnixNano())
+	op := ecOpInfo{
+		VolumeID:  0,
+		Status:    "requested",
+		StartedAt: time.Now().Format(time.RFC3339),
+	}
+	if volID, ok := adminResp["volume_id"]; ok {
+		if v, err := parseVolumeID(volID); err == nil {
+			op.VolumeID = v
+		}
+	}
+	if errStr, ok := adminResp["error"]; ok {
+		op.Status = "failed"
+		op.Error = fmt.Sprint(errStr)
+		op.FinishedAt = time.Now().Format(time.RFC3339)
+	}
+	s.ecOpsMu.Lock()
+	s.ecOps[opID] = op
+	s.ecOpsMu.Unlock()
+
 	writeJSON(w, http.StatusOK, adminResp)
+}
+
+// GET /api/v1/maintenance/encode/status — returns the list of erasure-coding
+// operations tracked by the control plane (requested, in progress, done,
+// failed).
+func (s *server) handleEncodeStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.ecOpsMu.Lock()
+	ops := make([]ecOpInfo, 0, len(s.ecOps))
+	for _, op := range s.ecOps {
+		ops = append(ops, op)
+	}
+	s.ecOpsMu.Unlock()
+	sort.Slice(ops, func(i, j int) bool {
+		return ops[i].StartedAt > ops[j].StartedAt
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"operations": ops})
 }
 
 // writePreferredNodesFile publishes the preferred node address list for the
@@ -1076,4 +1135,27 @@ func (s *server) nodeViews() []store.Node {
 		views = append(views, s.nodeView(n))
 	}
 	return views
+}
+
+// parseVolumeID extracts a numeric volume ID from an interface{} value
+// returned by the admin API (may be float64, string, or json.Number).
+func parseVolumeID(v any) (uint32, error) {
+	switch n := v.(type) {
+	case float64:
+		return uint32(n), nil
+	case string:
+		var id uint64
+		if _, err := fmt.Sscanf(n, "%d", &id); err != nil {
+			return 0, err
+		}
+		return uint32(id), nil
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil {
+			return 0, err
+		}
+		return uint32(i), nil
+	default:
+		return 0, fmt.Errorf("unsupported volume id type: %T", v)
+	}
 }

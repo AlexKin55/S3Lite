@@ -220,15 +220,22 @@ async function load(){
   // the nodes to power on to restore the download.
   const consoleEl = document.getElementById('console');
   const errors = j.download_errors || [];
+  const ecOps = j.ec_ops || [];
   const now = new Date().toLocaleTimeString();
   const lines = [];
-  if (errors.length === 0) {
-    lines.push('<div class="line ok">['+now+'] ✓ Нет ошибок скачивания.</div>');
+  if (errors.length === 0 && ecOps.length === 0) {
+    lines.push('<div class="line ok">['+now+'] ✓ Нет ошибок скачивания. Нет кодирований.</div>');
   } else {
     for (const e of errors) {
       const nodes = (e.nodes_to_start||[]).map(n=>'<b>'+esc(n)+'</b>').join(', ');
       lines.push('<div class="line err">['+e.last_seen+'] ⚠ Скачка недоступна: '+esc(e.collection)+' vol '+
         e.volume_id+'. Включите узлы: '+nodes+'</div>');
+    }
+    for (const op of ecOps) {
+      const status = op.status === 'done' ? '✓' : (op.status === 'failed' ? '✗' : '⟳');
+      const vol = op.volume_id ? ' vol '+op.volume_id : ' (volume не определён)';
+      lines.push('<div class="line info">['+op.started_at+'] EC '+status+esc(op.status)+vol+
+        (op.error ? ' — '+esc(op.error) : '')+'</div>');
     }
   }
   consoleEl.innerHTML = lines.join('');

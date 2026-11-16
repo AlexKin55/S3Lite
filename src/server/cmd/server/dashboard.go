@@ -46,6 +46,21 @@ func (s *server) newestAgentVersion() string {
 	return s.newestAgentVersionSeen
 }
 
+// ecOpsList returns a snapshot of the erasure-coding operations currently
+// tracked by the control plane.
+func (s *server) ecOpsList() []ecOpInfo {
+	s.ecOpsMu.Lock()
+	defer s.ecOpsMu.Unlock()
+	ops := make([]ecOpInfo, 0, len(s.ecOps))
+	for _, op := range s.ecOps {
+		ops = append(ops, op)
+	}
+	sort.Slice(ops, func(i, j int) bool {
+		return ops[i].StartedAt > ops[j].StartedAt
+	})
+	return ops
+}
+
 // versionLess compares dotted version strings ("0.0.4" < "0.0.10").
 // Segments are compared numerically; non-numeric tails (e.g. "-rc1") are
 // ignored and missing segments count as 0. Epoch (everything before ':')
@@ -179,6 +194,7 @@ func (s *server) dashboardAPI(w http.ResponseWriter, r *http.Request) {
 			"used_bytes":  usedCap,
 			"free_bytes":  freeCap,
 		},
+		"ec_ops": s.ecOpsList(),
 	}
 	writeJSON(w, http.StatusOK, payload)
 }
