@@ -352,6 +352,12 @@ func detectForDiskType(diskType string, diskMetrics []*types.VolumeHealthMetrics
 			if clusterInfo.ActiveTopology != nil && clusterInfo.ActiveTopology.HasAnyTask(metric.VolumeID) {
 				continue
 			}
+			// Only balance EC shard volumes, not regular replicated volumes.
+			// Preferred nodes keep their replica data; EC shards are spread
+			// across all nodes by ec_balance separately.
+			if !metric.IsECVolume {
+				continue
+			}
 			selectedVolume = metric
 			break
 		}
