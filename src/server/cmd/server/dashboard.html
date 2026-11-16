@@ -233,7 +233,7 @@ async function load(){
     }
     for (const op of ecOps) {
       const status = op.status === 'done' ? '✓' : (op.status === 'failed' ? '✗' : '⟳');
-      const vol = op.volume_id ? ' vol '+op.volume_id : ' (volume не определён)';
+      const vol = (op.volume_id !== undefined && op.volume_id !== null) ? ' vol '+op.volume_id : ' (volume не определён)';
       lines.push('<div class="line info">['+op.started_at+'] EC '+status+esc(op.status)+vol+
         (op.error ? ' — '+esc(op.error) : '')+'</div>');
     }

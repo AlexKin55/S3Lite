@@ -109,11 +109,11 @@ type server struct {
 // ecOpInfo describes a single erasure-coding operation tracked by the
 // control plane for dashboard visibility.
 type ecOpInfo struct {
-	VolumeID   uint32 `json:"volume_id"`
-	Status     string `json:"status"` // requested, encoding, done, failed
-	StartedAt  string `json:"started_at"`
-	FinishedAt string `json:"finished_at,omitempty"`
-	Error      string `json:"error,omitempty"`
+	VolumeID   *uint32 `json:"volume_id,omitempty"`
+	Status     string  `json:"status"` // requested, encoding, done, failed
+	StartedAt  string  `json:"started_at"`
+	FinishedAt string  `json:"finished_at,omitempty"`
+	Error      string  `json:"error,omitempty"`
 }
 
 // downloadErrorInfo records a failed download attempt: which volume was
@@ -562,13 +562,12 @@ func (s *server) handleMaintenanceEncode(w http.ResponseWriter, r *http.Request)
 	}
 	opID := fmt.Sprintf("enc-%d", time.Now().UnixNano())
 	op := ecOpInfo{
-		VolumeID:  0,
 		Status:    "requested",
 		StartedAt: time.Now().Format(time.RFC3339),
 	}
 	if volID, ok := adminResp["volume_id"]; ok {
 		if v, err := parseVolumeID(volID); err == nil {
-			op.VolumeID = v
+			op.VolumeID = &v
 		}
 	}
 	if errStr, ok := adminResp["error"]; ok {
