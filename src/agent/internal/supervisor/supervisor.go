@@ -214,12 +214,12 @@ func (s *Supervisor) Args() VolumeArgs {
 }
 
 // FetchStatus queries the volume server (GET /status) and returns a summary.
-// Regular volumes are read from the main volume port; EC shards are served by
-// the SeaweedFS EC shard server on port+10000 and are counted separately.
+// Both regular volumes and EC shards are served by the same weed volume
+// process on the same port; EC shards appear as separate volume entries in the
+// /status response (or with EcShards populated on the parent volume).
 func (s *Supervisor) FetchStatus(timeout time.Duration) Status {
 	s.mu.Lock()
 	url := fmt.Sprintf("http://%s:%d/status", s.args.IP, s.args.Port)
-	ecURL := fmt.Sprintf("http://%s:%d/status", s.args.IP, s.args.Port+10000)
 	started := s.lastStart
 	s.mu.Unlock()
 	client := &http.Client{Timeout: timeout}
@@ -242,19 +242,6 @@ func (s *Supervisor) FetchStatus(timeout time.Duration) Status {
 	ec := 0
 	for _, v := range st.Volumes {
 		ec += len(v.EcShards)
-	}
-	// EC shards are served on a separate port (volume_port + 10000). Query it
-	// to count EC shard volumes stored on this node.
-	if ecResp, ecErr := client.Get(ecURL); ecErr == nil {
-		defer ecResp.Body.Close()
-		if ecResp.StatusCode == http.StatusOK {
-			var ecSt struct {
-				Volumes []struct{} `json:"Volumes"`
-			}
-			if _ = json.NewDecoder(ecResp.Body).Decode(&ecSt); ecSt.Volumes != nil {
-				ec += len(ecSt.Volumes)
-			}
-		}
 	}
 	return Status{
 		Alive:         true,
