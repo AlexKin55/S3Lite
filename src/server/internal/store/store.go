@@ -49,6 +49,7 @@ type Node struct {
 	DiskUsed      int64     `json:"disk_used"`
 	VolumesCount  int       `json:"volumes_count"`
 	EcShardsCount int       `json:"ec_shards_count"`
+	MaxVolumes    int       `json:"max_volumes"`
 
 	// Recent control-plane request source IPs (register/heartbeat). More
 	// than one distinct source IP within duplicateWindow means the node_id
@@ -416,6 +417,19 @@ func (r *Registry) SetPreferred(id string, preferred bool) bool {
 		r.preferredPending[id] = true
 	}
 	r.persistStateLocked()
+	return true
+}
+
+// SetMaxVolumes records the configured per-node volume slot limit. Used by
+// the dashboard to show slot capacity alongside current usage.
+func (r *Registry) SetMaxVolumes(id string, maxVolumes int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n, ok := r.nodes[id]
+	if !ok {
+		return false
+	}
+	n.MaxVolumes = maxVolumes
 	return true
 }
 

@@ -378,6 +378,9 @@ func (s *server) handleNodes(w http.ResponseWriter, r *http.Request) {
 				req.NodeID, req.CapacityBytes, s.volSizeLimitMB)
 		}
 	}
+	// Store the max volume count on the node so the dashboard can show slot
+	// capacity alongside current usage.
+	s.reg.SetMaxVolumes(n.NodeID, maxVol)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"node_id": n.NodeID,
 		"volume": map[string]any{
