@@ -23,6 +23,7 @@ SUDO_PASS="123456"
 CONTROL_PLANE="Home:Fedora"
 
 FEDORA_NODES=(
+    Home:Fedora
     Home:Fedora2
     Home:Fedora3
     Note:Fedora
@@ -86,9 +87,9 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     exit 0
 fi
 
-echo "=== Starting cluster cleanup ==="
-echo "Control plane: ${CONTROL_PLANE}"
-run_cleanup "$CONTROL_PLANE" "fedy"
+#echo "=== Starting cluster cleanup ==="
+#echo "Control plane: ${CONTROL_PLANE}"
+#run_cleanup "$CONTROL_PLANE" "fedy"
 
 echo ""
 echo "=== Cleaning agent nodes ==="

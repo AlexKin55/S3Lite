@@ -18,7 +18,7 @@
 #   spec must match it (the check in %prep fails the build otherwise).
 #
 Name:           s3lite-server
-Version:        0.0.5
+Version:        0.0.6
 Release:        0
 Summary:        S3Lite distributed S3 storage - control plane server
 License:        Apache-2.0

@@ -163,7 +163,12 @@ func (s *Supervisor) Stop() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	close(s.stopCh)
+	select {
+	case <-s.stopCh:
+		// already closed
+	default:
+		close(s.stopCh)
+	}
 	if s.cmd == nil {
 		return nil
 	}

@@ -18,7 +18,7 @@
 #   spec must match it (the check in %prep fails the build otherwise).
 #
 Name:           s3lite-weed
-Version:        0.0.4
+Version:        0.0.6
 Release:        0
 Summary:        S3Lite distributed S3 storage - bundled SeaweedFS binaries
 License:        Apache-2.0
