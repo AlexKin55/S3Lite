@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,10 +53,23 @@ func main() {
 	writeFactor := flag.Int64("writeFactor", 5, "raw bytes of cluster space consumed per byte written (replication × EC overhead)")
 	flag.Parse()
 
+	// READ_TIMEOUT controls how long the proxy waits for the upstream S3 gateway
+	// to respond and stream a body. Some large downloads (multi-GB objects over
+	// slow links) take longer than the 60 s default, so it is configurable via
+	// READ_TIMEOUT seconds (defaults to 3600 s = 1 h).
+	readTimeout := 3600 * time.Second
+	if v := os.Getenv("READ_TIMEOUT"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			readTimeout = time.Duration(n) * time.Second
+		} else {
+			log.Printf("s3proxy: invalid READ_TIMEOUT=%q, using default 3600s", v)
+		}
+	}
+
 	proxy := &proxy{
 		upstream:    *upstream,
 		controlURL:  *control,
-		client:      &http.Client{Timeout: 60 * time.Second},
+		client:      &http.Client{Timeout: readTimeout},
 		stateTTL:    clusterStateTTL,
 		writeFactor: *writeFactor,
 	}
