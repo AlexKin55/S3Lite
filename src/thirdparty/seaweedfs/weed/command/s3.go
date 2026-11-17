@@ -71,6 +71,8 @@ type S3Options struct {
 	dataCenter                *string
 	localSocket               *string
 	idleTimeout               *int
+	readTimeout               *int
+	writeTimeout              *int
 	concurrentUploadLimitMB   *int
 	concurrentFileUploadLimit *int
 	enableIam                 *bool
@@ -130,6 +132,8 @@ func init() {
 	s3StandaloneOptions.localFilerSocket = cmdS3.Flag.String("localFilerSocket", "", "local filer socket path")
 	s3StandaloneOptions.localSocket = cmdS3.Flag.String("localSocket", "", "default to /tmp/seaweedfs-s3-<port>.sock")
 	s3StandaloneOptions.idleTimeout = cmdS3.Flag.Int("idleTimeout", 120, "connection idle seconds")
+	s3StandaloneOptions.readTimeout = cmdS3.Flag.Int("readTimeout", 300, "read timeout seconds")
+	s3StandaloneOptions.writeTimeout = cmdS3.Flag.Int("writeTimeout", 300, "write timeout seconds")
 	s3StandaloneOptions.concurrentUploadLimitMB = cmdS3.Flag.Int("concurrentUploadLimitMB", 0, "limit total concurrent upload size, 0 means unlimited")
 	s3StandaloneOptions.concurrentFileUploadLimit = cmdS3.Flag.Int("concurrentFileUploadLimit", 0, "limit number of concurrent file uploads, 0 means unlimited")
 	s3StandaloneOptions.enableIam = cmdS3.Flag.Bool("iam", true, "enable embedded IAM API on the same port")
@@ -439,7 +443,7 @@ func (s3opt *S3Options) startS3Server() bool {
 		if err != nil {
 			glog.Fatalf("Failed to listen on %s: %v", localSocket, err)
 		}
-		socketServer := newHttpServer(router, nil)
+		socketServer := newHttpServer(router, nil, *s3opt.readTimeout, *s3opt.writeTimeout)
 		httpServers = append(httpServers, socketServer)
 		go func() {
 			if err := socketServer.Serve(s3SocketListener); err != nil && err != http.ErrServerClosed {
@@ -518,7 +522,7 @@ func (s3opt *S3Options) startS3Server() bool {
 		if *s3opt.portHttps == 0 {
 			glog.V(0).Infof("Start Seaweed S3 API Server %s at https port %d", version.Version(), *s3opt.port)
 			if s3ApiLocalListener != nil {
-				localServer := newHttpServer(router, tlsConfig)
+				localServer := newHttpServer(router, tlsConfig, *s3opt.readTimeout, *s3opt.writeTimeout)
 				httpServers = append(httpServers, localServer)
 				go func() {
 					if err := localServer.ServeTLS(s3ApiLocalListener, "", ""); err != nil && err != http.ErrServerClosed {
@@ -526,7 +530,7 @@ func (s3opt *S3Options) startS3Server() bool {
 					}
 				}()
 			}
-			httpS := newHttpServer(router, tlsConfig)
+			httpS := newHttpServer(router, tlsConfig, *s3opt.readTimeout, *s3opt.writeTimeout)
 			httpServers = append(httpServers, httpS)
 			shutdown := s3opt.newShutdown(stopGrpcServer, s3ApiServer, httpServers)
 			if err = httpS.ServeTLS(s3ApiListener, "", ""); err != nil && err != http.ErrServerClosed {
@@ -542,7 +546,7 @@ func (s3opt *S3Options) startS3Server() bool {
 				glog.Fatalf("S3 API HTTPS listener on %s:%d error: %v", *s3opt.bindIp, *s3opt.portHttps, err)
 			}
 			if s3ApiLocalListenerHttps != nil {
-				localHttpsServer := newHttpServer(router, tlsConfig)
+				localHttpsServer := newHttpServer(router, tlsConfig, *s3opt.readTimeout, *s3opt.writeTimeout)
 				httpServers = append(httpServers, localHttpsServer)
 				go func() {
 					if err := localHttpsServer.ServeTLS(s3ApiLocalListenerHttps, "", ""); err != nil && err != http.ErrServerClosed {
@@ -550,7 +554,7 @@ func (s3opt *S3Options) startS3Server() bool {
 					}
 				}()
 			}
-			httpsServer := newHttpServer(router, tlsConfig)
+			httpsServer := newHttpServer(router, tlsConfig, *s3opt.readTimeout, *s3opt.writeTimeout)
 			httpServers = append(httpServers, httpsServer)
 			go func() {
 				if err := httpsServer.ServeTLS(s3ApiListenerHttps, "", ""); err != nil && err != http.ErrServerClosed {
@@ -562,7 +566,7 @@ func (s3opt *S3Options) startS3Server() bool {
 	if *s3opt.tlsPrivateKey == "" || *s3opt.portHttps > 0 {
 		glog.V(0).Infof("Start Seaweed S3 API Server %s at http port %d", version.Version(), *s3opt.port)
 		if s3ApiLocalListener != nil {
-			localServer := newHttpServer(router, nil)
+			localServer := newHttpServer(router, nil, *s3opt.readTimeout, *s3opt.writeTimeout)
 			httpServers = append(httpServers, localServer)
 			go func() {
 				if err := localServer.Serve(s3ApiLocalListener); err != nil && err != http.ErrServerClosed {
@@ -570,7 +574,7 @@ func (s3opt *S3Options) startS3Server() bool {
 				}
 			}()
 		}
-		httpS := newHttpServer(router, nil)
+		httpS := newHttpServer(router, nil, *s3opt.readTimeout, *s3opt.writeTimeout)
 		httpServers = append(httpServers, httpS)
 		shutdown := s3opt.newShutdown(stopGrpcServer, s3ApiServer, httpServers)
 		if err = httpS.Serve(s3ApiListener); err != nil && err != http.ErrServerClosed {
@@ -630,7 +634,7 @@ func (s3opt *S3Options) startIcebergServer(s3ApiServer *s3api.S3ApiServer) *http
 
 	glog.V(0).Infof("Start Iceberg REST Catalog Server at http://%s", listenAddress)
 
-	httpS := newHttpServer(icebergRouter, nil)
+	httpS := newHttpServer(icebergRouter, nil, *s3opt.readTimeout, *s3opt.writeTimeout)
 	// Serve on localhost as well if we're bound to a different interface
 	if icebergLocalListener != nil {
 		go func() {
@@ -674,7 +678,7 @@ func (s3opt *S3Options) startLanceServer(s3ApiServer *s3api.S3ApiServer) *http.S
 
 	glog.V(0).Infof("Start Lance Namespace Server at http://%s", listenAddress)
 
-	httpS := newHttpServer(lanceRouter, nil)
+	httpS := newHttpServer(lanceRouter, nil, *s3opt.readTimeout, *s3opt.writeTimeout)
 	if lanceLocalListener != nil {
 		go func() {
 			if err := httpS.Serve(lanceLocalListener); err != nil && err != http.ErrServerClosed {

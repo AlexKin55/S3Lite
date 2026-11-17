@@ -360,7 +360,7 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 	}
 
 	if masterLocalListener != nil {
-		go newHttpServer(r, nil).Serve(masterLocalListener)
+		go newHttpServer(r, nil, 0, 0).Serve(masterLocalListener)
 	}
 
 	var tlsConfig *tls.Config
@@ -385,9 +385,9 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 			tlsConfig = &tls.Config{}
 		}
 		tlsConfig.GetCertificate = getCert
-		go newHttpServer(r, tlsConfig).ServeTLS(masterListener, "", "")
+		go newHttpServer(r, tlsConfig, 0, 0).ServeTLS(masterListener, "", "")
 	} else {
-		go newHttpServer(r, nil).Serve(masterListener)
+		go newHttpServer(r, nil, 0, 0).Serve(masterListener)
 	}
 
 	grace.OnInterrupt(ms.Shutdown)

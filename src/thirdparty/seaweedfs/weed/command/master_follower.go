@@ -161,9 +161,9 @@ func startMasterFollower(masterOptions MasterOptions) {
 
 	// start http server
 	if masterLocalListener != nil {
-		go newHttpServer(r, nil).Serve(masterLocalListener)
+		go newHttpServer(r, nil, 0, 0).Serve(masterLocalListener)
 	}
-	go newHttpServer(r, nil).Serve(masterListener)
+	go newHttpServer(r, nil, 0, 0).Serve(masterListener)
 
 	select {}
 }

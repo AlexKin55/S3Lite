@@ -470,9 +470,12 @@ func runServer(cmd *Command, args []string) bool {
 	select {}
 }
 
-func newHttpServer(h http.Handler, tlsConfig *tls.Config) *http.Server {
+func newHttpServer(h http.Handler, tlsConfig *tls.Config, readTimeout, writeTimeout int) *http.Server {
 	s := &http.Server{
-		Handler: h,
+		Handler:        h,
+		ReadTimeout:    time.Duration(readTimeout) * time.Second,
+		WriteTimeout:   time.Duration(writeTimeout) * time.Second,
+		IdleTimeout:    time.Duration(readTimeout) * time.Second,
 	}
 	if tlsConfig != nil {
 		s.TLSConfig = tlsConfig.Clone()

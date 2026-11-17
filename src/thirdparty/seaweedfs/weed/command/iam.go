@@ -128,12 +128,12 @@ func (iamopt *IamOptions) startIamServer() bool {
 	glog.V(0).Infof("Start Seaweed IAM API Server %s at http port %d", version.Version(), *iamopt.port)
 	if iamApiLocalListener != nil {
 		go func() {
-			if err = newHttpServer(router, nil).Serve(iamApiLocalListener); err != nil {
+			if err = newHttpServer(router, nil, 0, 0).Serve(iamApiLocalListener); err != nil {
 				glog.Errorf("IAM API Server Fail to serve: %v", err)
 			}
 		}()
 	}
-	if err = newHttpServer(router, nil).Serve(iamApiListener); err != nil {
+	if err = newHttpServer(router, nil, 0, 0).Serve(iamApiListener); err != nil {
 		glog.Fatalf("IAM API Server Fail to serve: %v", err)
 	}
 

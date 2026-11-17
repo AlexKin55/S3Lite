@@ -439,7 +439,7 @@ func (fo *FilerOptions) startFiler() {
 			glog.Fatalf("Filer server public listener error on port %d:%v", *fo.publicPort, e)
 		}
 		publicHandler := weed_server.CleanPathHandler(publicVolumeMux)
-		publicServer := newHttpServer(publicHandler, nil)
+		publicServer := newHttpServer(publicHandler, nil, 0, 0)
 		httpServers = append(httpServers, publicServer)
 		go func() {
 			if e := publicServer.Serve(publicListener); e != nil && e != http.ErrServerClosed {
@@ -447,7 +447,7 @@ func (fo *FilerOptions) startFiler() {
 			}
 		}()
 		if localPublicListener != nil {
-			localPublicServer := newHttpServer(publicHandler, nil)
+			localPublicServer := newHttpServer(publicHandler, nil, 0, 0)
 			httpServers = append(httpServers, localPublicServer)
 			go func() {
 				if e := localPublicServer.Serve(localPublicListener); e != nil && e != http.ErrServerClosed {
@@ -535,7 +535,7 @@ func (fo *FilerOptions) startFiler() {
 		if err != nil {
 			glog.Fatalf("Failed to listen on %s: %v", localSocket, err)
 		}
-		socketServer = newHttpServer(defaultHandler, nil)
+		socketServer = newHttpServer(defaultHandler, nil, 0, 0)
 		httpServers = append(httpServers, socketServer)
 		go socketServer.Serve(filerSocketListener)
 	}
@@ -579,7 +579,7 @@ func (fo *FilerOptions) startFiler() {
 
 		var localTLSServer *http.Server
 		if filerLocalListener != nil {
-			localTLSServer = newHttpServer(defaultHandler, tlsConfig)
+			localTLSServer = newHttpServer(defaultHandler, tlsConfig, 0, 0)
 			httpServers = append(httpServers, localTLSServer)
 			go func() {
 				if err := localTLSServer.ServeTLS(filerLocalListener, "", ""); err != nil {
@@ -587,7 +587,7 @@ func (fo *FilerOptions) startFiler() {
 				}
 			}()
 		}
-		httpS := newHttpServer(defaultHandler, tlsConfig)
+		httpS := newHttpServer(defaultHandler, tlsConfig, 0, 0)
 		httpServers = append(httpServers, httpS)
 		shutdown := newFilerShutdown(fs.LeaveLockRing, fs.StopSubscriptions, stopGrpcServer, fs.Shutdown, httpServers...)
 
@@ -608,7 +608,7 @@ func (fo *FilerOptions) startFiler() {
 	} else {
 		var localHTTPServer *http.Server
 		if filerLocalListener != nil {
-			localHTTPServer = newHttpServer(defaultHandler, nil)
+			localHTTPServer = newHttpServer(defaultHandler, nil, 0, 0)
 			httpServers = append(httpServers, localHTTPServer)
 			go func() {
 				if err := localHTTPServer.Serve(filerLocalListener); err != nil {
@@ -616,7 +616,7 @@ func (fo *FilerOptions) startFiler() {
 				}
 			}()
 		}
-		httpS := newHttpServer(defaultHandler, nil)
+		httpS := newHttpServer(defaultHandler, nil, 0, 0)
 		httpServers = append(httpServers, httpS)
 		shutdown := newFilerShutdown(fs.LeaveLockRing, fs.StopSubscriptions, stopGrpcServer, fs.Shutdown, httpServers...)
 
